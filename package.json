@@ -6,6 +6,7 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx src/index.ts",
+    "agent:cli": "tsx src/agent/cli.ts",
     "dev:gateway": "tsx --watch src/gateway/main.ts",
     "dev:console": "tsx --watch src/console/main.ts",
     "dev:web": "pnpm --filter @multica/web dev",
@@ -26,6 +27,9 @@
     "typescript": "^5.9.3"
   },
   "dependencies": {
+    "@mariozechner/pi-agent-core": "^0.50.3",
+    "@mariozechner/pi-ai": "^0.50.3",
+    "@mariozechner/pi-coding-agent": "^0.50.3",
     "@nestjs/common": "^11.1.12",
     "@nestjs/core": "^11.1.12",
     "@nestjs/platform-express": "^11.1.12",
