@@ -9,7 +9,10 @@ import {
   type ResponseErrorPayload,
 } from "@multica/sdk";
 import { AsyncAgent } from "../agent/async-agent.js";
+import type { AgentOptions } from "../agent/types.js";
 import { getHubId } from "./hub-identity.js";
+import { setHub } from "./hub-singleton.js";
+import { initSubagentRegistry, shutdownSubagentRegistry } from "../agent/subagent/index.js";
 import { loadAgentRecords, addAgentRecord, removeAgentRecord } from "./agent-store.js";
 import { RpcDispatcher, RpcError } from "./rpc/dispatcher.js";
 import { createGetAgentMessagesHandler } from "./rpc/handlers/get-agent-messages.js";
@@ -47,6 +50,12 @@ export class Hub {
     this.rpc.register("createAgent", createCreateAgentHandler(this));
     this.rpc.register("deleteAgent", createDeleteAgentHandler(this));
     this.rpc.register("updateGateway", createUpdateGatewayHandler(this));
+
+    // Register as global singleton for cross-module access (subagent tools, announce flow)
+    setHub(this);
+
+    // Restore subagent registry from persistent state
+    initSubagentRegistry();
 
     this.client = this.createClient(this.url);
     this.client.connect();
@@ -243,6 +252,27 @@ export class Hub {
     }
   }
 
+  /** Create a subagent with specific options (isSubagent, systemPrompt, model) */
+  createSubagent(sessionId: string, options: Omit<AgentOptions, "sessionId"> = {}): AsyncAgent {
+    const existing = this.agents.get(sessionId);
+    if (existing && !existing.closed) {
+      return existing;
+    }
+
+    const agent = new AsyncAgent({
+      ...options,
+      sessionId,
+      isSubagent: true,
+    });
+    this.agents.set(agent.sessionId, agent);
+
+    // Subagents are ephemeral — don't persist to agent store
+    void this.consumeAgent(agent);
+
+    console.log(`[Hub] Subagent created: ${agent.sessionId}`);
+    return agent;
+  }
+
   getAgent(id: string): AsyncAgent | undefined {
     return this.agents.get(id);
   }
@@ -266,6 +296,9 @@ export class Hub {
   }
 
   shutdown(): void {
+    // Finalize subagent registry before closing agents
+    shutdownSubagentRegistry();
+
     for (const [id, agent] of this.agents) {
       agent.close();
       this.agents.delete(id);

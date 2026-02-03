@@ -35,6 +35,9 @@ export const TOOL_GROUPS: Record<string, string[]> = {
   // Memory tools (requires profileId)
   "group:memory": ["memory_get", "memory_set", "memory_delete", "memory_list"],
 
+  // Subagent tools
+  "group:subagent": ["sessions_spawn"],
+
   // All core tools
   "group:core": [
     "read",
@@ -76,16 +79,8 @@ export const TOOL_PROFILES: Record<ToolProfileId, { allow?: string[]; deny?: str
  * Subagents should not have access to session management or system tools.
  */
 export const DEFAULT_SUBAGENT_TOOL_DENY: string[] = [
-  // Future: session management tools
-  // "sessions_list",
-  // "sessions_history",
-  // "sessions_send",
-  // "sessions_spawn",
-  // "session_status",
-
-  // Future: system tools
-  // "gateway",
-  // "agents_list",
+  // Subagents cannot spawn subagents (no nested spawning)
+  "sessions_spawn",
 ];
 
 /**

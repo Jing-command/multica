@@ -6,6 +6,7 @@ import { createProcessTool } from "./tools/process.js";
 import { createGlobTool } from "./tools/glob.js";
 import { createWebFetchTool, createWebSearchTool } from "./tools/web/index.js";
 import { createMemoryTools } from "./tools/memory/index.js";
+import { createSessionsSpawnTool } from "./tools/sessions-spawn.js";
 import { filterTools } from "./tools/policy.js";
 import { isMulticaError, isRetryableError } from "../shared/errors.js";
 
@@ -19,6 +20,10 @@ export interface CreateToolsOptions {
   profileId?: string | undefined;
   /** Base directory for profiles (optional) */
   profileBaseDir?: string | undefined;
+  /** Whether this agent is a subagent (passed to sessions_spawn tool) */
+  isSubagent?: boolean | undefined;
+  /** Session ID of the agent (passed to sessions_spawn tool) */
+  sessionId?: string | undefined;
 }
 
 type ToolErrorPayload = {
@@ -88,7 +93,7 @@ function wrapTool<TParams, TResult>(
 export function createAllTools(options: CreateToolsOptions | string): AgentTool<any>[] {
   // Support legacy string argument for backwards compatibility
   const opts: CreateToolsOptions = typeof options === "string" ? { cwd: options } : options;
-  const { cwd, profileId, profileBaseDir } = opts;
+  const { cwd, profileId, profileBaseDir, isSubagent, sessionId } = opts;
 
   const baseTools = createCodingTools(cwd).filter(
     (tool) => tool.name !== "bash",
@@ -118,6 +123,13 @@ export function createAllTools(options: CreateToolsOptions | string): AgentTool<
     tools.push(...memoryTools);
   }
 
+  // Add sessions_spawn tool (will be filtered by policy for subagents)
+  const sessionsSpawnTool = createSessionsSpawnTool({
+    isSubagent: isSubagent ?? false,
+    sessionId,
+  });
+  tools.push(sessionsSpawnTool as AgentTool<any>);
+
   return tools;
 }
 
@@ -138,6 +150,8 @@ export function resolveTools(options: AgentOptions): AgentTool<any>[] {
     cwd,
     profileId: options.profileId,
     profileBaseDir: options.profileBaseDir,
+    isSubagent: options.isSubagent,
+    sessionId: options.sessionId,
   });
 
   // Apply policy filtering

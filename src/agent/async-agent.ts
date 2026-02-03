@@ -14,6 +14,7 @@ export class AsyncAgent {
   private readonly channel = new Channel<ChannelItem>();
   private _closed = false;
   private queue: Promise<void> = Promise.resolve();
+  private closeCallbacks: Array<() => void> = [];
   readonly sessionId: string;
 
   constructor(options?: AgentOptions) {
@@ -57,10 +58,33 @@ export class AsyncAgent {
     return this.channel;
   }
 
-  /** Close agent, stop all reads */
+  /** Returns a promise that resolves when the current message queue is drained */
+  waitForIdle(): Promise<void> {
+    return this.queue;
+  }
+
+  /** Register a callback to be invoked when the agent is closed */
+  onClose(callback: () => void): void {
+    if (this._closed) {
+      // Already closed, fire immediately
+      callback();
+      return;
+    }
+    this.closeCallbacks.push(callback);
+  }
+
+  /** Close agent, stop all reads, fire close callbacks */
   close(): void {
     if (this._closed) return;
     this._closed = true;
     this.channel.close();
+    for (const cb of this.closeCallbacks) {
+      try {
+        cb();
+      } catch {
+        // Don't let callback errors prevent other callbacks
+      }
+    }
+    this.closeCallbacks = [];
   }
 }
