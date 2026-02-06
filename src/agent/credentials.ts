@@ -31,6 +31,8 @@ export type CredentialsConfig = {
     order?: Record<string, string[]> | undefined;
   } | undefined;
   tools?: Record<string, ToolConfig> | undefined;
+  /** Channel plugin configs (telegram, discord, etc.) */
+  channels?: Record<string, Record<string, Record<string, unknown>> | undefined> | undefined;
 };
 
 type SkillsEnvConfig = {
@@ -215,6 +217,12 @@ export class CredentialManager {
     return Object.keys(providers).filter(
       (key) => key === provider || key.startsWith(prefix),
     );
+  }
+
+  /** Get channel plugin configs from credentials.json5 `channels` section. */
+  getChannelsConfig(): Record<string, Record<string, Record<string, unknown>> | undefined> {
+    this.loadCore();
+    return this.coreConfig?.channels ?? {};
   }
 
   getResolvedEnvSnapshot(): Record<string, string> {

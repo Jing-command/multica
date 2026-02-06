@@ -4,7 +4,7 @@
 
 export { ChannelManager } from "./manager.js";
 export { registerChannel, getChannel, listChannels } from "./registry.js";
-export { loadChannelsConfig, CHANNELS_CONFIG_PATH } from "./config.js";
+export { loadChannelsConfig } from "./config.js";
 export type {
   ChannelPlugin,
   ChannelMessage,
