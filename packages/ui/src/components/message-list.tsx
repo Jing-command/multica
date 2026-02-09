@@ -22,7 +22,16 @@ function getThinkingText(blocks: ContentBlock[]): string {
     .join("")
 }
 
-/** Strip LLM-facing metadata prefixes from user messages for clean display */
+/**
+ * Strip LLM-facing metadata prefixes from user messages for clean display.
+ *
+ * TODO: This is a short-term workaround. The root cause is that agent.write()
+ * bakes timestamp and media-type prefixes into the message content, and
+ * session JSONL stores the enriched string as-is. The proper fix is to
+ * separate "displayContent" from "llmContent" at the storage layer so the
+ * UI never sees LLM context prefixes. This regex approach is fragile —
+ * any change to timestamp format, locale, or new media types will break it.
+ */
 function stripUserMetadata(text: string): string {
   // Strip timestamp envelope: [Mon 2026-02-09 14:38 GMT+8]
   let cleaned = text.replace(/^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}[^\]]*\]\s*/, "")
