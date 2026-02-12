@@ -26,7 +26,7 @@ export default function ProfilePage() {
   const { providers, current, setProvider, refresh, loading: providerLoading } = useProviderStore()
 
   const [profileLoading, setProfileLoading] = useState(true)
-  const [saving, setSaving] = useState(false)
+  const [_saving, setSaving] = useState(false)
   const [name, setName] = useState('')
   const [userContent, setUserContent] = useState('')
   const [hasChanges, setHasChanges] = useState(false)

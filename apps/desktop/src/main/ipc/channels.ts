@@ -30,11 +30,22 @@ function maskToken(token: unknown): string | undefined {
 export function registerChannelsIpcHandlers(): void {
   /**
    * List all channel account states (running / stopped / error).
+   * Waits for any "starting" status to settle before returning.
    */
   ipcMain.handle('channels:listStates', async () => {
     const hub = getCurrentHub()
     if (!hub) return []
-    return hub.channelManager.listAccountStates()
+
+    let states = hub.channelManager.listAccountStates()
+
+    // Wait for "starting" status to settle (max 3.5s, since internal timeout is 3s)
+    const start = Date.now()
+    while (states.some(s => s.status === 'starting') && Date.now() - start < 3500) {
+      await new Promise(r => setTimeout(r, 100))
+      states = hub.channelManager.listAccountStates()
+    }
+
+    return states
   })
 
   /**
