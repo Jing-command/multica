@@ -4,9 +4,11 @@
  * Parse skill files with YAML frontmatter and markdown body
  */
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { parse as parseYaml } from "yaml";
-import type { Skill, SkillFrontmatter, SkillSource } from "./types.js";
+import type { Skill, SkillFrontmatter, SkillSource, SkillInstallSpec } from "./types.js";
+import { parseDotEnv } from "./dotenv.js";
 
 /**
  * Parse YAML frontmatter from markdown content
@@ -72,21 +74,37 @@ function validateFrontmatter(raw: Record<string, unknown>): SkillFrontmatter | n
   // Parse metadata if present
   if (typeof raw.metadata === "object" && raw.metadata !== null) {
     const meta = raw.metadata as Record<string, unknown>;
+    const filterStrings = (arr: unknown): string[] | undefined =>
+      Array.isArray(arr) ? arr.filter((v): v is string => typeof v === "string") : undefined;
+
     frontmatter.metadata = {
       emoji: typeof meta.emoji === "string" ? meta.emoji : undefined,
-      requiresEnv: Array.isArray(meta.requiresEnv)
-        ? meta.requiresEnv.filter((v): v is string => typeof v === "string")
-        : undefined,
-      requiresBinaries: Array.isArray(meta.requiresBinaries)
-        ? meta.requiresBinaries.filter((v): v is string => typeof v === "string")
-        : undefined,
-      platforms: Array.isArray(meta.platforms)
-        ? meta.platforms.filter((v): v is string => typeof v === "string")
-        : undefined,
-      tags: Array.isArray(meta.tags)
-        ? meta.tags.filter((v): v is string => typeof v === "string")
-        : undefined,
+      tags: filterStrings(meta.tags),
+      // Legacy fields
+      requiresEnv: filterStrings(meta.requiresEnv),
+      requiresBinaries: filterStrings(meta.requiresBinaries),
+      platforms: filterStrings(meta.platforms),
+      // New fields
+      always: typeof meta.always === "boolean" ? meta.always : undefined,
+      skillKey: typeof meta.skillKey === "string" ? meta.skillKey : undefined,
+      os: filterStrings(meta.os),
     };
+
+    // Parse requires nested object
+    if (typeof meta.requires === "object" && meta.requires !== null) {
+      const req = meta.requires as Record<string, unknown>;
+      frontmatter.metadata.requires = {
+        bins: filterStrings(req.bins),
+        anyBins: filterStrings(req.anyBins),
+        env: filterStrings(req.env),
+        config: filterStrings(req.config),
+      };
+    }
+
+    // Parse install array
+    if (Array.isArray(meta.install)) {
+      frontmatter.metadata.install = meta.install as SkillInstallSpec[];
+    }
   }
 
   // Parse invocation control fields
@@ -170,12 +188,25 @@ export function parseSkillFile(
       return null;
     }
 
+    // Load .env from skill directory
+    const skillDir = dirname(filePath);
+    const envPath = join(skillDir, ".env");
+    let env: Record<string, string> = {};
+    if (existsSync(envPath)) {
+      try {
+        env = parseDotEnv(readFileSync(envPath, "utf-8"));
+      } catch {
+        // Ignore .env parse errors
+      }
+    }
+
     return {
       id: skillId,
       frontmatter,
       instructions,
       source,
       filePath,
+      env,
     };
   } catch {
     // File read error or other issues

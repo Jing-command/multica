@@ -198,8 +198,8 @@ export function initializeManagedSkills(): void {
 
       // Check if skill exists in managed
       if (!existsSync(dest)) {
-        // Skill doesn't exist, copy it
-        cpSync(src, dest, { recursive: true, dereference: true });
+        // Skill doesn't exist, copy it (skip .env files - those are user-specific)
+        cpSync(src, dest, { recursive: true, dereference: true, filter: (s) => !s.endsWith("/.env") });
         continue;
       }
 
@@ -214,9 +214,21 @@ export function initializeManagedSkills(): void {
 
       // Update if bundled version is higher
       if (compareVersions(bundledVersion, managedVersion) > 0) {
-        // Remove old and copy new
+        // Preserve user's .env file across upgrades
+        const envPath = join(dest, ".env");
+        let savedEnv: string | null = null;
+        if (existsSync(envPath)) {
+          try { savedEnv = readFileSync(envPath, "utf-8"); } catch { /* ignore */ }
+        }
+
+        // Remove old and copy new (skip .env from bundle)
         rmSync(dest, { recursive: true });
-        cpSync(src, dest, { recursive: true, dereference: true });
+        cpSync(src, dest, { recursive: true, dereference: true, filter: (s) => !s.endsWith("/.env") });
+
+        // Restore user's .env
+        if (savedEnv !== null) {
+          writeFileSync(envPath, savedEnv, "utf-8");
+        }
       }
     }
 

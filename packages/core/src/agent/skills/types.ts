@@ -147,6 +147,8 @@ export interface Skill {
   source: SkillSource;
   /** Full path to SKILL.md */
   filePath: string;
+  /** Environment variables loaded from the skill's .env file */
+  env: Record<string, string>;
 }
 
 // ============================================================================

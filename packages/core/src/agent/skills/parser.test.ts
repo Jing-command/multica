@@ -1,5 +1,8 @@
-import { describe, it, expect } from "vitest";
-import { parseFrontmatter } from "./parser.js";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { parseFrontmatter, parseSkillFile } from "./parser.js";
 
 describe("parser", () => {
   describe("parseFrontmatter", () => {
@@ -238,6 +241,128 @@ Body.
       expect(frontmatter?.name).toBe("Special: Characters & Symbols");
       expect(frontmatter?.description).toBe("Quotes and colons: work");
       expect(body).toBe("Body.");
+    });
+  });
+
+  describe("parseSkillFile", () => {
+    const testDir = join(tmpdir(), `multica-parser-test-${Date.now()}`);
+
+    beforeEach(() => {
+      mkdirSync(testDir, { recursive: true });
+    });
+
+    afterEach(() => {
+      rmSync(testDir, { recursive: true, force: true });
+    });
+
+    it("should parse metadata.requires fields", () => {
+      const skillDir = join(testDir, "test-skill");
+      mkdirSync(skillDir);
+      writeFileSync(join(skillDir, "SKILL.md"), `---
+name: Test Skill
+metadata:
+  requires:
+    env:
+      - API_KEY
+      - SECRET
+    bins:
+      - node
+    anyBins:
+      - whisper
+      - whisper-cli
+    config:
+      - browser.enabled
+---
+Instructions.
+`);
+
+      const skill = parseSkillFile(join(skillDir, "SKILL.md"), "test-skill", "bundled");
+      expect(skill).not.toBeNull();
+      expect(skill!.frontmatter.metadata?.requires).toEqual({
+        env: ["API_KEY", "SECRET"],
+        bins: ["node"],
+        anyBins: ["whisper", "whisper-cli"],
+        config: ["browser.enabled"],
+      });
+    });
+
+    it("should parse metadata.always flag", () => {
+      const skillDir = join(testDir, "always-skill");
+      mkdirSync(skillDir);
+      writeFileSync(join(skillDir, "SKILL.md"), `---
+name: Always Skill
+metadata:
+  always: true
+---
+Instructions.
+`);
+
+      const skill = parseSkillFile(join(skillDir, "SKILL.md"), "always-skill", "bundled");
+      expect(skill).not.toBeNull();
+      expect(skill!.frontmatter.metadata?.always).toBe(true);
+    });
+
+    it("should parse metadata.os field", () => {
+      const skillDir = join(testDir, "os-skill");
+      mkdirSync(skillDir);
+      writeFileSync(join(skillDir, "SKILL.md"), `---
+name: OS Skill
+metadata:
+  os:
+    - darwin
+    - linux
+---
+Instructions.
+`);
+
+      const skill = parseSkillFile(join(skillDir, "SKILL.md"), "os-skill", "bundled");
+      expect(skill).not.toBeNull();
+      expect(skill!.frontmatter.metadata?.os).toEqual(["darwin", "linux"]);
+    });
+
+    it("should parse metadata.skillKey field", () => {
+      const skillDir = join(testDir, "key-skill");
+      mkdirSync(skillDir);
+      writeFileSync(join(skillDir, "SKILL.md"), `---
+name: Key Skill
+metadata:
+  skillKey: custom-key
+---
+Instructions.
+`);
+
+      const skill = parseSkillFile(join(skillDir, "SKILL.md"), "key-skill", "bundled");
+      expect(skill).not.toBeNull();
+      expect(skill!.frontmatter.metadata?.skillKey).toBe("custom-key");
+    });
+
+    it("should load .env file from skill directory", () => {
+      const skillDir = join(testDir, "env-skill");
+      mkdirSync(skillDir);
+      writeFileSync(join(skillDir, "SKILL.md"), `---
+name: Env Skill
+---
+Instructions.
+`);
+      writeFileSync(join(skillDir, ".env"), "API_KEY=test-key\nSECRET=test-secret\n");
+
+      const skill = parseSkillFile(join(skillDir, "SKILL.md"), "env-skill", "bundled");
+      expect(skill).not.toBeNull();
+      expect(skill!.env).toEqual({ API_KEY: "test-key", SECRET: "test-secret" });
+    });
+
+    it("should return empty env when no .env file exists", () => {
+      const skillDir = join(testDir, "no-env-skill");
+      mkdirSync(skillDir);
+      writeFileSync(join(skillDir, "SKILL.md"), `---
+name: No Env Skill
+---
+Instructions.
+`);
+
+      const skill = parseSkillFile(join(skillDir, "SKILL.md"), "no-env-skill", "bundled");
+      expect(skill).not.toBeNull();
+      expect(skill!.env).toEqual({});
     });
   });
 });

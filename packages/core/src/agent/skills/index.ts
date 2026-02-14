@@ -72,6 +72,7 @@ export {
 } from "./eligibility.js";
 
 export { parseFrontmatter, parseSkillFile } from "./parser.js";
+export { parseDotEnv } from "./dotenv.js";
 export { loadAllSkills, getProfileSkillsDir, initializeManagedSkills, getManagedSkillsDir } from "./loader.js";
 
 // Export install module

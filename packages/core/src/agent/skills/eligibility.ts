@@ -19,7 +19,7 @@ import {
   normalizeRequirements,
   normalizePlatforms,
 } from "./types.js";
-import { credentialManager, getSkillsEnvPath } from "../credentials.js";
+import { dirname, join } from "node:path";
 
 // ============================================================================
 // Diagnostic Types
@@ -74,11 +74,17 @@ export function binaryExists(binary: string): boolean {
 /**
  * Check if an environment variable is set
  *
+ * Checks the skill's own .env first, then falls back to process.env.
+ *
  * @param envVar - Environment variable name
+ * @param skill - Skill to check against
  * @returns True if set (even if empty string)
  */
-function envExists(envVar: string): boolean {
-  return credentialManager.hasEnv(envVar);
+function envExists(envVar: string, skill: Skill): boolean {
+  if (Object.prototype.hasOwnProperty.call(skill.env, envVar)) {
+    return true;
+  }
+  return envVar in process.env;
 }
 
 // ============================================================================
@@ -306,7 +312,7 @@ export function checkEligibilityDetailed(
   if (requirements.env && requirements.env.length > 0) {
     for (const envVar of requirements.env) {
       // Check if env var exists
-      if (envExists(envVar)) continue;
+      if (envExists(envVar, skill)) continue;
 
       missingEnvVars.push(envVar);
       reasons.push(`Required environment variable not set: ${envVar}`);
@@ -437,14 +443,14 @@ function getBinaryInstallHint(binary: string, platform: NodeJS.Platform): string
 /**
  * Generate hints for missing environment variables
  */
-function generateEnvHint(envVars: string[], _skill: Skill): string {
+function generateEnvHint(envVars: string[], skill: Skill): string {
   const hints: string[] = [];
+  const envPath = join(dirname(skill.filePath), ".env");
 
   for (const envVar of envVars) {
     // Check for well-known API key patterns
     if (envVar.endsWith("_API_KEY") || envVar.endsWith("_KEY")) {
-      const service = envVar.replace(/_API_KEY$|_KEY$/, "").toLowerCase();
-      hints.push(`Set ${envVar} in your environment or add to ${getSkillsEnvPath()}`);
+      hints.push(`Set ${envVar} in ${envPath} or your environment`);
 
       // Add provider-specific hints
       const providerHint = getApiKeyHint(envVar);
@@ -452,7 +458,7 @@ function generateEnvHint(envVars: string[], _skill: Skill): string {
         hints.push(providerHint);
       }
     } else {
-      hints.push(`export ${envVar}=<value>`);
+      hints.push(`Set ${envVar} in ${envPath} or export ${envVar}=<value>`);
     }
   }
 

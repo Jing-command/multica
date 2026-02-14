@@ -7,6 +7,7 @@ function createSkill(
   id: string,
   frontmatter: Partial<SkillFrontmatter> & { name: string },
   source: "bundled" | "profile" = "bundled",
+  env: Record<string, string> = {},
 ): Skill {
   return {
     id,
@@ -14,6 +15,7 @@ function createSkill(
     instructions: "Test instructions",
     source,
     filePath: `/path/to/${id}/SKILL.md`,
+    env,
   };
 }
 
@@ -234,6 +236,38 @@ describe("eligibility", () => {
 
         const result = checkEligibility(skill, ctx("darwin"));
         expect(result.eligible).toBe(true);
+      });
+
+      it("should be eligible when env var is in skill .env file", () => {
+        delete process.env.SKILL_API_KEY;
+
+        const skill = createSkill("test", {
+          name: "Test Skill",
+          metadata: {
+            requires: {
+              env: ["SKILL_API_KEY"],
+            },
+          },
+        }, "bundled", { SKILL_API_KEY: "test-value" });
+
+        const result = checkEligibility(skill, ctx("darwin"));
+        expect(result.eligible).toBe(true);
+      });
+
+      it("should be ineligible when env var not in skill .env or process.env", () => {
+        delete process.env.MISSING_KEY;
+
+        const skill = createSkill("test", {
+          name: "Test Skill",
+          metadata: {
+            requires: {
+              env: ["MISSING_KEY"],
+            },
+          },
+        }, "bundled", {});
+
+        const result = checkEligibility(skill, ctx("darwin"));
+        expect(result.eligible).toBe(false);
       });
 
       it("should be eligible even if env var is empty string", () => {
