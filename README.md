@@ -113,11 +113,3 @@ Web/Mobile Clients
 | Channel system | [docs/channels/README.md](./docs/channels/README.md) |
 | Channel media handling | [docs/channels/media-handling.md](./docs/channels/media-handling.md) |
 | Desktop login integration | [docs/auth/desktop-integration.md](./docs/auth/desktop-integration.md) |
-
-**Design Proposals** (not yet implemented)
-
-| Topic | Link |
-|-------|------|
-| Auto memory refresh | [docs/design/auto-memory-refresh.md](./docs/design/auto-memory-refresh.md) |
-| Cron job tool | [docs/design/cron-job-tool.md](./docs/design/cron-job-tool.md) |
-| Dashboard design | [docs/plans/2026-02-12-dashboard-design.md](./docs/plans/2026-02-12-dashboard-design.md) |
