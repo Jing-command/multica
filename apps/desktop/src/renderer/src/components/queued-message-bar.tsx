@@ -15,13 +15,12 @@ export function QueuedMessageBar({ messages, isRunning, onRemove, onClear }: Que
     ? 'Agent is running. Queued messages will send automatically.'
     : 'Queued messages are being sent.'
 
-  const firstMessagePreview = (() => {
-    const text = messages[0]?.text ?? ''
-    if (text.length <= 120) return text
-    return `${text.slice(0, 120)}...`
-  })()
-
   if (messages.length === 0) return null
+  const firstMessage = messages[0]
+  const firstMessagePreview =
+    firstMessage.text.length <= 120
+      ? firstMessage.text
+      : `${firstMessage.text.slice(0, 120)}...`
 
   return (
     <div className="container px-4 pb-2">
@@ -66,8 +65,14 @@ export function QueuedMessageBar({ messages, isRunning, onRemove, onClear }: Que
           </div>
         ) : (
           <div className="px-2 pb-2 space-y-1">
-            <div className="rounded-md bg-background/70 px-2 py-1.5 text-xs text-foreground/85 break-all">
-              {firstMessagePreview}
+            <div className="flex items-start justify-between gap-2 rounded-md bg-background/70 px-2 py-1.5">
+              <div className="text-xs text-foreground/85 break-all">{firstMessagePreview}</div>
+              <button
+                onClick={() => onRemove(firstMessage.id)}
+                className="shrink-0 text-xs text-muted-foreground hover:text-foreground transition-colors"
+              >
+                Remove
+              </button>
             </div>
             {messages.length > 1 && (
               <div className="px-1 text-xs text-muted-foreground">
