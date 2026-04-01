@@ -471,20 +471,16 @@ func (h *Handler) canAssignAgent(ctx context.Context, r *http.Request, agentID, 
 }
 
 // shouldEnqueueAgentTask returns true when an issue assignment should trigger
-// the assigned agent. Only fires for "todo" status — assignment means "start
-// fresh work", so the agent shouldn't be triggered on issues already in
-// progress, blocked, or done.
+// the assigned agent. No status gate — assignment is an explicit human action,
+// so it should trigger regardless of issue status (e.g. assigning an agent to
+// a done issue to fix a discovered problem).
 func (h *Handler) shouldEnqueueAgentTask(ctx context.Context, issue db.Issue) bool {
-	if issue.Status != "todo" {
-		return false
-	}
 	return h.isAgentTriggerEnabled(ctx, issue, "on_assign")
 }
 
 // shouldEnqueueOnComment returns true if a member comment on this issue should
-// trigger the assigned agent. Unlike on_assign (todo only), on_comment fires
-// for any non-terminal status — comments are conversational and can happen at
-// any stage of active work (todo, in_progress, in_review, blocked).
+// trigger the assigned agent. Fires for any non-terminal status — comments are
+// conversational and can happen at any stage of active work.
 func (h *Handler) shouldEnqueueOnComment(ctx context.Context, issue db.Issue) bool {
 	// Don't trigger on terminal statuses (done, cancelled).
 	if issue.Status == "done" || issue.Status == "cancelled" {

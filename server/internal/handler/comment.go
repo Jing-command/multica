@@ -239,12 +239,9 @@ func (h *Handler) isReplyToMemberThread(parent *db.Comment, content string, issu
 // enqueues a task for each mentioned agent. Skips self-mentions, agents that
 // are already the issue's assignee (handled by on_comment), and agents with
 // on_mention trigger disabled.
+// Note: no status gate here — @mention is an explicit action and should work
+// even on done/cancelled issues (the agent can reopen the issue if needed).
 func (h *Handler) enqueueMentionedAgentTasks(ctx context.Context, issue db.Issue, comment db.Comment, authorType, authorID string) {
-	// Don't trigger on terminal statuses.
-	if issue.Status == "done" || issue.Status == "cancelled" {
-		return
-	}
-
 	mentions := util.ParseMentions(comment.Content)
 	for _, m := range mentions {
 		if m.Type != "agent" {
