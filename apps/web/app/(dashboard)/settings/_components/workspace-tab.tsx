@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Save, LogOut, Plus, Trash2 } from "lucide-react";
+import { Save, LogOut } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
@@ -21,7 +21,6 @@ import { toast } from "sonner";
 import { useAuthStore } from "@/features/auth";
 import { useWorkspaceStore } from "@/features/workspace";
 import { api } from "@/shared/api";
-import type { WorkspaceRepo } from "@/shared/types";
 
 export function WorkspaceTab() {
   const user = useAuthStore((s) => s.user);
@@ -34,7 +33,6 @@ export function WorkspaceTab() {
   const [name, setName] = useState(workspace?.name ?? "");
   const [description, setDescription] = useState(workspace?.description ?? "");
   const [context, setContext] = useState(workspace?.context ?? "");
-  const [repos, setRepos] = useState<WorkspaceRepo[]>(workspace?.repos ?? []);
   const [saving, setSaving] = useState(false);
   const [actionId, setActionId] = useState<string | null>(null);
   const [confirmAction, setConfirmAction] = useState<{
@@ -52,7 +50,6 @@ export function WorkspaceTab() {
     setName(workspace?.name ?? "");
     setDescription(workspace?.description ?? "");
     setContext(workspace?.context ?? "");
-    setRepos(workspace?.repos ?? []);
   }, [workspace]);
 
   const handleSave = async () => {
@@ -63,7 +60,6 @@ export function WorkspaceTab() {
         name,
         description,
         context,
-        repos,
       });
       updateWorkspace(updated);
       toast.success("Workspace settings saved");
@@ -72,18 +68,6 @@ export function WorkspaceTab() {
     } finally {
       setSaving(false);
     }
-  };
-
-  const handleAddRepo = () => {
-    setRepos([...repos, { url: "", description: "" }]);
-  };
-
-  const handleRemoveRepo = (index: number) => {
-    setRepos(repos.filter((_, i) => i !== index));
-  };
-
-  const handleRepoChange = (index: number, field: keyof WorkspaceRepo, value: string) => {
-    setRepos(repos.map((r, i) => (i === index ? { ...r, [field]: value } : r)));
   };
 
   const handleLeaveWorkspace = () => {
@@ -186,69 +170,6 @@ export function WorkspaceTab() {
               <p className="text-xs text-muted-foreground">
                 Only admins and owners can update workspace settings.
               </p>
-            )}
-          </CardContent>
-        </Card>
-      </section>
-
-      {/* Repositories */}
-      <section className="space-y-4">
-        <h2 className="text-sm font-semibold">Repositories</h2>
-
-        <Card>
-          <CardContent className="space-y-3">
-            <p className="text-xs text-muted-foreground">
-              GitHub repositories associated with this workspace. Agents use these to clone and work on code.
-            </p>
-
-            {repos.map((repo, index) => (
-              <div key={index} className="flex gap-2">
-                <div className="flex-1 space-y-1.5">
-                  <Input
-                    type="url"
-                    value={repo.url}
-                    onChange={(e) => handleRepoChange(index, "url", e.target.value)}
-                    disabled={!canManageWorkspace}
-                    placeholder="https://github.com/org/repo"
-                    className="text-sm"
-                  />
-                  <Input
-                    type="text"
-                    value={repo.description}
-                    onChange={(e) => handleRepoChange(index, "description", e.target.value)}
-                    disabled={!canManageWorkspace}
-                    placeholder="Description (e.g. Go backend + Next.js frontend)"
-                    className="text-sm"
-                  />
-                </div>
-                {canManageWorkspace && (
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="mt-0.5 shrink-0 text-muted-foreground hover:text-destructive"
-                    onClick={() => handleRemoveRepo(index)}
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </Button>
-                )}
-              </div>
-            ))}
-
-            {canManageWorkspace && (
-              <div className="flex items-center justify-between pt-1">
-                <Button variant="outline" size="sm" onClick={handleAddRepo}>
-                  <Plus className="h-3 w-3" />
-                  Add repository
-                </Button>
-                <Button
-                  size="sm"
-                  onClick={handleSave}
-                  disabled={saving || !name.trim() || !canManageWorkspace}
-                >
-                  <Save className="h-3 w-3" />
-                  {saving ? "Saving..." : "Save"}
-                </Button>
-              </div>
             )}
           </CardContent>
         </Card>
