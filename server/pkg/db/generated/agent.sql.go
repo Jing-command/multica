@@ -414,6 +414,41 @@ func (q *Queries) GetAgent(ctx context.Context, id pgtype.UUID) (Agent, error) {
 	return i, err
 }
 
+const getAgentByName = `-- name: GetAgentByName :one
+SELECT id, workspace_id, name, avatar_url, runtime_mode, runtime_config, visibility, status, max_concurrent_tasks, owner_id, created_at, updated_at, description, runtime_id, instructions, archived_at, archived_by FROM agent
+WHERE workspace_id = $1 AND name = $2 AND archived_at IS NULL
+`
+
+type GetAgentByNameParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	Name        string      `json:"name"`
+}
+
+func (q *Queries) GetAgentByName(ctx context.Context, arg GetAgentByNameParams) (Agent, error) {
+	row := q.db.QueryRow(ctx, getAgentByName, arg.WorkspaceID, arg.Name)
+	var i Agent
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Name,
+		&i.AvatarUrl,
+		&i.RuntimeMode,
+		&i.RuntimeConfig,
+		&i.Visibility,
+		&i.Status,
+		&i.MaxConcurrentTasks,
+		&i.OwnerID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Description,
+		&i.RuntimeID,
+		&i.Instructions,
+		&i.ArchivedAt,
+		&i.ArchivedBy,
+	)
+	return i, err
+}
+
 const getAgentInWorkspace = `-- name: GetAgentInWorkspace :one
 SELECT id, workspace_id, name, avatar_url, runtime_mode, runtime_config, visibility, status, max_concurrent_tasks, owner_id, created_at, updated_at, description, runtime_id, instructions, archived_at, archived_by FROM agent
 WHERE id = $1 AND workspace_id = $2
@@ -810,6 +845,22 @@ func (q *Queries) ListTasksByIssue(ctx context.Context, issueID pgtype.UUID) ([]
 		return nil, err
 	}
 	return items, nil
+}
+
+const rebindPendingTasksToRuntime = `-- name: RebindPendingTasksToRuntime :exec
+UPDATE agent_task_queue
+SET runtime_id = $2
+WHERE agent_id = $1 AND status IN ('queued', 'dispatched')
+`
+
+type RebindPendingTasksToRuntimeParams struct {
+	AgentID   pgtype.UUID `json:"agent_id"`
+	RuntimeID pgtype.UUID `json:"runtime_id"`
+}
+
+func (q *Queries) RebindPendingTasksToRuntime(ctx context.Context, arg RebindPendingTasksToRuntimeParams) error {
+	_, err := q.db.Exec(ctx, rebindPendingTasksToRuntime, arg.AgentID, arg.RuntimeID)
+	return err
 }
 
 const restoreAgent = `-- name: RestoreAgent :one

@@ -103,6 +103,13 @@ var issueRunMessagesCmd = &cobra.Command{
 	RunE:  runIssueRunMessages,
 }
 
+var issueChildrenCmd = &cobra.Command{
+	Use:   "children <id>",
+	Short: "List child issues of a parent issue",
+	Args:  exactArgs(1),
+	RunE:  runIssueChildren,
+}
+
 var issueSearchCmd = &cobra.Command{
 	Use:   "search <query>",
 	Short: "Search issues by title or description",
@@ -124,6 +131,7 @@ func init() {
 	issueCmd.AddCommand(issueCommentCmd)
 	issueCmd.AddCommand(issueRunsCmd)
 	issueCmd.AddCommand(issueRunMessagesCmd)
+	issueCmd.AddCommand(issueChildrenCmd)
 	issueCmd.AddCommand(issueSearchCmd)
 
 	issueCommentCmd.AddCommand(issueCommentListCmd)
@@ -191,6 +199,9 @@ func init() {
 	issueSearchCmd.Flags().Int("limit", 20, "Maximum number of results to return")
 	issueSearchCmd.Flags().Bool("include-closed", false, "Include done and cancelled issues")
 	issueSearchCmd.Flags().String("output", "table", "Output format: table or json")
+
+	// issue children
+	issueChildrenCmd.Flags().String("output", "json", "Output format: table or json")
 }
 
 // ---------------------------------------------------------------------------
@@ -789,6 +800,50 @@ func runIssueRunMessages(cmd *cobra.Command, args []string) error {
 			strVal(m, "type"),
 			strVal(m, "tool"),
 			content,
+		})
+	}
+	cli.PrintTable(os.Stdout, headers, rows)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Children command
+// ---------------------------------------------------------------------------
+
+func runIssueChildren(cmd *cobra.Command, args []string) error {
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var result map[string]any
+	if err := client.GetJSON(ctx, "/api/issues/"+args[0]+"/children", &result); err != nil {
+		return fmt.Errorf("list children: %w", err)
+	}
+
+	issuesRaw, _ := result["issues"].([]any)
+
+	output, _ := cmd.Flags().GetString("output")
+	if output == "json" {
+		return cli.PrintJSON(os.Stdout, issuesRaw)
+	}
+
+	headers := []string{"ID", "TITLE", "STATUS", "PRIORITY", "ASSIGNEE"}
+	rows := make([][]string, 0, len(issuesRaw))
+	for _, raw := range issuesRaw {
+		issue, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		rows = append(rows, []string{
+			truncateID(strVal(issue, "id")),
+			strVal(issue, "title"),
+			strVal(issue, "status"),
+			strVal(issue, "priority"),
+			formatAssignee(issue),
 		})
 	}
 	cli.PrintTable(os.Stdout, headers, rows)
