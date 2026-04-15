@@ -110,6 +110,41 @@ var issueChildrenCmd = &cobra.Command{
 	RunE:  runIssueChildren,
 }
 
+var issueSubmitReviewCmd = &cobra.Command{
+	Use:   "submit-review <issue-id>",
+	Short: "Submit an issue for workflow review",
+	Args:  exactArgs(1),
+	RunE:  runIssueSubmitReview,
+}
+
+var issueReviewCmd = &cobra.Command{
+	Use:   "review <issue-id>",
+	Short: "Review an issue workflow decision",
+	Args:  exactArgs(1),
+	RunE:  runIssueReview,
+}
+
+var issueReportBlockedCmd = &cobra.Command{
+	Use:   "report-blocked <issue-id>",
+	Short: "Report an issue as blocked in workflow",
+	Args:  exactArgs(1),
+	RunE:  runIssueReportBlocked,
+}
+
+var issueReplanCmd = &cobra.Command{
+	Use:   "replan <issue-id>",
+	Short: "Request a workflow replan for an issue",
+	Args:  exactArgs(1),
+	RunE:  runIssueReplan,
+}
+
+var issueFinalizeCmd = &cobra.Command{
+	Use:   "finalize <issue-id>",
+	Short: "Finalize a parent issue workflow",
+	Args:  exactArgs(1),
+	RunE:  runIssueFinalize,
+}
+
 var issueSearchCmd = &cobra.Command{
 	Use:   "search <query>",
 	Short: "Search issues by title or description",
@@ -119,6 +154,14 @@ var issueSearchCmd = &cobra.Command{
 
 var validIssueStatuses = []string{
 	"backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled",
+}
+
+var validReviewDecisions = []string{
+	"approved", "changes_requested", "blocked",
+}
+
+var validCriterionResults = []string{
+	"pass", "fail", "not_applicable",
 }
 
 func init() {
@@ -132,6 +175,11 @@ func init() {
 	issueCmd.AddCommand(issueRunsCmd)
 	issueCmd.AddCommand(issueRunMessagesCmd)
 	issueCmd.AddCommand(issueChildrenCmd)
+	issueCmd.AddCommand(issueSubmitReviewCmd)
+	issueCmd.AddCommand(issueReviewCmd)
+	issueCmd.AddCommand(issueReportBlockedCmd)
+	issueCmd.AddCommand(issueReplanCmd)
+	issueCmd.AddCommand(issueFinalizeCmd)
 	issueCmd.AddCommand(issueSearchCmd)
 
 	issueCommentCmd.AddCommand(issueCommentListCmd)
@@ -202,6 +250,33 @@ func init() {
 
 	// issue children
 	issueChildrenCmd.Flags().String("output", "json", "Output format: table or json")
+
+	// issue submit-review
+	issueSubmitReviewCmd.Flags().String("idempotency-key", "", "Idempotency key for submit-review request")
+	issueSubmitReviewCmd.Flags().String("summary", "", "Submission summary")
+	issueSubmitReviewCmd.Flags().String("pr-url", "", "Pull request URL to include in submission evidence")
+	issueSubmitReviewCmd.Flags().String("output", "json", "Output format: table or json")
+
+	// issue review
+	issueReviewCmd.Flags().String("idempotency-key", "", "Idempotency key for review request")
+	issueReviewCmd.Flags().String("review-round-id", "", "Submitted review round ID to resolve")
+	issueReviewCmd.Flags().String("verdict", "", "Review verdict")
+	issueReviewCmd.Flags().String("summary", "", "Review summary")
+	issueReviewCmd.Flags().StringSlice("criterion", nil, "Criterion verdict in criterion-id:result[:note] format")
+	issueReviewCmd.Flags().String("output", "json", "Output format: table or json")
+
+	// issue report-blocked
+	issueReportBlockedCmd.Flags().String("reason", "", "Blocking reason")
+	issueReportBlockedCmd.Flags().String("output", "json", "Output format: table or json")
+
+	// issue replan
+	issueReplanCmd.Flags().String("idempotency-key", "", "Idempotency key for replan request")
+	issueReplanCmd.Flags().String("reason", "", "Reason for replan")
+	issueReplanCmd.Flags().String("plan-content", "", "Updated plan content")
+	issueReplanCmd.Flags().String("output", "json", "Output format: table or json")
+
+	// issue finalize
+	issueFinalizeCmd.Flags().String("output", "json", "Output format: table or json")
 }
 
 // ---------------------------------------------------------------------------
@@ -850,6 +925,175 @@ func runIssueChildren(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func runIssueSubmitReview(cmd *cobra.Command, args []string) error {
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	body := map[string]any{}
+	if idempotencyKey, _ := cmd.Flags().GetString("idempotency-key"); idempotencyKey != "" {
+		body["idempotency_key"] = idempotencyKey
+	}
+	if summary, _ := cmd.Flags().GetString("summary"); summary != "" {
+		body["summary"] = summary
+	}
+	if prURL, _ := cmd.Flags().GetString("pr-url"); prURL != "" {
+		body["evidence"] = map[string]any{"pr_url": prURL}
+	}
+
+	var result map[string]any
+	if err := client.PostJSON(ctx, "/api/issues/"+args[0]+"/workflow/submit-review", body, &result); err != nil {
+		return fmt.Errorf("submit review: %w", err)
+	}
+
+	output, _ := cmd.Flags().GetString("output")
+	if output == "table" {
+		return nil
+	}
+	return cli.PrintJSON(os.Stdout, result)
+}
+
+func runIssueReview(cmd *cobra.Command, args []string) error {
+	verdict, _ := cmd.Flags().GetString("verdict")
+	if verdict == "" {
+		return fmt.Errorf("--verdict is required")
+	}
+	if !containsString(validReviewDecisions, verdict) {
+		return fmt.Errorf("invalid verdict %q; valid values: %s", verdict, strings.Join(validReviewDecisions, ", "))
+	}
+	reviewRoundID, _ := cmd.Flags().GetString("review-round-id")
+	if reviewRoundID == "" {
+		return fmt.Errorf("--review-round-id is required")
+	}
+
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	criteriaFlags, _ := cmd.Flags().GetStringSlice("criterion")
+	criteria := make([]map[string]any, 0, len(criteriaFlags))
+	for _, raw := range criteriaFlags {
+		criterion, parseErr := parseWorkflowCriterion(raw)
+		if parseErr != nil {
+			return parseErr
+		}
+		criteria = append(criteria, criterion)
+	}
+
+	body := map[string]any{
+		"verdict":         verdict,
+		"review_round_id": reviewRoundID,
+	}
+	if idempotencyKey, _ := cmd.Flags().GetString("idempotency-key"); idempotencyKey != "" {
+		body["idempotency_key"] = idempotencyKey
+	}
+	if summary, _ := cmd.Flags().GetString("summary"); summary != "" {
+		body["summary"] = summary
+	}
+	if len(criteria) > 0 {
+		body["criterion_results"] = criteria
+	}
+
+	var result map[string]any
+	if err := client.PostJSON(ctx, "/api/issues/"+args[0]+"/workflow/review", body, &result); err != nil {
+		return fmt.Errorf("review issue workflow: %w", err)
+	}
+
+	output, _ := cmd.Flags().GetString("output")
+	if output == "table" {
+		return nil
+	}
+	return cli.PrintJSON(os.Stdout, result)
+}
+
+func runIssueReportBlocked(cmd *cobra.Command, args []string) error {
+	reason, _ := cmd.Flags().GetString("reason")
+	if reason == "" {
+		return fmt.Errorf("--reason is required")
+	}
+
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	body := map[string]any{"reason": reason}
+	var result map[string]any
+	if err := client.PostJSON(ctx, "/api/issues/"+args[0]+"/workflow/report-blocked", body, &result); err != nil {
+		return fmt.Errorf("report issue blocked: %w", err)
+	}
+
+	output, _ := cmd.Flags().GetString("output")
+	if output == "table" {
+		return nil
+	}
+	return cli.PrintJSON(os.Stdout, result)
+}
+
+func runIssueReplan(cmd *cobra.Command, args []string) error {
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	body := map[string]any{}
+	if idempotencyKey, _ := cmd.Flags().GetString("idempotency-key"); idempotencyKey != "" {
+		body["idempotency_key"] = idempotencyKey
+	}
+	if reason, _ := cmd.Flags().GetString("reason"); reason != "" {
+		body["reason"] = reason
+	}
+	if planContent, _ := cmd.Flags().GetString("plan-content"); planContent != "" {
+		body["plan_content"] = planContent
+	}
+
+	var result map[string]any
+	if err := client.PostJSON(ctx, "/api/issues/"+args[0]+"/workflow/replan", body, &result); err != nil {
+		return fmt.Errorf("replan issue workflow: %w", err)
+	}
+
+	output, _ := cmd.Flags().GetString("output")
+	if output == "table" {
+		return nil
+	}
+	return cli.PrintJSON(os.Stdout, result)
+}
+
+func runIssueFinalize(cmd *cobra.Command, args []string) error {
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var result map[string]any
+	if err := client.PostJSON(ctx, "/api/issues/"+args[0]+"/workflow/finalize-parent", map[string]any{}, &result); err != nil {
+		return fmt.Errorf("finalize issue workflow: %w", err)
+	}
+
+	output, _ := cmd.Flags().GetString("output")
+	if output == "table" {
+		return nil
+	}
+	return cli.PrintJSON(os.Stdout, result)
+}
+
 // ---------------------------------------------------------------------------
 // Search command
 // ---------------------------------------------------------------------------
@@ -993,6 +1237,34 @@ func formatAssignee(issue map[string]any) string {
 		return ""
 	}
 	return aType + ":" + truncateID(aID)
+}
+
+func parseWorkflowCriterion(raw string) (map[string]any, error) {
+	parts := strings.SplitN(raw, ":", 3)
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return nil, fmt.Errorf("invalid --criterion %q; use criterion-id:result[:note]", raw)
+	}
+	if !containsString(validCriterionResults, parts[1]) {
+		return nil, fmt.Errorf("invalid criterion result %q; valid values: %s", parts[1], strings.Join(validCriterionResults, ", "))
+	}
+
+	criterion := map[string]any{
+		"criterion_id": parts[0],
+		"result":       parts[1],
+	}
+	if len(parts) == 3 && parts[2] != "" {
+		criterion["note"] = parts[2]
+	}
+	return criterion, nil
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func truncateID(id string) string {

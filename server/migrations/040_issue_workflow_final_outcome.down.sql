@@ -1,0 +1,2 @@
+ALTER TABLE issue
+    DROP COLUMN IF EXISTS workflow_final_outcome;

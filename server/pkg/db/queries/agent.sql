@@ -160,10 +160,19 @@ SELECT count(*) > 0 AS has_pending FROM agent_task_queue
 WHERE issue_id = $1 AND status IN ('queued', 'dispatched');
 
 -- name: HasPendingTaskForIssueAndAgent :one
--- Returns true if a specific agent already has a queued or dispatched task
--- for the given issue. Used by @mention trigger dedup.
+-- Returns true if a specific agent already has a queued or dispatched (but not
+-- yet running) task for the given issue. Used by @mention and comment-trigger
+-- dedup so follow-up events are not swallowed while an agent is already
+-- running and can pick up new work on the next cycle.
 SELECT count(*) > 0 AS has_pending FROM agent_task_queue
 WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued', 'dispatched');
+
+-- name: HasActiveTaskForIssueAndAgent :one
+-- Returns true if a specific agent already has any queued, dispatched, or
+-- running task for the given issue. Used where duplicate work must be fully
+-- suppressed, including while an existing task is still running.
+SELECT count(*) > 0 AS has_active FROM agent_task_queue
+WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued', 'dispatched', 'running');
 
 -- name: RebindPendingTasksToRuntime :exec
 UPDATE agent_task_queue
