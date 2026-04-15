@@ -531,6 +531,23 @@ func TestSubmitReview_ReplaysSameIdempotencyKeyAsSameRound(t *testing.T) {
 	}
 }
 
+func TestSubmitReview_DefaultsMissingEvidenceToEmptyObject(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationEntities(t, ctx)
+	svc := NewOrchestrationService(testServicePool, testServiceQueries, nil, nil)
+
+	reviewRound, err := svc.SubmitReview(ctx, SubmitReviewParams{
+		ChildIssueID:     fixture.childIssueID,
+		SubmitterAgentID: fixture.workerAgentID,
+	})
+	if err != nil {
+		t.Fatalf("SubmitReview: %v", err)
+	}
+	if got := string(reviewRound.SubmissionEvidence); got != `{}` {
+		t.Fatalf("expected default submission evidence {}, got %s", got)
+	}
+}
+
 func TestCreatePlanRevision_ReplaysSameIdempotencyKeyAsSameRevision(t *testing.T) {
 	ctx := context.Background()
 	fixture := seedOrchestrationEntities(t, ctx)
@@ -981,6 +998,93 @@ func TestReview_BlockingVerdictCreatesEscalationAndBlocksChildSpec(t *testing.T)
 	}
 	if childSpec.Status != "blocked" {
 		t.Fatalf("expected child spec status blocked, got %q", childSpec.Status)
+	}
+}
+
+func TestReview_UsesDefaultEscalationReasonForEmptySummary(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationEntities(t, ctx)
+	svc := NewOrchestrationService(testServicePool, testServiceQueries, nil, nil)
+
+	submitted := submitForReview(t, ctx, svc, fixture, "ready for review")
+
+	res, err := svc.Review(ctx, ReviewParams{
+		ChildIssueID:    fixture.childIssueID,
+		ReviewRoundID:   submitted.ID,
+		ReviewerAgentID: fixture.orchestratorAgentID,
+		Verdict:         ReviewDecisionBlocked,
+		Summary:         pgtype.Text{String: "", Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if res.Escalation == nil {
+		t.Fatal("expected escalation to be returned")
+	}
+	if res.Escalation.Reason != "review escalation" {
+		t.Fatalf("expected default escalation reason, got %q", res.Escalation.Reason)
+	}
+}
+
+func TestReview_UsesDefaultEscalationReasonForWhitespaceSummary(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationEntities(t, ctx)
+	svc := NewOrchestrationService(testServicePool, testServiceQueries, nil, nil)
+
+	submitted := submitForReview(t, ctx, svc, fixture, "ready for review")
+
+	res, err := svc.Review(ctx, ReviewParams{
+		ChildIssueID:    fixture.childIssueID,
+		ReviewRoundID:   submitted.ID,
+		ReviewerAgentID: fixture.orchestratorAgentID,
+		Verdict:         ReviewDecisionBlocked,
+		Summary:         pgtype.Text{String: "   ", Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if res.Escalation == nil {
+		t.Fatal("expected escalation to be returned")
+	}
+	if res.Escalation.Reason != "review escalation" {
+		t.Fatalf("expected default escalation reason, got %q", res.Escalation.Reason)
+	}
+}
+
+func TestReview_RejectsDuplicateCriterionIDs(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationEntities(t, ctx)
+	svc := NewOrchestrationService(testServicePool, testServiceQueries, nil, nil)
+
+	submitted := submitForReview(t, ctx, svc, fixture, "ready for review")
+	childSpec, err := testServiceQueries.GetChildSpecByIssueID(ctx, fixture.childIssueID)
+	if err != nil {
+		t.Fatalf("GetChildSpecByIssueID: %v", err)
+	}
+	criterion, err := testServiceQueries.CreateChildAcceptanceCriterion(ctx, db.CreateChildAcceptanceCriterionParams{
+		ChildSpecID:   childSpec.ID,
+		Ordinal:       2,
+		CriterionText: "Duplicate criterion target",
+	})
+	if err != nil {
+		t.Fatalf("CreateChildAcceptanceCriterion: %v", err)
+	}
+
+	_, err = svc.Review(ctx, ReviewParams{
+		ChildIssueID:    fixture.childIssueID,
+		ReviewRoundID:   submitted.ID,
+		ReviewerAgentID: fixture.orchestratorAgentID,
+		Verdict:         ReviewDecisionApproved,
+		CriterionResults: []CriterionVerdict{
+			{CriterionID: criterion.ID, Result: CriterionResultPass},
+			{CriterionID: criterion.ID, Result: CriterionResultPass},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected duplicate criterion ids to be rejected")
+	}
+	if got := err.Error(); got != "duplicate criterion id" {
+		t.Fatalf("expected duplicate criterion id error, got %q", got)
 	}
 }
 

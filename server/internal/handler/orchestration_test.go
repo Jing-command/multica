@@ -239,6 +239,36 @@ func TestSubmitReviewWorkflow_AllowsAssignedWorkerAgentWithMatchingTask(t *testi
 	}
 }
 
+func TestSubmitReviewWorkflow_DefaultsMissingEvidenceToEmptyObject(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationHandlerFixture(t, ctx)
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues/"+fixture.childIssueID+"/workflow/submit-review", map[string]any{
+		"summary": "ready without evidence",
+	})
+	req = withURLParam(req, "id", fixture.childIssueID)
+	req.Header.Set("X-Agent-ID", fixture.workerAgentID)
+	req.Header.Set("X-Task-ID", fixture.workerChildTaskID)
+
+	testHandler.SubmitIssueReview(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	childSpec, err := testHandler.Queries.GetChildSpecByIssueID(ctx, parseUUID(fixture.childIssueID))
+	if err != nil {
+		t.Fatalf("load child spec: %v", err)
+	}
+	reviewRound, err := testHandler.Queries.GetLatestPendingChildReviewRound(ctx, childSpec.ID)
+	if err != nil {
+		t.Fatalf("load pending review round: %v", err)
+	}
+	if got := string(reviewRound.SubmissionEvidence); got != `{}` {
+		t.Fatalf("expected submission evidence {}, got %s", got)
+	}
+}
+
 func TestSubmitReviewWorkflow_RejectsCompletedTask(t *testing.T) {
 	ctx := context.Background()
 	fixture := seedOrchestrationHandlerFixture(t, ctx)
@@ -258,6 +288,24 @@ func TestSubmitReviewWorkflow_RejectsCompletedTask(t *testing.T) {
 	testHandler.SubmitIssueReview(w, req)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestReportIssueBlocked_RejectsWhitespaceReason(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationHandlerFixture(t, ctx)
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues/"+fixture.childIssueID+"/workflow/report-blocked", map[string]any{
+		"reason": "   ",
+	})
+	req = withURLParam(req, "id", fixture.childIssueID)
+	req.Header.Set("X-Agent-ID", fixture.workerAgentID)
+	req.Header.Set("X-Task-ID", fixture.workerChildTaskID)
+
+	testHandler.ReportIssueBlocked(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -505,6 +553,64 @@ func TestReviewWorkflow_ReturnsBadRequestForInvalidCriterionResult(t *testing.T)
 	}
 }
 
+func TestReviewWorkflow_ReturnsBadRequestForDuplicateCriterionIDs(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationHandlerFixture(t, ctx)
+
+	submit := httptest.NewRecorder()
+	submitReq := newRequest("POST", "/api/issues/"+fixture.childIssueID+"/workflow/submit-review", map[string]any{
+		"summary": "ready for duplicate criterion review",
+	})
+	submitReq = withURLParam(submitReq, "id", fixture.childIssueID)
+	submitReq.Header.Set("X-Agent-ID", fixture.workerAgentID)
+	submitReq.Header.Set("X-Task-ID", fixture.workerChildTaskID)
+	testHandler.SubmitIssueReview(submit, submitReq)
+	if submit.Code != http.StatusOK {
+		t.Fatalf("submit review setup failed: %d: %s", submit.Code, submit.Body.String())
+	}
+
+	childSpec, err := testHandler.Queries.GetChildSpecByIssueID(ctx, parseUUID(fixture.childIssueID))
+	if err != nil {
+		t.Fatalf("load child spec: %v", err)
+	}
+	criterion, err := testHandler.Queries.CreateChildAcceptanceCriterion(ctx, db.CreateChildAcceptanceCriterionParams{
+		ChildSpecID:   childSpec.ID,
+		Ordinal:       2,
+		CriterionText: "Criterion for duplicate result test",
+	})
+	if err != nil {
+		t.Fatalf("create acceptance criterion: %v", err)
+	}
+	reviewRound, err := testHandler.Queries.GetLatestPendingChildReviewRound(ctx, childSpec.ID)
+	if err != nil {
+		t.Fatalf("load pending review round: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues/"+fixture.childIssueID+"/workflow/review", map[string]any{
+		"review_round_id": uuidToString(reviewRound.ID),
+		"verdict":         "approved",
+		"criterion_results": []map[string]any{
+			{
+				"criterion_id": uuidToString(criterion.ID),
+				"result":       "pass",
+			},
+			{
+				"criterion_id": uuidToString(criterion.ID),
+				"result":       "pass",
+			},
+		},
+	})
+	req = withURLParam(req, "id", fixture.childIssueID)
+	req.Header.Set("X-Agent-ID", fixture.orchestratorAgentID)
+	req.Header.Set("X-Task-ID", fixture.orchestratorTaskID)
+	testHandler.ReviewIssueWorkflow(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestReviewWorkflow_ReturnsNotFoundForUnknownReviewRound(t *testing.T) {
 	ctx := context.Background()
 	fixture := seedOrchestrationHandlerFixture(t, ctx)
@@ -595,7 +701,7 @@ func TestReportBlockedWorkflow_AllowsAssignedWorker(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req := newRequest("POST", "/api/issues/"+fixture.childIssueID+"/workflow/report-blocked", map[string]any{
-		"reason": "worker is blocked on dependency",
+		"reason": "  worker is blocked on dependency  ",
 	})
 	req = withURLParam(req, "id", fixture.childIssueID)
 	req.Header.Set("X-Agent-ID", fixture.workerAgentID)
@@ -623,7 +729,7 @@ func TestReportBlockedWorkflow_AllowsAssignedWorker(t *testing.T) {
 		t.Fatal("expected open escalation in response")
 	}
 	if issue.Orchestration.Child.OpenEscalation.Reason != "worker is blocked on dependency" {
-		t.Fatalf("expected escalation reason to round-trip, got %q", issue.Orchestration.Child.OpenEscalation.Reason)
+		t.Fatalf("expected trimmed escalation reason, got %q", issue.Orchestration.Child.OpenEscalation.Reason)
 	}
 }
 
@@ -707,6 +813,44 @@ func TestReplanWorkflow_RejectsTerminalChild(t *testing.T) {
 	testHandler.ReplanIssueWorkflow(w, req)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestReplanWorkflow_DoesNotPersistEmptyReasonOrPlanContent(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationHandlerFixture(t, ctx)
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues/"+fixture.childIssueID+"/workflow/replan", map[string]any{
+		"idempotency_key": "replan-http-empty-1",
+		"reason":          "   ",
+		"plan_content":    "",
+	})
+	req = withURLParam(req, "id", fixture.childIssueID)
+	req.Header.Set("X-Agent-ID", fixture.orchestratorAgentID)
+	req.Header.Set("X-Task-ID", fixture.orchestratorTaskID)
+
+	testHandler.ReplanIssueWorkflow(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	childSpec, err := testHandler.Queries.GetChildSpecByIssueID(ctx, parseUUID(fixture.childIssueID))
+	if err != nil {
+		t.Fatalf("load child spec: %v", err)
+	}
+	revision, err := testHandler.Queries.GetPlanRevisionByIdempotencyKey(ctx, db.GetPlanRevisionByIdempotencyKeyParams{
+		ChildSpecID:    childSpec.ID,
+		IdempotencyKey: strToText("replan-http-empty-1"),
+	})
+	if err != nil {
+		t.Fatalf("load plan revision by idempotency key: %v", err)
+	}
+	if revision.Reason.Valid {
+		t.Fatalf("expected empty reason to remain null, got %#v", revision.Reason)
+	}
+	if revision.PlanContent.Valid {
+		t.Fatalf("expected empty plan_content to remain null, got %#v", revision.PlanContent)
 	}
 }
 

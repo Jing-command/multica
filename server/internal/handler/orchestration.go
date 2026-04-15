@@ -96,6 +96,7 @@ func mapWorkflowError(err error) (int, string) {
 		strings.Contains(msg, "unsupported review verdict") ||
 		strings.Contains(msg, "invalid criterion result") ||
 		strings.Contains(msg, "criterion does not belong") ||
+		strings.Contains(msg, "duplicate criterion id") ||
 		strings.Contains(msg, "idempotency key already used for different review round") {
 		return http.StatusBadRequest, msg
 	}
@@ -176,7 +177,8 @@ func (h *Handler) ReportIssueBlocked(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.Reason == "" {
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
 		writeError(w, http.StatusBadRequest, "reason is required")
 		return
 	}
@@ -187,7 +189,7 @@ func (h *Handler) ReportIssueBlocked(w http.ResponseWriter, r *http.Request) {
 	_, err := h.OrchestrationService.ReportBlocked(r.Context(), service.ReportBlockedParams{
 		ChildIssueID:    issue.ID,
 		ReporterAgentID: parseUUID(agentID),
-		Reason:          req.Reason,
+		Reason:          reason,
 	})
 	if err != nil {
 		status, msg := mapWorkflowError(err)
@@ -249,13 +251,14 @@ func (h *Handler) ReviewIssueWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "orchestration service unavailable")
 		return
 	}
+	reviewSummary := strings.TrimSpace(req.Summary)
 	_, err := h.OrchestrationService.Review(r.Context(), service.ReviewParams{
 		ChildIssueID:     issue.ID,
 		ReviewRoundID:    parseUUID(req.ReviewRoundID),
 		ReviewerAgentID:  parseUUID(agentID),
 		IdempotencyKey:   req.IdempotencyKey,
 		Verdict:          req.Verdict,
-		Summary:          ptrToText(&req.Summary),
+		Summary:          strToText(reviewSummary),
 		CriterionResults: criteria,
 	})
 	if err != nil {
@@ -294,11 +297,13 @@ func (h *Handler) ReplanIssueWorkflow(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "orchestration service unavailable")
 		return
 	}
+	reason := strings.TrimSpace(req.Reason)
+	planContent := strings.TrimSpace(req.PlanContent)
 	_, err := h.OrchestrationService.CreatePlanRevision(r.Context(), service.CreatePlanRevisionParams{
 		ChildIssueID:       issue.ID,
 		RequestedByAgentID: parseUUID(agentID),
-		Reason:             ptrToText(&req.Reason),
-		PlanContent:        ptrToText(&req.PlanContent),
+		Reason:             strToText(reason),
+		PlanContent:        strToText(planContent),
 		IdempotencyKey:     req.IdempotencyKey,
 	})
 	if err != nil {

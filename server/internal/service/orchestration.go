@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -100,7 +101,7 @@ func (s *OrchestrationService) SubmitReview(ctx context.Context, params SubmitRe
 	}
 
 	submissionEvidence := params.EvidenceJSON
-	if len(submissionEvidence) == 0 {
+	if trimmedEvidence := strings.TrimSpace(string(submissionEvidence)); trimmedEvidence == "" || trimmedEvidence == "null" {
 		submissionEvidence = []byte(`{}`)
 	}
 
@@ -330,7 +331,13 @@ func (s *OrchestrationService) Review(ctx context.Context, params ReviewParams) 
 	}
 
 	criteriaResults := make([]db.ChildReviewCriterionResult, 0, len(params.CriterionResults))
+	seenCriterionIDs := make(map[string]struct{}, len(params.CriterionResults))
 	for _, criterion := range params.CriterionResults {
+		criterionID := util.UUIDToString(criterion.CriterionID)
+		if _, exists := seenCriterionIDs[criterionID]; exists {
+			return ReviewResult{}, fmt.Errorf("duplicate criterion id")
+		}
+		seenCriterionIDs[criterionID] = struct{}{}
 		if criterion.Result != CriterionResultPass && criterion.Result != CriterionResultFail && criterion.Result != CriterionResultNotApplicable {
 			return ReviewResult{}, fmt.Errorf("invalid criterion result: %s", criterion.Result)
 		}
@@ -358,7 +365,7 @@ func (s *OrchestrationService) Review(ctx context.Context, params ReviewParams) 
 
 	result := ReviewResult{Round: round, CriteriaResults: criteriaResults}
 	summaryReason := "review escalation"
-	if params.Summary.Valid {
+	if params.Summary.Valid && strings.TrimSpace(params.Summary.String) != "" {
 		summaryReason = params.Summary.String
 	}
 
