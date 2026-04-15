@@ -188,6 +188,9 @@ func (s *OrchestrationService) CreatePlanRevision(ctx context.Context, params Cr
 	if err != nil {
 		return db.PlanRevision{}, fmt.Errorf("create plan revision: %w", err)
 	}
+	if err := s.enqueueAgentTaskIfNeeded(ctx, tx, queries, childSpec.ChildIssueID, childSpec.WorkerAgentID, true); err != nil {
+		return db.PlanRevision{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return db.PlanRevision{}, fmt.Errorf("commit transaction: %w", err)
 	}
@@ -398,6 +401,9 @@ func (s *OrchestrationService) Review(ctx context.Context, params ReviewParams) 
 			}
 			if _, err := queries.UpdateIssueStatus(ctx, db.UpdateIssueStatusParams{ID: params.ChildIssueID, Status: "in_progress"}); err != nil {
 				return ReviewResult{}, fmt.Errorf("reopen child issue after changes requested: %w", err)
+			}
+			if err := s.enqueueAgentTaskIfNeeded(ctx, tx, queries, childSpec.ChildIssueID, childSpec.WorkerAgentID, true); err != nil {
+				return ReviewResult{}, err
 			}
 		}
 	case ReviewDecisionBlocked:

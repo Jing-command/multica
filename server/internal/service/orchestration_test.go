@@ -591,6 +591,36 @@ func TestCreatePlanRevision_PublishesChildReplannedEvent(t *testing.T) {
 	t.Fatalf("expected %s to be published, got %#v", protocol.EventChildReplanned, published)
 }
 
+func TestCreatePlanRevision_RequeuesWorkerTask(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationEntities(t, ctx)
+	svc := NewOrchestrationService(testServicePool, testServiceQueries, nil, nil)
+
+	if _, err := testServicePool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2`, fixture.childIssueID, fixture.workerAgentID); err != nil {
+		t.Fatalf("clear child worker tasks: %v", err)
+	}
+
+	beforeCount := countIssueTasksForAgent(t, ctx, fixture.childIssueID, fixture.workerAgentID)
+	if beforeCount != 0 {
+		t.Fatalf("expected no worker task before replan, got %d", beforeCount)
+	}
+
+	_, err := svc.CreatePlanRevision(ctx, CreatePlanRevisionParams{
+		ChildIssueID:       fixture.childIssueID,
+		RequestedByAgentID: fixture.orchestratorAgentID,
+		Reason:             pgtype.Text{String: "scope changed", Valid: true},
+		PlanContent:        pgtype.Text{String: "updated plan", Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("CreatePlanRevision: %v", err)
+	}
+
+	afterCount := countIssueTasksForAgent(t, ctx, fixture.childIssueID, fixture.workerAgentID)
+	if afterCount != 1 {
+		t.Fatalf("expected one worker task after replan, got %d", afterCount)
+	}
+}
+
 func TestCreatePlanRevision_RejectsNonOrchestratorRequester(t *testing.T) {
 	ctx := context.Background()
 	fixture := seedOrchestrationEntities(t, ctx)
@@ -784,6 +814,43 @@ func TestReview_ApprovedEnqueuesParentTaskWithoutTriggerComment(t *testing.T) {
 	}
 	if parentTask.TriggerCommentID.Valid {
 		t.Fatal("expected parent wakeup task to omit trigger_comment_id")
+	}
+}
+
+func TestReview_ChangesRequestedRequeuesWorkerTask(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationEntities(t, ctx)
+	svc := NewOrchestrationService(testServicePool, testServiceQueries, nil, nil)
+
+	if _, err := testServicePool.Exec(ctx, `UPDATE child_spec SET max_review_rounds = 2 WHERE child_issue_id = $1`, fixture.childIssueID); err != nil {
+		t.Fatalf("set max_review_rounds: %v", err)
+	}
+
+	submitted := submitForReview(t, ctx, svc, fixture, "ready for review")
+
+	if _, err := testServicePool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2`, fixture.childIssueID, fixture.workerAgentID); err != nil {
+		t.Fatalf("clear child worker tasks: %v", err)
+	}
+
+	beforeCount := countIssueTasksForAgent(t, ctx, fixture.childIssueID, fixture.workerAgentID)
+	if beforeCount != 0 {
+		t.Fatalf("expected no worker task before changes_requested review, got %d", beforeCount)
+	}
+
+	_, err := svc.Review(ctx, ReviewParams{
+		ChildIssueID:    fixture.childIssueID,
+		ReviewRoundID:   submitted.ID,
+		ReviewerAgentID: fixture.orchestratorAgentID,
+		Verdict:         ReviewDecisionChangesRequested,
+		Summary:         pgtype.Text{String: "please revise", Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+
+	afterCount := countIssueTasksForAgent(t, ctx, fixture.childIssueID, fixture.workerAgentID)
+	if afterCount != 1 {
+		t.Fatalf("expected one worker task after changes_requested review, got %d", afterCount)
 	}
 }
 
