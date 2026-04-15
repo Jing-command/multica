@@ -884,6 +884,71 @@ func TestGetIssue_IncludesStructuredOrchestrationState(t *testing.T) {
 	}
 }
 
+func assertListedIssuesOmitOrchestration(t *testing.T, issues []IssueResponse, ids ...string) {
+	t.Helper()
+
+	if len(issues) == 0 {
+		t.Fatal("expected list response to include issues")
+	}
+
+	targets := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		targets[id] = struct{}{}
+	}
+
+	for _, issue := range issues {
+		if _, ok := targets[issue.ID]; ok {
+			if issue.Orchestration != nil {
+				t.Fatalf("expected list issue %s to omit orchestration state, got %#v", issue.ID, issue.Orchestration)
+			}
+		}
+	}
+}
+
+func TestListIssues_DoesNotIncludeStructuredOrchestrationState(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationHandlerFixture(t, ctx)
+
+	w := httptest.NewRecorder()
+	req := newRequest("GET", "/api/issues?workspace_id="+testWorkspaceID, nil)
+	testHandler.ListIssues(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Issues []IssueResponse `json:"issues"`
+		Total  int64           `json:"total"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	assertListedIssuesOmitOrchestration(t, resp.Issues, fixture.childIssueID, fixture.parentIssueID)
+}
+
+func TestListOpenIssues_DoesNotIncludeStructuredOrchestrationState(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationHandlerFixture(t, ctx)
+
+	w := httptest.NewRecorder()
+	req := newRequest("GET", "/api/issues?workspace_id="+testWorkspaceID+"&open_only=true", nil)
+	testHandler.ListIssues(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Issues []IssueResponse `json:"issues"`
+		Total  int64           `json:"total"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	assertListedIssuesOmitOrchestration(t, resp.Issues, fixture.childIssueID, fixture.parentIssueID)
+}
+
 func TestFinalizeParentWorkflow_OrchestratorCanFinalizeDoneChildren(t *testing.T) {
 	ctx := context.Background()
 	fixture := seedOrchestrationHandlerFixture(t, ctx)

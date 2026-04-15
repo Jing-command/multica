@@ -357,9 +357,10 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		prefix := h.getIssuePrefix(ctx, wsUUID)
 		resp := make([]IssueResponse, len(issues))
 		for i, issue := range issues {
-			resp[i] = h.issueResponse(ctx, issue)
+			resp[i] = issueToResponse(issue, prefix)
 		}
 
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -411,9 +412,10 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 		total = int64(len(issues))
 	}
 
+	prefix := h.getIssuePrefix(ctx, wsUUID)
 	resp := make([]IssueResponse, len(issues))
 	for i, issue := range issues {
-		resp[i] = h.issueResponse(ctx, issue)
+		resp[i] = issueToResponse(issue, prefix)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
