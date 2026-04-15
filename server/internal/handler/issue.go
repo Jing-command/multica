@@ -18,26 +18,64 @@ import (
 )
 
 // IssueResponse is the JSON response for an issue.
+type IssueWorkflowReviewResponse struct {
+	RoundNumber     int32   `json:"round_number"`
+	Decision        string  `json:"decision"`
+	ReviewerAgentID *string `json:"reviewer_agent_id,omitempty"`
+	Summary         *string `json:"summary,omitempty"`
+	CreatedAt       string  `json:"created_at"`
+}
+
+type IssueWorkflowEscalationResponse struct {
+	RaisedByAgentID *string `json:"raised_by_agent_id,omitempty"`
+	Reason          string  `json:"reason"`
+	Status          string  `json:"status"`
+	CreatedAt       string  `json:"created_at"`
+}
+
+type IssueChildOrchestrationStateResponse struct {
+	ParentIssueID       string                           `json:"parent_issue_id"`
+	WorkerAgentID       string                           `json:"worker_agent_id"`
+	OrchestratorAgentID string                           `json:"orchestrator_agent_id"`
+	Status              string                           `json:"status"`
+	MaxReviewRounds     int32                            `json:"max_review_rounds"`
+	LatestReview        *IssueWorkflowReviewResponse     `json:"latest_review,omitempty"`
+	OpenEscalation      *IssueWorkflowEscalationResponse `json:"open_escalation,omitempty"`
+}
+
+type IssueParentOrchestrationStateResponse struct {
+	ChildCount        int32   `json:"child_count"`
+	DoneChildCount    int32   `json:"done_child_count"`
+	BlockedChildCount int32   `json:"blocked_child_count"`
+	FinalOutcome      *string `json:"final_outcome,omitempty"`
+}
+
+type IssueOrchestrationStateResponse struct {
+	Child  *IssueChildOrchestrationStateResponse  `json:"child,omitempty"`
+	Parent *IssueParentOrchestrationStateResponse `json:"parent,omitempty"`
+}
+
 type IssueResponse struct {
-	ID                 string                  `json:"id"`
-	WorkspaceID        string                  `json:"workspace_id"`
-	Number             int32                   `json:"number"`
-	Identifier         string                  `json:"identifier"`
-	Title              string                  `json:"title"`
-	Description        *string                 `json:"description"`
-	Status             string                  `json:"status"`
-	Priority           string                  `json:"priority"`
-	AssigneeType       *string                 `json:"assignee_type"`
-	AssigneeID         *string                 `json:"assignee_id"`
-	CreatorType        string                  `json:"creator_type"`
-	CreatorID          string                  `json:"creator_id"`
-	ParentIssueID      *string                 `json:"parent_issue_id"`
-	Position           float64                 `json:"position"`
-	DueDate            *string                 `json:"due_date"`
-	CreatedAt          string                  `json:"created_at"`
-	UpdatedAt          string                  `json:"updated_at"`
-	Reactions          []IssueReactionResponse `json:"reactions,omitempty"`
-	Attachments        []AttachmentResponse    `json:"attachments,omitempty"`
+	ID            string                           `json:"id"`
+	WorkspaceID   string                           `json:"workspace_id"`
+	Number        int32                            `json:"number"`
+	Identifier    string                           `json:"identifier"`
+	Title         string                           `json:"title"`
+	Description   *string                          `json:"description"`
+	Status        string                           `json:"status"`
+	Priority      string                           `json:"priority"`
+	AssigneeType  *string                          `json:"assignee_type"`
+	AssigneeID    *string                          `json:"assignee_id"`
+	CreatorType   string                           `json:"creator_type"`
+	CreatorID     string                           `json:"creator_id"`
+	ParentIssueID *string                          `json:"parent_issue_id"`
+	Position      float64                          `json:"position"`
+	DueDate       *string                          `json:"due_date"`
+	CreatedAt     string                           `json:"created_at"`
+	UpdatedAt     string                           `json:"updated_at"`
+	Reactions     []IssueReactionResponse          `json:"reactions,omitempty"`
+	Attachments   []AttachmentResponse             `json:"attachments,omitempty"`
+	Orchestration *IssueOrchestrationStateResponse `json:"orchestration,omitempty"`
 }
 
 func issueToResponse(i db.Issue, issuePrefix string) IssueResponse {
@@ -61,6 +99,77 @@ func issueToResponse(i db.Issue, issuePrefix string) IssueResponse {
 		CreatedAt:     timestampToString(i.CreatedAt),
 		UpdatedAt:     timestampToString(i.UpdatedAt),
 	}
+}
+
+func issueWorkflowReviewToResponse(round db.ChildReviewRound) *IssueWorkflowReviewResponse {
+	if !round.ID.Valid {
+		return nil
+	}
+	return &IssueWorkflowReviewResponse{
+		RoundNumber:     round.RoundNumber,
+		Decision:        round.Decision,
+		ReviewerAgentID: uuidToPtr(round.ReviewerAgentID),
+		Summary:         textToPtr(round.Summary),
+		CreatedAt:       timestampToString(round.CreatedAt),
+	}
+}
+
+func issueWorkflowEscalationToResponse(escalation db.ChildEscalation) *IssueWorkflowEscalationResponse {
+	if !escalation.ID.Valid {
+		return nil
+	}
+	return &IssueWorkflowEscalationResponse{
+		RaisedByAgentID: uuidToPtr(escalation.RaisedByAgentID),
+		Reason:          escalation.Reason,
+		Status:          escalation.Status,
+		CreatedAt:       timestampToString(escalation.CreatedAt),
+	}
+}
+
+func (h *Handler) enrichIssueResponseWithOrchestration(ctx context.Context, issue db.Issue, resp *IssueResponse) {
+	childSpec, err := h.Queries.GetChildSpecByIssueID(ctx, issue.ID)
+	if err == nil {
+		childState := &IssueChildOrchestrationStateResponse{
+			ParentIssueID:       uuidToString(childSpec.ParentIssueID),
+			WorkerAgentID:       uuidToString(childSpec.WorkerAgentID),
+			OrchestratorAgentID: uuidToString(childSpec.OrchestratorAgentID),
+			Status:              childSpec.Status,
+			MaxReviewRounds:     childSpec.MaxReviewRounds,
+		}
+		if latestReview, reviewErr := h.Queries.GetLatestChildReviewRound(ctx, childSpec.ID); reviewErr == nil {
+			childState.LatestReview = issueWorkflowReviewToResponse(latestReview)
+		}
+		if escalation, escalationErr := h.Queries.GetLatestOpenChildEscalation(ctx, childSpec.ID); escalationErr == nil {
+			childState.OpenEscalation = issueWorkflowEscalationToResponse(escalation)
+		}
+		resp.Orchestration = &IssueOrchestrationStateResponse{Child: childState}
+		return
+	}
+
+	children, err := h.Queries.ListChildIssues(ctx, issue.ID)
+	if err != nil || len(children) == 0 {
+		return
+	}
+	parentState := &IssueParentOrchestrationStateResponse{
+		ChildCount:   int32(len(children)),
+		FinalOutcome: textToPtr(issue.WorkflowFinalOutcome),
+	}
+	for _, child := range children {
+		switch child.Status {
+		case "done":
+			parentState.DoneChildCount++
+		case "blocked":
+			parentState.BlockedChildCount++
+		}
+	}
+	resp.Orchestration = &IssueOrchestrationStateResponse{Parent: parentState}
+}
+
+func (h *Handler) issueResponse(ctx context.Context, issue db.Issue) IssueResponse {
+	prefix := h.getIssuePrefix(ctx, issue.WorkspaceID)
+	resp := issueToResponse(issue, prefix)
+	h.enrichIssueResponseWithOrchestration(ctx, issue, &resp)
+	return resp
 }
 
 // SearchIssueResponse extends IssueResponse with search metadata.
@@ -321,8 +430,7 @@ func (h *Handler) GetIssue(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
-	resp := issueToResponse(issue, prefix)
+	resp := h.issueResponse(r.Context(), issue)
 
 	// Fetch issue reactions.
 	reactions, err := h.Queries.ListIssueReactions(r.Context(), issue.ID)
@@ -370,15 +478,15 @@ func (h *Handler) ListChildIssues(w http.ResponseWriter, r *http.Request) {
 }
 
 type CreateIssueRequest struct {
-	Title              string   `json:"title"`
-	Description        *string  `json:"description"`
-	Status             string   `json:"status"`
-	Priority           string   `json:"priority"`
-	AssigneeType       *string  `json:"assignee_type"`
-	AssigneeID         *string  `json:"assignee_id"`
-	ParentIssueID      *string  `json:"parent_issue_id"`
-	DueDate            *string  `json:"due_date"`
-	AttachmentIDs      []string `json:"attachment_ids,omitempty"`
+	Title         string   `json:"title"`
+	Description   *string  `json:"description"`
+	Status        string   `json:"status"`
+	Priority      string   `json:"priority"`
+	AssigneeType  *string  `json:"assignee_type"`
+	AssigneeID    *string  `json:"assignee_id"`
+	ParentIssueID *string  `json:"parent_issue_id"`
+	DueDate       *string  `json:"due_date"`
+	AttachmentIDs []string `json:"attachment_ids,omitempty"`
 }
 
 func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
@@ -472,19 +580,19 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	creatorType, actualCreatorID := h.resolveActor(r, creatorID, workspaceID)
 
 	issue, err := qtx.CreateIssue(r.Context(), db.CreateIssueParams{
-		WorkspaceID:        parseUUID(workspaceID),
-		Title:              req.Title,
-		Description:        ptrToText(req.Description),
-		Status:             status,
-		Priority:           priority,
-		AssigneeType:       assigneeType,
-		AssigneeID:         assigneeID,
-		CreatorType:        creatorType,
-		CreatorID:          parseUUID(actualCreatorID),
-		ParentIssueID:      parentIssueID,
-		Position:           0,
-		DueDate:            dueDate,
-		Number:             issueNumber,
+		WorkspaceID:   parseUUID(workspaceID),
+		Title:         req.Title,
+		Description:   ptrToText(req.Description),
+		Status:        status,
+		Priority:      priority,
+		AssigneeType:  assigneeType,
+		AssigneeID:    assigneeID,
+		CreatorType:   creatorType,
+		CreatorID:     parseUUID(actualCreatorID),
+		ParentIssueID: parentIssueID,
+		Position:      0,
+		DueDate:       dueDate,
+		Number:        issueNumber,
 	})
 	if err != nil {
 		slog.Warn("create issue failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID)...)
@@ -502,8 +610,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		h.linkAttachmentsByIssueIDs(r.Context(), issue.ID, issue.WorkspaceID, req.AttachmentIDs)
 	}
 
-	prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
-	resp := issueToResponse(issue, prefix)
+	resp := h.issueResponse(r.Context(), issue)
 
 	// Fetch linked attachments so they appear in the response.
 	if len(req.AttachmentIDs) > 0 {
@@ -533,15 +640,15 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 }
 
 type UpdateIssueRequest struct {
-	Title              *string  `json:"title"`
-	Description        *string  `json:"description"`
-	Status             *string  `json:"status"`
-	Priority           *string  `json:"priority"`
-	AssigneeType       *string  `json:"assignee_type"`
-	AssigneeID         *string  `json:"assignee_id"`
-	Position           *float64 `json:"position"`
-	DueDate            *string  `json:"due_date"`
-	ParentIssueID      *string  `json:"parent_issue_id"`
+	Title         *string  `json:"title"`
+	Description   *string  `json:"description"`
+	Status        *string  `json:"status"`
+	Priority      *string  `json:"priority"`
+	AssigneeType  *string  `json:"assignee_type"`
+	AssigneeID    *string  `json:"assignee_id"`
+	Position      *float64 `json:"position"`
+	DueDate       *string  `json:"due_date"`
+	ParentIssueID *string  `json:"parent_issue_id"`
 }
 
 func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
@@ -671,9 +778,19 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to update issue: "+err.Error())
 		return
 	}
+	if req.Status != nil && issue.Status != "done" && issue.Status != "blocked" && issue.WorkflowFinalOutcome.Valid {
+		issue, err = h.Queries.UpdateIssueWorkflowFinalOutcome(r.Context(), db.UpdateIssueWorkflowFinalOutcomeParams{
+			ID:                   issue.ID,
+			WorkflowFinalOutcome: pgtype.Text{},
+		})
+		if err != nil {
+			slog.Warn("clear issue workflow final outcome failed", append(logger.RequestAttrs(r), "error", err, "issue_id", id, "workspace_id", workspaceID)...)
+			writeError(w, http.StatusInternalServerError, "failed to clear workflow final outcome")
+			return
+		}
+	}
 
-	prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
-	resp := issueToResponse(issue, prefix)
+	resp := h.issueResponse(r.Context(), issue)
 	slog.Info("issue updated", append(logger.RequestAttrs(r), "issue_id", id, "workspace_id", workspaceID)...)
 
 	assigneeChanged := (req.AssigneeType != nil || req.AssigneeID != nil) &&
@@ -938,9 +1055,18 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("batch update issue failed", "issue_id", issueID, "error", err)
 			continue
 		}
+		if req.Updates.Status != nil && issue.Status != "done" && issue.Status != "blocked" && issue.WorkflowFinalOutcome.Valid {
+			issue, err = h.Queries.UpdateIssueWorkflowFinalOutcome(r.Context(), db.UpdateIssueWorkflowFinalOutcomeParams{
+				ID:                   issue.ID,
+				WorkflowFinalOutcome: pgtype.Text{},
+			})
+			if err != nil {
+				slog.Warn("clear issue workflow final outcome failed", "issue_id", issueID, "error", err)
+				continue
+			}
+		}
 
-		prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
-		resp := issueToResponse(issue, prefix)
+		resp := h.issueResponse(r.Context(), issue)
 		actorType, actorID := h.resolveActor(r, userID, workspaceID)
 
 		assigneeChanged := (req.Updates.AssigneeType != nil || req.Updates.AssigneeID != nil) &&

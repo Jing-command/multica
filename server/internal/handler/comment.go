@@ -403,6 +403,12 @@ func (h *Handler) enqueueMentionedAgentTasks(ctx context.Context, issue db.Issue
 			continue
 		}
 		agentUUID := parseUUID(m.ID)
+		if issue.ParentIssueID.Valid {
+			childSpec, err := h.Queries.GetChildSpecByIssueID(ctx, issue.ID)
+			if err == nil && childSpec.OrchestratorAgentID == agentUUID {
+				continue
+			}
+		}
 		// Load the agent to check visibility, archive status, and trigger config.
 		agent, err := h.Queries.GetAgent(ctx, agentUUID)
 		if err != nil || !agent.RuntimeID.Valid || agent.ArchivedAt.Valid {

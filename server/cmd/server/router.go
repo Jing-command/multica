@@ -179,6 +179,11 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus) chi.Route
 					r.Delete("/reactions", h.RemoveIssueReaction)
 					r.Get("/attachments", h.ListAttachments)
 					r.Get("/children", h.ListChildIssues)
+					r.Post("/workflow/submit-review", h.SubmitIssueReview)
+					r.Post("/workflow/report-blocked", h.ReportIssueBlocked)
+					r.Post("/workflow/review", h.ReviewIssueWorkflow)
+					r.Post("/workflow/replan", h.ReplanIssueWorkflow)
+					r.Post("/workflow/finalize-parent", h.FinalizeParentWorkflow)
 				})
 			})
 

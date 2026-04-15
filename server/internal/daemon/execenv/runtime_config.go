@@ -55,7 +55,8 @@ func buildMetaSkillContent(provider string, ctx TaskContextForEnv) string {
 	b.WriteString("- `multica repo checkout <url>` — Check out a repository into the working directory (creates a git worktree with a dedicated branch)\n")
 	b.WriteString("- `multica issue runs <issue-id> --output json` — List all execution runs for an issue (status, timestamps, errors)\n")
 	b.WriteString("- `multica issue run-messages <task-id> [--since <seq>] --output json` — List messages for a specific execution run (supports incremental fetch)\n")
-	b.WriteString("- `multica attachment download <id> [-o <dir>]` — Download an attachment file locally by ID\n\n")
+	b.WriteString("- `multica attachment download <id> [-o <dir>]` — Download an attachment file locally by ID\n")
+	b.WriteString("- `multica issue children <id> --output json` — List child issues of a parent issue (useful for tracking sub-task progress)\n\n")
 
 	b.WriteString("### Write\n")
 	b.WriteString("- `multica issue create --title \"...\" [--description \"...\"] [--priority X] [--assignee X] [--parent <issue-id>] [--status X]` — Create a new issue\n")
@@ -63,6 +64,11 @@ func buildMetaSkillContent(provider string, ctx TaskContextForEnv) string {
 	b.WriteString("- `multica issue comment add <issue-id> --content \"...\" [--parent <comment-id>]` — Post a comment (use --parent to reply to a specific comment)\n")
 	b.WriteString("- `multica issue comment delete <comment-id>` — Delete a comment\n")
 	b.WriteString("- `multica issue status <id> <status>` — Update issue status (todo, in_progress, in_review, done, blocked)\n")
+	b.WriteString("- `multica issue submit-review <issue-id> [--summary \"...\"]` — Submit worker output for formal workflow review\n")
+	b.WriteString("- `multica issue review <issue-id> --verdict <approved|changes_requested> [--summary \"...\"] [--criterion <criterion-id:result[:note]>]` — Record a formal workflow review decision\n")
+	b.WriteString("- `multica issue report-blocked <issue-id> --reason \"...\"` — Record a formal blocked state with the current blocker\n")
+	b.WriteString("- `multica issue replan <issue-id> [--reason \"...\"] [--plan-content \"...\"]` — Request a workflow replan for an issue\n")
+	b.WriteString("- `multica issue finalize <issue-id>` — Finalize a parent issue workflow\n")
 	b.WriteString("- `multica issue update <id> [--title X] [--description X] [--priority X]` — Update issue fields\n\n")
 
 	// Inject available repositories section.
@@ -83,9 +89,45 @@ func buildMetaSkillContent(provider string, ctx TaskContextForEnv) string {
 	}
 
 	b.WriteString("### Workflow\n\n")
+	b.WriteString("comments are narrative only and do not change workflow state. Use formal workflow commands for state transitions and review outcomes.\n\n")
 
-	if ctx.TriggerCommentID != "" {
-		// Comment-triggered: focus on reading and replying
+	if len(ctx.PermissionSnapshotJSON) > 0 {
+		b.WriteString("## Hard file permissions\n\n")
+		b.WriteString("Your allowed write scope is enforced by the execution environment after repository checkout. If a path is not allowed, write operations will fail. Do not attempt to work around this boundary.\n\n")
+	}
+
+	if ctx.IsOrchestrator {
+		// Orchestrator agent: decompose, assign, track.
+		b.WriteString("You are the **Orchestrator**. You coordinate work — you do NOT write code yourself.\n\n")
+		if ctx.TriggerCommentID != "" {
+			// Orchestrator re-triggered by a child issue update.
+			b.WriteString("**A worker has updated a child issue.** Check progress and aggregate if all done.\n\n")
+			fmt.Fprintf(&b, "1. Run `multica issue children %s --output json` to check all child statuses\n", ctx.IssueID)
+			b.WriteString("2. If **all children are terminal**:\n")
+			fmt.Fprintf(&b, "   - Read each child's comments for narrative output: `multica issue comment list <child-id> --output json`\n")
+			fmt.Fprintf(&b, "   - Post a summary comment: `multica issue comment add %s --parent %s --content \"...\"`\n", ctx.IssueID, ctx.TriggerCommentID)
+			fmt.Fprintf(&b, "   - Finalize the parent with the formal workflow command: `multica issue finalize %s`\n", ctx.IssueID)
+			b.WriteString("3. If **some children are `blocked`**:\n")
+			b.WriteString("   - Read the blocker comments for context and take action (clarify, reassign, or replan)\n")
+			b.WriteString("4. If children are still `in_progress`, `todo`, or `in_review`:\n")
+			b.WriteString("   - Do nothing — you will be notified again when they update. Do NOT post \"waiting\" comments.\n\n")
+		} else {
+			// Orchestrator assigned a new task — decompose and assign.
+			b.WriteString("You are responsible for decomposing this task and assigning sub-tasks to workers.\n\n")
+			fmt.Fprintf(&b, "1. Run `multica issue get %s --output json` to understand your task\n", ctx.IssueID)
+			fmt.Fprintf(&b, "2. Run `multica issue status %s in_progress`\n", ctx.IssueID)
+			b.WriteString("3. Run `multica agent list --output json` to see available worker agents\n")
+			b.WriteString("4. Decompose the task into 3-7 child issues. Each child should be independently completable.\n")
+			b.WriteString("5. For each child issue:\n")
+			fmt.Fprintf(&b, "   - `multica issue create --parent %s --title \"<title>\" --description \"<scope and acceptance criteria>\"`\n", ctx.IssueID)
+			b.WriteString("   - `multica issue assign <child-id> --to <worker-agent-name>`\n")
+			fmt.Fprintf(&b, "6. Post a comment listing all child issues: `multica issue comment add %s --content \"...\"`\n", ctx.IssueID)
+			b.WriteString("7. Review child outcomes with formal workflow commands: workers submit with `submit-review`, reviewers decide with `review`, and blocked children use `report-blocked`.\n")
+			b.WriteString("8. When all children are terminal, summarize in a comment and use `multica issue finalize <issue-id>`.\n")
+			b.WriteString("9. Do NOT use comments alone to move workflow state.\n\n")
+		}
+	} else if ctx.TriggerCommentID != "" {
+		// Worker agent: comment-triggered, focus on reading and replying.
 		b.WriteString("**This task was triggered by a comment.** Your primary job is to respond.\n\n")
 		fmt.Fprintf(&b, "1. Run `multica issue get %s --output json` to understand the issue context\n", ctx.IssueID)
 		fmt.Fprintf(&b, "2. Run `multica issue comment list %s --output json` to read the conversation\n", ctx.IssueID)
@@ -95,7 +137,7 @@ func buildMetaSkillContent(provider string, ctx TaskContextForEnv) string {
 		b.WriteString("5. If the comment requests code changes or further work, do the work first, then reply with your results\n")
 		b.WriteString("6. Do NOT change the issue status unless the comment explicitly asks for it\n\n")
 	} else {
-		// Assignment-triggered: full workflow
+		// Worker agent: assignment-triggered, full workflow.
 		b.WriteString("You are responsible for managing the issue status throughout your work.\n\n")
 		fmt.Fprintf(&b, "1. Run `multica issue get %s --output json` to understand your task\n", ctx.IssueID)
 		fmt.Fprintf(&b, "2. Run `multica issue status %s in_progress`\n", ctx.IssueID)
@@ -116,8 +158,8 @@ func buildMetaSkillContent(provider string, ctx TaskContextForEnv) string {
 			fmt.Fprintf(&b, "   e. Post the PR link as a comment: `multica issue comment add %s --content \"PR: <url>\"`\n", ctx.IssueID)
 		}
 		b.WriteString("5. If the task does not require code (e.g. research, documentation), post your findings as a comment\n")
-		fmt.Fprintf(&b, "6. Run `multica issue status %s in_review`\n", ctx.IssueID)
-		fmt.Fprintf(&b, "7. If blocked, run `multica issue status %s blocked` and post a comment explaining why\n\n", ctx.IssueID)
+		fmt.Fprintf(&b, "6. When work is ready for formal review, run `multica issue submit-review %s --summary \"<what changed>\"`\n", ctx.IssueID)
+		fmt.Fprintf(&b, "7. If blocked, run `multica issue report-blocked %s --reason \"<blocker>\"` and add a comment only for extra narrative context\n\n", ctx.IssueID)
 	}
 
 	if len(ctx.AgentSkills) > 0 {

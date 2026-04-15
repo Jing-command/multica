@@ -19,6 +19,7 @@ export class TestApiClient {
   private token: string | null = null;
   private workspaceId: string | null = null;
   private createdIssueIds: string[] = [];
+  private createdWorkspaceIds: string[] = [];
 
   async login(email: string, name: string) {
     // Step 1: Send verification code
@@ -27,11 +28,8 @@ export class TestApiClient {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email }),
     });
-    if (!sendRes.ok) {
-      // Rate limited — code already sent recently, read it from DB
-      if (sendRes.status !== 429) {
-        throw new Error(`send-code failed: ${sendRes.status}`);
-      }
+    if (!sendRes.ok && sendRes.status !== 429) {
+      throw new Error(`send-code failed: ${sendRes.status} ${await sendRes.text()}`);
     }
 
     // Step 2: Read code from database
@@ -43,7 +41,7 @@ export class TestApiClient {
         [email]
       );
       if (result.rows.length === 0) {
-        throw new Error(`No verification code found for ${email}`);
+        throw new Error(`No verification code found for ${email} in ${DATABASE_URL}`);
       }
       const code = result.rows[0].code;
 
@@ -53,15 +51,24 @@ export class TestApiClient {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, code }),
       });
+      if (!verifyRes.ok) {
+        throw new Error(`verify-code failed: ${verifyRes.status} ${await verifyRes.text()}`);
+      }
       const data = await verifyRes.json();
+      if (!data.token) {
+        throw new Error(`verify-code returned no token: ${JSON.stringify(data)}`);
+      }
       this.token = data.token;
 
       // Update user name if needed
       if (name && data.user?.name !== name) {
-        await this.authedFetch("/api/me", {
+        const updateRes = await this.authedFetch("/api/me", {
           method: "PATCH",
           body: JSON.stringify({ name }),
         });
+        if (!updateRes.ok) {
+          throw new Error(`update me failed: ${updateRes.status} ${await updateRes.text()}`);
+        }
       }
 
       return data;
@@ -72,11 +79,54 @@ export class TestApiClient {
 
   async getWorkspaces(): Promise<TestWorkspace[]> {
     const res = await this.authedFetch("/api/workspaces");
-    return res.json();
+    if (!res.ok) {
+      throw new Error(`list workspaces failed: ${res.status} ${await res.text()}`);
+    }
+    const data = await res.json();
+    if (!Array.isArray(data)) {
+      throw new Error(`list workspaces returned non-array: ${JSON.stringify(data)}`);
+    }
+    return data as TestWorkspace[];
+  }
+
+  setToken(token: string) {
+    this.token = token;
   }
 
   setWorkspaceId(id: string) {
     this.workspaceId = id;
+  }
+
+  getCurrentWorkspaceId() {
+    return this.workspaceId;
+  }
+
+  async createWorkspace(name: string, slug: string) {
+    const res = await this.authedFetch("/api/workspaces", {
+      method: "POST",
+      body: JSON.stringify({ name, slug }),
+    });
+    if (!res.ok) {
+      throw new Error(`create workspace failed: ${res.status} ${await res.text()}`);
+    }
+    const workspace = (await res.json()) as TestWorkspace;
+    this.workspaceId = workspace.id;
+    this.createdWorkspaceIds.push(workspace.id);
+    return workspace;
+  }
+
+  async deleteWorkspace(id: string) {
+    const previousWorkspaceId = this.workspaceId;
+    this.workspaceId = id;
+    try {
+      const res = await this.authedFetch(`/api/workspaces/${id}`, { method: "DELETE" });
+      if (!res.ok && res.status !== 404) {
+        throw new Error(`delete workspace failed: ${res.status} ${await res.text()}`);
+      }
+    } finally {
+      this.workspaceId = previousWorkspaceId === id ? null : previousWorkspaceId;
+      this.createdWorkspaceIds = this.createdWorkspaceIds.filter((workspaceId) => workspaceId !== id);
+    }
   }
 
   async ensureWorkspace(name = "E2E Workspace", slug = "e2e-workspace") {
@@ -121,7 +171,7 @@ export class TestApiClient {
     await this.authedFetch(`/api/issues/${id}`, { method: "DELETE" });
   }
 
-  /** Clean up all issues created during this test. */
+  /** Clean up all issues and workspaces created during this test. */
   async cleanup() {
     for (const id of this.createdIssueIds) {
       try {
@@ -131,6 +181,15 @@ export class TestApiClient {
       }
     }
     this.createdIssueIds = [];
+
+    for (const id of [...this.createdWorkspaceIds].reverse()) {
+      try {
+        await this.deleteWorkspace(id);
+      } catch {
+        /* ignore — may already be deleted */
+      }
+    }
+    this.createdWorkspaceIds = [];
   }
 
   getToken() {

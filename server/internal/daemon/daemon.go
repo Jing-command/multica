@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -878,13 +879,27 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, taskLo
 	// Prepare isolated execution environment.
 	// Repos are passed as metadata only — the agent checks them out on demand
 	// via `multica repo checkout <url>`.
+	permissionSnapshotJSON := task.PermissionSnapshotJSON
+	if len(permissionSnapshotJSON) > 0 && !json.Valid(permissionSnapshotJSON) {
+		return TaskResult{}, fmt.Errorf("permission snapshot is invalid JSON")
+	}
+	if len(permissionSnapshotJSON) == 0 && task.PermissionSnapshot != nil {
+		marshaled, err := json.Marshal(task.PermissionSnapshot)
+		if err != nil {
+			return TaskResult{}, fmt.Errorf("marshal permission snapshot: %w", err)
+		}
+		permissionSnapshotJSON = marshaled
+	}
+
 	taskCtx := execenv.TaskContextForEnv{
-		IssueID:           task.IssueID,
-		TriggerCommentID:  task.TriggerCommentID,
-		AgentName:         agentName,
-		AgentInstructions: instructions,
-		AgentSkills:       convertSkillsForEnv(skills),
-		Repos:             convertReposForEnv(task.Repos),
+		IssueID:                task.IssueID,
+		TriggerCommentID:       task.TriggerCommentID,
+		AgentName:              agentName,
+		AgentInstructions:      instructions,
+		AgentSkills:            convertSkillsForEnv(skills),
+		Repos:                  convertReposForEnv(task.Repos),
+		IsOrchestrator:         agentName == "Orchestrator",
+		PermissionSnapshotJSON: permissionSnapshotJSON,
 	}
 
 	// Try to reuse the workdir from a previous task on the same (agent, issue) pair.
@@ -964,10 +979,11 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, taskLo
 	taskStart := time.Now()
 
 	session, err := backend.Execute(ctx, prompt, agent.ExecOptions{
-		Cwd:             env.WorkDir,
-		Model:           entry.Model,
-		Timeout:         d.cfg.AgentTimeout,
-		ResumeSessionID: task.PriorSessionID,
+		Cwd:                    env.WorkDir,
+		Model:                  entry.Model,
+		Timeout:                d.cfg.AgentTimeout,
+		ResumeSessionID:        task.PriorSessionID,
+		PermissionSnapshotJSON: permissionSnapshotJSON,
 	})
 	if err != nil {
 		return TaskResult{}, err

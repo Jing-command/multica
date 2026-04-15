@@ -179,6 +179,18 @@ func TestPrepareWithRepoContext(t *testing.T) {
 	}
 }
 
+func TestBuildMetaSkillContent_UsesVerdictFlagForReviewCommand(t *testing.T) {
+	t.Parallel()
+
+	content := buildMetaSkillContent("claude", TaskContextForEnv{IssueID: "issue-123", IsOrchestrator: true})
+	if !strings.Contains(content, "multica issue review <issue-id> --verdict <approved|changes_requested>") {
+		t.Fatalf("expected runtime instructions to use --verdict, got:\n%s", content)
+	}
+	if strings.Contains(content, "--decision") {
+		t.Fatalf("expected runtime instructions to avoid --decision, got:\n%s", content)
+	}
+}
+
 func TestWriteContextFiles(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -352,6 +364,116 @@ func TestCleanupPreservesLogs(t *testing.T) {
 	}
 }
 
+func TestEnforcePermissionSnapshotIfPresent_AppliesAfterCheckoutMaterializesTree(t *testing.T) {
+	t.Parallel()
+
+	workspacesRoot := t.TempDir()
+	env, err := Prepare(PrepareParams{
+		WorkspacesRoot: workspacesRoot,
+		WorkspaceID:    "ws-test-004",
+		TaskID:         "e5f6a7b8-c9d0-1234-efab-345678901234",
+		AgentName:      "Permission Test",
+		Task: TaskContextForEnv{
+			IssueID:                "permission-hook-id",
+			PermissionSnapshotJSON: []byte(`{"allowed_paths":["repo/allowed/**"]}`),
+		},
+	}, testLogger())
+	if err != nil {
+		t.Fatalf("Prepare failed: %v", err)
+	}
+	defer func() {
+		if err := env.Cleanup(true); err != nil {
+			t.Fatalf("Cleanup failed: %v", err)
+		}
+	}()
+
+	worktreePath := filepath.Join(env.WorkDir, "repo")
+	if err := os.MkdirAll(filepath.Join(worktreePath, "allowed"), 0o755); err != nil {
+		t.Fatalf("mkdir allowed dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(worktreePath, "blocked"), 0o755); err != nil {
+		t.Fatalf("mkdir blocked dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, "allowed", "keep.txt"), []byte("ok\n"), 0o644); err != nil {
+		t.Fatalf("seed allowed file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, "blocked", "deny.txt"), []byte("nope\n"), 0o644); err != nil {
+		t.Fatalf("seed blocked file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(env.WorkDir, "CLAUDE.md"), []byte("runtime config\n"), 0o644); err != nil {
+		t.Fatalf("seed sibling runtime file: %v", err)
+	}
+
+	if err := env.EnforcePermissionSnapshotIfPresent(worktreePath); err != nil {
+		t.Fatalf("EnforcePermissionSnapshotIfPresent failed: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(worktreePath, "allowed", "new.txt"), []byte("ok\n"), 0o644); err != nil {
+		t.Fatalf("expected allowed write to succeed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, "blocked", "deny.txt"), []byte("denied\n"), 0o644); err == nil {
+		t.Fatal("expected blocked write to fail after enforcement hook")
+	}
+	if err := os.WriteFile(filepath.Join(env.WorkDir, "CLAUDE.md"), []byte("runtime config refreshed\n"), 0o644); err != nil {
+		t.Fatalf("expected sibling runtime file to stay writable: %v", err)
+	}
+}
+
+func TestEnforcePermissionSnapshotIfPresent_UsesOnlyTrustedWorkdirSnapshot(t *testing.T) {
+	t.Parallel()
+
+	workspacesRoot := t.TempDir()
+	env, err := Prepare(PrepareParams{
+		WorkspacesRoot: workspacesRoot,
+		WorkspaceID:    "ws-test-005",
+		TaskID:         "f6a7b8c9-d0e1-2345-fabc-456789012345",
+		AgentName:      "Permission Test",
+		Task: TaskContextForEnv{
+			IssueID:                "trusted-snapshot-id",
+			PermissionSnapshotJSON: []byte(`{"allowed_paths":["repo/allowed/**"]}`),
+		},
+	}, testLogger())
+	if err != nil {
+		t.Fatalf("Prepare failed: %v", err)
+	}
+	defer func() {
+		if err := env.Cleanup(true); err != nil {
+			t.Fatalf("Cleanup failed: %v", err)
+		}
+	}()
+
+	worktreePath := filepath.Join(env.WorkDir, "repo")
+	if err := os.MkdirAll(filepath.Join(worktreePath, ".agent_context"), 0o755); err != nil {
+		t.Fatalf("mkdir repo-owned context dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(worktreePath, "allowed"), 0o755); err != nil {
+		t.Fatalf("mkdir allowed dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(worktreePath, "blocked"), 0o755); err != nil {
+		t.Fatalf("mkdir blocked dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, ".agent_context", "permission_snapshot.json"), []byte(`{"allowed_paths":["repo/blocked/**"]}`), 0o644); err != nil {
+		t.Fatalf("write repo-owned snapshot: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, "allowed", "ok.txt"), []byte("ok\n"), 0o644); err != nil {
+		t.Fatalf("seed allowed file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, "blocked", "nope.txt"), []byte("nope\n"), 0o644); err != nil {
+		t.Fatalf("seed blocked file: %v", err)
+	}
+
+	if err := env.EnforcePermissionSnapshotIfPresent(worktreePath); err != nil {
+		t.Fatalf("EnforcePermissionSnapshotIfPresent failed: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(worktreePath, "allowed", "new.txt"), []byte("ok\n"), 0o644); err != nil {
+		t.Fatalf("expected trusted snapshot to allow repo/allowed writes: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, "blocked", "nope.txt"), []byte("denied\n"), 0o644); err == nil {
+		t.Fatal("expected trusted snapshot to keep repo/blocked read-only")
+	}
+}
+
 func TestInjectRuntimeConfigClaude(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -380,6 +502,12 @@ func TestInjectRuntimeConfigClaude(t *testing.T) {
 		"Multica Agent Runtime",
 		"multica issue get",
 		"multica issue comment list",
+		"multica issue submit-review",
+		"multica issue review",
+		"multica issue report-blocked",
+		"multica issue replan",
+		"multica issue finalize",
+		"comments are narrative only and do not change workflow state",
 		"Go Conventions",
 		"PR Review",
 		"discovered automatically",

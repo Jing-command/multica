@@ -116,6 +116,12 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("daemon registered", "workspace_id", req.WorkspaceID, "daemon_id", req.DaemonID, "runtimes_count", len(resp))
 
+	// Ensure the built-in Orchestrator agent exists for this workspace.
+	if len(resp) > 0 {
+		preferredRuntime := selectPreferredOrchestratorRuntimeResponses(resp)
+		ensureOrchestratorAgent(r.Context(), h.Queries, parseUUID(req.WorkspaceID), parseUUID(preferredRuntime.ID), member.UserID)
+	}
+
 	h.publish(protocol.EventDaemonRegister, req.WorkspaceID, "system", "", map[string]any{
 		"runtimes": resp,
 	})

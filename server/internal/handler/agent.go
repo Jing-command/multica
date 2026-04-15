@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/daemon"
 	"github.com/multica-ai/multica/server/internal/logger"
 	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -73,24 +74,26 @@ type RepoData struct {
 }
 
 type AgentTaskResponse struct {
-	ID             string         `json:"id"`
-	AgentID        string         `json:"agent_id"`
-	RuntimeID      string         `json:"runtime_id"`
-	IssueID        string         `json:"issue_id"`
-	WorkspaceID    string         `json:"workspace_id"`
-	Status         string         `json:"status"`
-	Priority       int32          `json:"priority"`
-	DispatchedAt   *string        `json:"dispatched_at"`
-	StartedAt      *string        `json:"started_at"`
-	CompletedAt    *string        `json:"completed_at"`
-	Result         any            `json:"result"`
-	Error          *string        `json:"error"`
-	Agent          *TaskAgentData `json:"agent,omitempty"`
-	Repos          []RepoData     `json:"repos,omitempty"`
-	CreatedAt      string         `json:"created_at"`
-	PriorSessionID   string         `json:"prior_session_id,omitempty"`    // session ID from a previous task on same issue
-	PriorWorkDir     string         `json:"prior_work_dir,omitempty"`     // work_dir from a previous task on same issue
-	TriggerCommentID *string        `json:"trigger_comment_id,omitempty"` // comment that triggered this task
+	ID                     string                  `json:"id"`
+	AgentID                string                  `json:"agent_id"`
+	RuntimeID              string                  `json:"runtime_id"`
+	IssueID                string                  `json:"issue_id"`
+	WorkspaceID            string                  `json:"workspace_id"`
+	Status                 string                  `json:"status"`
+	Priority               int32                   `json:"priority"`
+	DispatchedAt           *string                 `json:"dispatched_at"`
+	StartedAt              *string                 `json:"started_at"`
+	CompletedAt            *string                 `json:"completed_at"`
+	Result                 any                     `json:"result"`
+	Error                  *string                 `json:"error"`
+	Agent                  *TaskAgentData          `json:"agent,omitempty"`
+	Repos                  []RepoData              `json:"repos,omitempty"`
+	CreatedAt              string                  `json:"created_at"`
+	PriorSessionID         string                  `json:"prior_session_id,omitempty"`     // session ID from a previous task on same issue
+	PriorWorkDir           string                  `json:"prior_work_dir,omitempty"`       // work_dir from a previous task on same issue
+	TriggerCommentID       *string                 `json:"trigger_comment_id,omitempty"`   // comment that triggered this task
+	PermissionSnapshot     *daemon.PermissionSnapshotData `json:"permission_snapshot,omitempty"`
+	PermissionSnapshotJSON json.RawMessage         `json:"permission_snapshot_json,omitempty"`
 }
 
 // TaskAgentData holds agent info included in claim responses so the daemon
@@ -107,20 +110,38 @@ func taskToResponse(t db.AgentTaskQueue) AgentTaskResponse {
 	if t.Result != nil {
 		json.Unmarshal(t.Result, &result)
 	}
+
+	var contextPayload struct {
+		PermissionSnapshotJSON json.RawMessage `json:"permission_snapshot_json"`
+	}
+	if t.Context != nil {
+		_ = json.Unmarshal(t.Context, &contextPayload)
+	}
+
+	var permissionSnapshot *daemon.PermissionSnapshotData
+	if len(contextPayload.PermissionSnapshotJSON) > 0 {
+		var parsed daemon.PermissionSnapshotData
+		if err := json.Unmarshal(contextPayload.PermissionSnapshotJSON, &parsed); err == nil {
+			permissionSnapshot = &parsed
+		}
+	}
+
 	return AgentTaskResponse{
-		ID:           uuidToString(t.ID),
-		AgentID:      uuidToString(t.AgentID),
-		RuntimeID:    uuidToString(t.RuntimeID),
-		IssueID:      uuidToString(t.IssueID),
-		Status:       t.Status,
-		Priority:     t.Priority,
-		DispatchedAt: timestampToPtr(t.DispatchedAt),
-		StartedAt:    timestampToPtr(t.StartedAt),
-		CompletedAt:  timestampToPtr(t.CompletedAt),
-		Result:       result,
-		Error:            textToPtr(t.Error),
-		CreatedAt:        timestampToString(t.CreatedAt),
-		TriggerCommentID: uuidToPtr(t.TriggerCommentID),
+		ID:                     uuidToString(t.ID),
+		AgentID:                uuidToString(t.AgentID),
+		RuntimeID:              uuidToString(t.RuntimeID),
+		IssueID:                uuidToString(t.IssueID),
+		Status:                 t.Status,
+		Priority:               t.Priority,
+		DispatchedAt:           timestampToPtr(t.DispatchedAt),
+		StartedAt:              timestampToPtr(t.StartedAt),
+		CompletedAt:            timestampToPtr(t.CompletedAt),
+		Result:                 result,
+		Error:                  textToPtr(t.Error),
+		CreatedAt:              timestampToString(t.CreatedAt),
+		TriggerCommentID:       uuidToPtr(t.TriggerCommentID),
+		PermissionSnapshot:     permissionSnapshot,
+		PermissionSnapshotJSON: contextPayload.PermissionSnapshotJSON,
 	}
 }
 

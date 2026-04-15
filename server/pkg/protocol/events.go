@@ -61,4 +61,14 @@ const (
 	// Daemon events
 	EventDaemonHeartbeat = "daemon:heartbeat"
 	EventDaemonRegister  = "daemon:register"
+
+	// Orchestration lifecycle events
+	EventChildReviewSubmitted        = "orchestration:child_review_submitted"
+	EventChildReviewApproved         = "orchestration:child_review_approved"
+	EventChildReviewChangesRequested = "orchestration:child_review_changes_requested"
+	EventChildReviewEscalated        = "orchestration:child_review_escalated"
+	EventChildBlockedReported        = "orchestration:child_blocked_reported"
+	EventChildReplanned              = "orchestration:child_replanned"
+	EventParentAwaitingAggregation   = "orchestration:parent_awaiting_aggregation"
+	EventParentFinalized             = "orchestration:parent_finalized"
 )

@@ -47,7 +47,12 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	}
 	args = append(args, prompt)
 
-	cmd := exec.CommandContext(runCtx, execPath, args...)
+	cmdPath, cmdArgs, err := wrapCommandWithSandbox(execPath, args, opts)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("wrap opencode with sandbox: %w", err)
+	}
+	cmd := exec.CommandContext(runCtx, cmdPath, cmdArgs...)
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
@@ -312,8 +317,8 @@ type opencodeEventPart struct {
 
 // opencodeTokens represents token usage in a step_finish event.
 type opencodeTokens struct {
-	Input  int64              `json:"input"`
-	Output int64              `json:"output"`
+	Input  int64                `json:"input"`
+	Output int64                `json:"output"`
 	Cache  *opencodeCacheTokens `json:"cache,omitempty"`
 }
 
