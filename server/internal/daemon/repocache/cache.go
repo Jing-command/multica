@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 )
 
 // RepoInfo describes a repository to cache.
@@ -194,6 +196,23 @@ func (c *Cache) CreateWorktree(params WorktreeParams) (*WorktreeResult, error) {
 	// If worktree already exists (reused environment from a prior task),
 	// update it to the latest remote code instead of creating a new one.
 	if isGitWorktree(worktreePath) {
+		snapshotExists, err := trustedPermissionSnapshotExists(params.WorkDir)
+		if err != nil {
+			return nil, err
+		}
+		if err := execenv.MakeTreeWritable(worktreePath); err != nil {
+			return nil, fmt.Errorf("unlock existing worktree: %w", err)
+		}
+		relockOnExit := snapshotExists
+		defer func() {
+			if !relockOnExit {
+				return
+			}
+			if err := applyPermissionSnapshot(params.WorkDir, worktreePath); err != nil {
+				_ = execenv.MakeTreeReadOnly(worktreePath)
+			}
+		}()
+
 		actualBranch, err := updateExistingWorktree(worktreePath, branchName, baseRef)
 		if err != nil {
 			return nil, fmt.Errorf("update existing worktree: %w", err)
@@ -201,6 +220,12 @@ func (c *Cache) CreateWorktree(params WorktreeParams) (*WorktreeResult, error) {
 
 		for _, pattern := range []string{".agent_context", "CLAUDE.md", "AGENTS.md", ".claude", ".config/opencode"} {
 			_ = excludeFromGit(worktreePath, pattern)
+		}
+		if snapshotExists {
+			if err := applyPermissionSnapshot(params.WorkDir, worktreePath); err != nil {
+				return nil, fmt.Errorf("apply permission snapshot: %w", err)
+			}
+			relockOnExit = false
 		}
 
 		c.logger.Info("repo checkout: existing worktree updated",
@@ -224,6 +249,9 @@ func (c *Cache) CreateWorktree(params WorktreeParams) (*WorktreeResult, error) {
 	// Exclude agent context files from git tracking.
 	for _, pattern := range []string{".agent_context", "CLAUDE.md", "AGENTS.md", ".claude", ".config/opencode"} {
 		_ = excludeFromGit(worktreePath, pattern)
+	}
+	if err := applyPermissionSnapshot(params.WorkDir, worktreePath); err != nil {
+		return nil, fmt.Errorf("apply permission snapshot: %w", err)
 	}
 
 	c.logger.Info("repo checkout: worktree created",
@@ -412,4 +440,19 @@ func shortID(uuid string) string {
 		return s[:8]
 	}
 	return s
+}
+
+func applyPermissionSnapshot(workDir, worktreePath string) error {
+	return execenv.EnforcePermissionSnapshotIfPresent(workDir, worktreePath)
+}
+
+func trustedPermissionSnapshotExists(workDir string) (bool, error) {
+	_, err := os.Stat(filepath.Join(workDir, ".agent_context", "permission_snapshot.json"))
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("stat permission snapshot: %w", err)
 }

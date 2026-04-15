@@ -20,12 +20,13 @@ type Backend interface {
 
 // ExecOptions configures a single execution.
 type ExecOptions struct {
-	Cwd             string
-	Model           string
-	SystemPrompt    string
-	MaxTurns        int
-	Timeout         time.Duration
-	ResumeSessionID string // if non-empty, resume a previous agent session
+	Cwd                    string
+	Model                  string
+	SystemPrompt           string
+	MaxTurns               int
+	Timeout                time.Duration
+	ResumeSessionID        string // if non-empty, resume a previous agent session
+	PermissionSnapshotJSON []byte
 }
 
 // Session represents a running agent execution.

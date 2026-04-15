@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // RepoContextForEnv describes a workspace repo available for checkout.
@@ -18,23 +19,24 @@ type RepoContextForEnv struct {
 
 // PrepareParams holds all inputs needed to set up an execution environment.
 type PrepareParams struct {
-	WorkspacesRoot string           // base path for all envs (e.g., ~/multica_workspaces)
-	WorkspaceID    string           // workspace UUID — tasks are grouped under this
-	TaskID         string           // task UUID — used for directory name
-	AgentName      string           // for git branch naming only
-	Provider       string           // agent provider ("claude", "codex") — determines skill injection paths
+	WorkspacesRoot string            // base path for all envs (e.g., ~/multica_workspaces)
+	WorkspaceID    string            // workspace UUID — tasks are grouped under this
+	TaskID         string            // task UUID — used for directory name
+	AgentName      string            // for git branch naming only
+	Provider       string            // agent provider ("claude", "codex") — determines skill injection paths
 	Task           TaskContextForEnv // context data for writing files
 }
 
 // TaskContextForEnv is the subset of task context used for writing context files.
 type TaskContextForEnv struct {
-	IssueID           string
-	TriggerCommentID  string // comment that triggered this task (empty for on_assign)
-	AgentName         string
-	AgentInstructions string // agent identity/persona instructions, injected into CLAUDE.md
-	AgentSkills       []SkillContextForEnv
-	Repos             []RepoContextForEnv // workspace repos available for checkout
-	IsOrchestrator    bool               // true for the built-in Orchestrator agent
+	IssueID                string
+	TriggerCommentID       string // comment that triggered this task (empty for on_assign)
+	AgentName              string
+	AgentInstructions      string // agent identity/persona instructions, injected into CLAUDE.md
+	AgentSkills            []SkillContextForEnv
+	Repos                  []RepoContextForEnv // workspace repos available for checkout
+	IsOrchestrator         bool                // true for the built-in Orchestrator agent
+	PermissionSnapshotJSON []byte
 }
 
 // SkillContextForEnv represents a skill to be written into the execution environment.
@@ -60,6 +62,119 @@ type Environment struct {
 	CodexHome string
 
 	logger *slog.Logger // for cleanup logging
+}
+
+// EnforcePermissionSnapshotIfPresent loads the trusted execenv-written permission snapshot
+// for env.WorkDir and applies filesystem-level enforcement to the checked out repo root.
+// It intentionally runs after checkout/update so execenv never chmods an empty placeholder
+// directory and interferes with later git worktree creation.
+func (env *Environment) EnforcePermissionSnapshotIfPresent(worktreePath string) error {
+	if env == nil {
+		return nil
+	}
+	return EnforcePermissionSnapshotIfPresent(env.WorkDir, worktreePath)
+}
+
+// EnforcePermissionSnapshotIfPresent loads the trusted execenv-written permission snapshot
+// from workDir/.agent_context/permission_snapshot.json and applies filesystem-level
+// enforcement only to worktreePath. Repository contents are never consulted as a snapshot
+// source, so a repo-owned .agent_context/permission_snapshot.json cannot override policy.
+func EnforcePermissionSnapshotIfPresent(workDir, worktreePath string) error {
+	snapshotPath := filepath.Join(workDir, ".agent_context", "permission_snapshot.json")
+	data, err := os.ReadFile(snapshotPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read permission snapshot: %w", err)
+	}
+
+	snapshot, err := ParsePermissionSnapshotJSON(data)
+	if err != nil {
+		return err
+	}
+	repoSnapshot, err := snapshotForRepo(worktreePath, snapshot)
+	if err != nil {
+		return err
+	}
+	return ApplyPermissionSnapshotToWorktree(worktreePath, repoSnapshot)
+}
+
+func snapshotForRepo(worktreePath string, snapshot PermissionSnapshot) (PermissionSnapshot, error) {
+	repoName := filepath.Base(filepath.Clean(worktreePath))
+	if repoName == "." || repoName == string(filepath.Separator) || repoName == "" {
+		return PermissionSnapshot{}, fmt.Errorf("resolve repo name from worktree path")
+	}
+
+	allowed, err := rebasePermissionScopesForRepo(repoName, snapshot.AllowedPaths)
+	if err != nil {
+		return PermissionSnapshot{}, err
+	}
+	readOnly, err := rebasePermissionScopesForRepo(repoName, snapshot.ReadOnlyPaths)
+	if err != nil {
+		return PermissionSnapshot{}, err
+	}
+	blocked, err := rebasePermissionScopesForRepo(repoName, snapshot.BlockedPaths)
+	if err != nil {
+		return PermissionSnapshot{}, err
+	}
+
+	if len(snapshot.AllowedPaths) > 0 && len(allowed) == 0 {
+		allowed = []string{".multica-no-write-access"}
+	}
+
+	return PermissionSnapshot{
+		AllowedPaths:  allowed,
+		ReadOnlyPaths: readOnly,
+		BlockedPaths:  blocked,
+		AllowedTools:  append([]string(nil), snapshot.AllowedTools...),
+	}, nil
+}
+
+func rebasePermissionScopesForRepo(repoName string, scopes []string) ([]string, error) {
+	result := make([]string, 0, len(scopes))
+	for _, scope := range scopes {
+		rebased, ok, err := rebasePermissionScopeForRepo(repoName, scope)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		result = append(result, rebased)
+	}
+	return result, nil
+}
+
+func rebasePermissionScopeForRepo(repoName, scope string) (string, bool, error) {
+	normalized, recursive, err := normalizePermissionScope(scope)
+	if err != nil {
+		return "", false, err
+	}
+	if normalized == "" {
+		return "", false, nil
+	}
+
+	if normalized == repoName {
+		return ".", true, nil
+	}
+
+	prefix := repoName + "/"
+	if !strings.HasPrefix(normalized, prefix) {
+		return "", false, nil
+	}
+
+	rebased := strings.TrimPrefix(normalized, prefix)
+	if rebased == "" {
+		rebased = "."
+	}
+	if recursive {
+		if rebased == "." {
+			return ".", true, nil
+		}
+		return rebased + "/**", true, nil
+	}
+	return rebased, true, nil
 }
 
 // Prepare creates an isolated execution environment for a task.
@@ -152,6 +267,11 @@ func (env *Environment) Cleanup(removeAll bool) error {
 		return nil
 	}
 
+	if err := MakeTreeWritable(env.WorkDir); err != nil && !os.IsNotExist(err) {
+		env.logger.Warn("execenv: cleanup unlock workdir failed", "error", err)
+		return err
+	}
+
 	if removeAll {
 		if err := os.RemoveAll(env.RootDir); err != nil {
 			env.logger.Warn("execenv: cleanup removeAll failed", "error", err)
@@ -166,4 +286,14 @@ func (env *Environment) Cleanup(removeAll bool) error {
 		return err
 	}
 	return nil
+}
+
+// MakeTreeWritable removes filesystem-level permission enforcement under root.
+func MakeTreeWritable(root string) error {
+	return setTreeWritableState(root, true)
+}
+
+// MakeTreeReadOnly applies a fail-closed read-only lock under root.
+func MakeTreeReadOnly(root string) error {
+	return setTreeWritableState(root, false)
 }

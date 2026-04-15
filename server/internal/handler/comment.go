@@ -3,7 +3,6 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -276,59 +275,7 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 	// Pass parentComment so that replies inherit mentions from the thread root.
 	h.enqueueMentionedAgentTasks(r.Context(), issue, comment, parentComment, authorType, authorID)
 
-	// When an agent posts a comment on a child issue, notify the parent issue's
-	// assigned agent so orchestrators can track worker progress and aggregate results.
-	if authorType == "agent" && issue.ParentIssueID.Valid {
-		parentIssue, err := h.Queries.GetIssue(r.Context(), issue.ParentIssueID)
-		if err == nil &&
-			parentIssue.AssigneeType.Valid && parentIssue.AssigneeType.String == "agent" &&
-			parentIssue.AssigneeID.Valid {
-			parentAgentID := parentIssue.AssigneeID
-			// Prevent self-notification: the commenting agent IS the parent's assignee.
-			if parseUUID(authorID) != parentAgentID {
-				hasPending, err := h.Queries.HasPendingTaskForIssueAndAgent(r.Context(),
-					db.HasPendingTaskForIssueAndAgentParams{
-						IssueID: parentIssue.ID,
-						AgentID: parentAgentID,
-					})
-				if err == nil && !hasPending {
-					triggerCommentID, bridgeErr := h.createParentAgentTriggerComment(r.Context(), parentIssue, issue, comment, parentAgentID)
-					if bridgeErr != nil {
-						slog.Warn("create parent trigger comment failed",
-							"child_issue_id", issueID,
-							"parent_issue_id", uuidToString(parentIssue.ID),
-							"agent_id", uuidToString(parentAgentID),
-							"error", bridgeErr)
-					} else if _, err := h.TaskService.EnqueueTaskForMention(r.Context(), parentIssue, parentAgentID, triggerCommentID); err != nil {
-						slog.Warn("enqueue parent agent task on child comment failed",
-							"child_issue_id", issueID,
-							"parent_issue_id", uuidToString(parentIssue.ID),
-							"agent_id", uuidToString(parentAgentID),
-							"error", err)
-					}
-				}
-			}
-		}
-	}
-
 	writeJSON(w, http.StatusCreated, resp)
-}
-
-func (h *Handler) createParentAgentTriggerComment(ctx context.Context, parentIssue, childIssue db.Issue, childComment db.Comment, parentAgentID pgtype.UUID) (pgtype.UUID, error) {
-	content := fmt.Sprintf("Worker update from child issue %s. Review child comment %s before responding.", uuidToString(childIssue.ID), uuidToString(childComment.ID))
-	bridgeComment, err := h.Queries.CreateComment(ctx, db.CreateCommentParams{
-		IssueID:     parentIssue.ID,
-		WorkspaceID: parentIssue.WorkspaceID,
-		AuthorType:  "agent",
-		AuthorID:    parentAgentID,
-		Content:     content,
-		Type:        "system",
-		ParentID:    pgtype.UUID{},
-	})
-	if err != nil {
-		return pgtype.UUID{}, err
-	}
-	return bridgeComment.ID, nil
 }
 
 // commentMentionsOthersButNotAssignee returns true if the comment @mentions
@@ -456,6 +403,12 @@ func (h *Handler) enqueueMentionedAgentTasks(ctx context.Context, issue db.Issue
 			continue
 		}
 		agentUUID := parseUUID(m.ID)
+		if issue.ParentIssueID.Valid {
+			childSpec, err := h.Queries.GetChildSpecByIssueID(ctx, issue.ID)
+			if err == nil && childSpec.OrchestratorAgentID == agentUUID {
+				continue
+			}
+		}
 		// Load the agent to check visibility, archive status, and trigger config.
 		agent, err := h.Queries.GetAgent(ctx, agentUUID)
 		if err != nil || !agent.RuntimeID.Valid || agent.ArchivedAt.Valid {

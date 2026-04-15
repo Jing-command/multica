@@ -48,7 +48,12 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	}
 	args = append(args, "-p", prompt)
 
-	cmd := exec.CommandContext(runCtx, execPath, args...)
+	cmdPath, cmdArgs, err := wrapCommandWithSandbox(execPath, args, opts)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("wrap openclaw with sandbox: %w", err)
+	}
+	cmd := exec.CommandContext(runCtx, cmdPath, cmdArgs...)
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}

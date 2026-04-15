@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sync/atomic"
 	"testing"
 
@@ -1266,5 +1267,62 @@ func TestFinalizeParentWorkflow_SupportsIdentifierRouteParam(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestClaimTaskByRuntime_IncludesPermissionSnapshotJSON(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationHandlerFixture(t, ctx)
+
+	snapshotJSON := `{"allowed_paths":["repo/allowed/**"],"read_only_paths":["repo/docs/**"],"blocked_paths":["repo/.git/**"],"allowed_tools":["Read","Edit"]}`
+	if _, err := testPool.Exec(ctx, `
+		UPDATE agent_task_queue
+		SET context = $2::jsonb
+		WHERE id = $1
+	`, fixture.workerChildTaskID, fmt.Sprintf(`{"permission_snapshot_json":%s}`, snapshotJSON)); err != nil {
+		t.Fatalf("attach permission snapshot to task context: %v", err)
+	}
+
+	var runtimeID string
+	if err := testPool.QueryRow(ctx, `SELECT runtime_id FROM agent_task_queue WHERE id = $1`, fixture.workerChildTaskID).Scan(&runtimeID); err != nil {
+		t.Fatalf("load task runtime id: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", map[string]any{})
+	req = withURLParam(req, "runtimeId", runtimeID)
+	testHandler.ClaimTaskByRuntime(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Task *struct {
+			ID                     string                 `json:"id"`
+			PermissionSnapshot     map[string]any         `json:"permission_snapshot"`
+			PermissionSnapshotJSON json.RawMessage        `json:"permission_snapshot_json"`
+		} `json:"task"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Task == nil {
+		t.Fatal("expected claimed task")
+	}
+	var wantSnapshot map[string]any
+	if err := json.Unmarshal([]byte(snapshotJSON), &wantSnapshot); err != nil {
+		t.Fatalf("decode expected snapshot: %v", err)
+	}
+
+	var gotSnapshot map[string]any
+	if err := json.Unmarshal(resp.Task.PermissionSnapshotJSON, &gotSnapshot); err != nil {
+		t.Fatalf("decode returned snapshot: %v", err)
+	}
+
+	if !reflect.DeepEqual(gotSnapshot, wantSnapshot) {
+		t.Fatalf("expected permission_snapshot_json %s, got %s", snapshotJSON, string(resp.Task.PermissionSnapshotJSON))
+	}
+	if !reflect.DeepEqual(resp.Task.PermissionSnapshot, wantSnapshot) {
+		t.Fatalf("expected permission_snapshot %#v, got %#v", wantSnapshot, resp.Task.PermissionSnapshot)
 	}
 }

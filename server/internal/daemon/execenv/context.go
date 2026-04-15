@@ -1,6 +1,7 @@
 package execenv
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,6 +26,18 @@ func writeContextFiles(workDir, provider string, ctx TaskContextForEnv) error {
 	path := filepath.Join(contextDir, "issue_context.md")
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return fmt.Errorf("write issue_context.md: %w", err)
+	}
+
+	permissionSnapshotPath := filepath.Join(contextDir, "permission_snapshot.json")
+	if len(ctx.PermissionSnapshotJSON) > 0 {
+		if !json.Valid(ctx.PermissionSnapshotJSON) {
+			return fmt.Errorf("permission snapshot is invalid JSON")
+		}
+		if err := os.WriteFile(permissionSnapshotPath, ctx.PermissionSnapshotJSON, 0o644); err != nil {
+			return fmt.Errorf("write permission_snapshot.json: %w", err)
+		}
+	} else if err := os.Remove(permissionSnapshotPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove permission_snapshot.json: %w", err)
 	}
 
 	if len(ctx.AgentSkills) > 0 {

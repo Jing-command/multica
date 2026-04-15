@@ -12,7 +12,7 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
-func TestCreateComment_ChildAgentCommentEnqueuesParentTaskWithParentIssueTriggerComment(t *testing.T) {
+func TestCreateComment_ChildAgentCommentDoesNotEnqueueParentTask(t *testing.T) {
 	ctx := context.Background()
 
 	var orchestratorRuntimeID string
@@ -108,69 +108,475 @@ func TestCreateComment_ChildAgentCommentEnqueuesParentTaskWithParentIssueTrigger
 		t.Fatalf("CreateComment: expected 201, got %d: %s", w.Code, w.Body.String())
 	}
 
-	var childComment CommentResponse
-	if err := json.NewDecoder(w.Body).Decode(&childComment); err != nil {
-		t.Fatalf("decode child comment: %v", err)
+	var parentCommentCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM comment
+		WHERE issue_id = $1
+	`, parent.ID).Scan(&parentCommentCount); err != nil {
+		t.Fatalf("count parent comments: %v", err)
+	}
+	if parentCommentCount != 0 {
+		t.Fatalf("expected no parent bridge comment from child agent comment, got %d comments", parentCommentCount)
 	}
 
-	var parentTask db.AgentTaskQueue
+	var parentTaskCount int
 	if err := testPool.QueryRow(ctx, `
-		SELECT id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id
+		SELECT count(*)
 		FROM agent_task_queue
 		WHERE issue_id = $1 AND agent_id = $2
-		ORDER BY created_at DESC
-		LIMIT 1
-	`, parent.ID, orchestratorAgentID).Scan(
-		&parentTask.ID,
-		&parentTask.AgentID,
-		&parentTask.IssueID,
-		&parentTask.Status,
-		&parentTask.Priority,
-		&parentTask.DispatchedAt,
-		&parentTask.StartedAt,
-		&parentTask.CompletedAt,
-		&parentTask.Result,
-		&parentTask.Error,
-		&parentTask.CreatedAt,
-		&parentTask.Context,
-		&parentTask.RuntimeID,
-		&parentTask.SessionID,
-		&parentTask.WorkDir,
-		&parentTask.TriggerCommentID,
-	); err != nil {
-		t.Fatalf("load parent task: %v", err)
+	`, parent.ID, orchestratorAgentID).Scan(&parentTaskCount); err != nil {
+		t.Fatalf("count parent tasks: %v", err)
 	}
+	if parentTaskCount != 0 {
+		t.Fatalf("expected child agent comment not to enqueue parent task, got %d tasks", parentTaskCount)
+	}
+}
 
-	if !parentTask.TriggerCommentID.Valid {
-		t.Fatal("expected parent task to include trigger_comment_id")
-	}
-	if uuidToString(parentTask.TriggerCommentID) == childComment.ID {
-		t.Fatalf("expected parent task trigger comment to belong to parent issue, got child comment %s", childComment.ID)
-	}
+func TestCreateComment_ChildAgentCommentDoesNotEnqueueFollowupParentTaskWhenParentTaskIsRunning(t *testing.T) {
+	ctx := context.Background()
 
-	var triggerIssueID string
-	var triggerAuthorType string
-	var triggerType string
-	var triggerContent string
+	var orchestratorRuntimeID string
 	if err := testPool.QueryRow(ctx, `
-		SELECT issue_id, author_type, type, content
-		FROM comment
-		WHERE id = $1
-	`, parentTask.TriggerCommentID).Scan(&triggerIssueID, &triggerAuthorType, &triggerType, &triggerContent); err != nil {
-		t.Fatalf("load trigger comment: %v", err)
+		INSERT INTO agent_runtime (
+			workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, owner_id
+		)
+		VALUES ($1, NULL, 'Orchestrator Runtime Running', 'local', 'claude', 'online', 'test', '{}'::jsonb, now(), $2)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&orchestratorRuntimeID); err != nil {
+		t.Fatalf("insert orchestrator runtime: %v", err)
 	}
 
-	if triggerIssueID != parent.ID {
-		t.Fatalf("expected trigger comment issue_id %s, got %s", parent.ID, triggerIssueID)
+	var workerRuntimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (
+			workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, owner_id
+		)
+		VALUES ($1, NULL, 'Worker Runtime Running', 'local', 'codex', 'online', 'test', '{}'::jsonb, now(), $2)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&workerRuntimeID); err != nil {
+		t.Fatalf("insert worker runtime: %v", err)
 	}
-	if triggerAuthorType != "agent" {
-		t.Fatalf("expected trigger comment author_type agent, got %s", triggerAuthorType)
+
+	var orchestratorAgentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (
+			workspace_id, name, description, runtime_mode, runtime_config,
+			runtime_id, visibility, max_concurrent_tasks, owner_id
+		)
+		VALUES ($1, 'Orchestrator', '', 'local', '{}'::jsonb, $2, 'workspace', 10, $3)
+		RETURNING id
+	`, testWorkspaceID, orchestratorRuntimeID, testUserID).Scan(&orchestratorAgentID); err != nil {
+		t.Fatalf("insert orchestrator agent: %v", err)
 	}
-	if triggerType != "system" {
-		t.Fatalf("expected trigger comment type system, got %s", triggerType)
+
+	var workerAgentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (
+			workspace_id, name, description, runtime_mode, runtime_config,
+			runtime_id, visibility, max_concurrent_tasks, owner_id
+		)
+		VALUES ($1, 'Worker Agent Running', '', 'local', '{}'::jsonb, $2, 'workspace', 1, $3)
+		RETURNING id
+	`, testWorkspaceID, workerRuntimeID, testUserID).Scan(&workerAgentID); err != nil {
+		t.Fatalf("insert worker agent: %v", err)
 	}
-	if triggerContent == "" || !containsAll(triggerContent, child.ID, childComment.ID) {
-		t.Fatalf("expected bridge comment to reference child issue and comment, got %q", triggerContent)
+
+	createIssue := func(title string, assigneeType *string, assigneeID *string, parentIssueID *string) IssueResponse {
+		w := httptest.NewRecorder()
+		req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+			"title":           title,
+			"status":          "todo",
+			"assignee_type":   assigneeType,
+			"assignee_id":     assigneeID,
+			"parent_issue_id": parentIssueID,
+		})
+		testHandler.CreateIssue(w, req)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("CreateIssue %q: expected 201, got %d: %s", title, w.Code, w.Body.String())
+		}
+		var issue IssueResponse
+		if err := json.NewDecoder(w.Body).Decode(&issue); err != nil {
+			t.Fatalf("decode issue %q: %v", title, err)
+		}
+		return issue
+	}
+
+	agentType := "agent"
+	parent := createIssue("Parent running issue", &agentType, &orchestratorAgentID, nil)
+	child := createIssue("Child running issue", &agentType, &workerAgentID, &parent.ID)
+
+	if _, err := testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2`, parent.ID, orchestratorAgentID); err != nil {
+		t.Fatalf("clear parent tasks: %v", err)
+	}
+
+	var runningTaskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority, started_at)
+		VALUES ($1, $2, $3, 'running', 1, now())
+		RETURNING id
+	`, orchestratorAgentID, orchestratorRuntimeID, parent.ID).Scan(&runningTaskID); err != nil {
+		t.Fatalf("insert running parent task: %v", err)
+	}
+
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1 OR issue_id = $2`, parent.ID, child.ID)
+		testPool.Exec(ctx, `DELETE FROM comment WHERE issue_id = $1 OR issue_id = $2`, parent.ID, child.ID)
+		testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1 OR id = $2`, parent.ID, child.ID)
+		testPool.Exec(ctx, `DELETE FROM agent WHERE id = $1 OR id = $2`, orchestratorAgentID, workerAgentID)
+		testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE id = $1 OR id = $2`, orchestratorRuntimeID, workerRuntimeID)
+		_ = runningTaskID
+	})
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues/"+child.ID+"/comments", map[string]any{
+		"content": "Worker posted follow-up while parent task is still running",
+	})
+	req = withURLParam(req, "id", child.ID)
+	req.Header.Set("X-Agent-ID", workerAgentID)
+	testHandler.CreateComment(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateComment: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var taskCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM agent_task_queue
+		WHERE issue_id = $1 AND agent_id = $2
+	`, parent.ID, orchestratorAgentID).Scan(&taskCount); err != nil {
+		t.Fatalf("count parent tasks: %v", err)
+	}
+	if taskCount != 1 {
+		t.Fatalf("expected existing running parent task only, got %d tasks", taskCount)
+	}
+
+	var parentCommentCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM comment
+		WHERE issue_id = $1
+	`, parent.ID).Scan(&parentCommentCount); err != nil {
+		t.Fatalf("count parent comments: %v", err)
+	}
+	if parentCommentCount != 0 {
+		t.Fatalf("expected no parent bridge comment while parent task is running, got %d comments", parentCommentCount)
+	}
+}
+
+func TestCreateComment_MentionedAgentCanQueueAlongsideAssignedAgentPendingTask(t *testing.T) {
+	ctx := context.Background()
+
+	var assigneeRuntimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (
+			workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, owner_id
+		)
+		VALUES ($1, NULL, 'Assigned Runtime', 'local', 'claude', 'online', 'test', '{}'::jsonb, now(), $2)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&assigneeRuntimeID); err != nil {
+		t.Fatalf("insert assigned runtime: %v", err)
+	}
+
+	var mentionedRuntimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (
+			workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, owner_id
+		)
+		VALUES ($1, NULL, 'Mentioned Runtime', 'local', 'codex', 'online', 'test', '{}'::jsonb, now(), $2)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&mentionedRuntimeID); err != nil {
+		t.Fatalf("insert mentioned runtime: %v", err)
+	}
+
+	var assignedAgentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (
+			workspace_id, name, description, runtime_mode, runtime_config,
+			runtime_id, visibility, max_concurrent_tasks, owner_id
+		)
+		VALUES ($1, 'Assigned Agent', '', 'local', '{}'::jsonb, $2, 'workspace', 1, $3)
+		RETURNING id
+	`, testWorkspaceID, assigneeRuntimeID, testUserID).Scan(&assignedAgentID); err != nil {
+		t.Fatalf("insert assigned agent: %v", err)
+	}
+
+	var mentionedAgentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (
+			workspace_id, name, description, runtime_mode, runtime_config,
+			runtime_id, visibility, max_concurrent_tasks, owner_id
+		)
+		VALUES ($1, 'Mentioned Agent', '', 'local', '{}'::jsonb, $2, 'workspace', 1, $3)
+		RETURNING id
+	`, testWorkspaceID, mentionedRuntimeID, testUserID).Scan(&mentionedAgentID); err != nil {
+		t.Fatalf("insert mentioned agent: %v", err)
+	}
+
+	agentType := "agent"
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":         "Mention fanout issue",
+		"status":        "todo",
+		"assignee_type": &agentType,
+		"assignee_id":   &assignedAgentID,
+	})
+	testHandler.CreateIssue(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var issue IssueResponse
+	if err := json.NewDecoder(w.Body).Decode(&issue); err != nil {
+		t.Fatalf("decode issue: %v", err)
+	}
+
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, issue.ID)
+		testPool.Exec(ctx, `DELETE FROM comment WHERE issue_id = $1`, issue.ID)
+		testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issue.ID)
+		testPool.Exec(ctx, `DELETE FROM agent WHERE id = $1 OR id = $2`, assignedAgentID, mentionedAgentID)
+		testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE id = $1 OR id = $2`, assigneeRuntimeID, mentionedRuntimeID)
+	})
+
+	commentW := httptest.NewRecorder()
+	commentReq := newRequest("POST", "/api/issues/"+issue.ID+"/comments", map[string]any{
+		"content": fmt.Sprintf("Please sync with [@Mentioned](mention://agent/%s)", mentionedAgentID),
+	})
+	commentReq = withURLParam(commentReq, "id", issue.ID)
+	testHandler.CreateComment(commentW, commentReq)
+	if commentW.Code != http.StatusCreated {
+		t.Fatalf("CreateComment: expected 201, got %d: %s", commentW.Code, commentW.Body.String())
+	}
+
+	var assignedCount, mentionedCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2`, issue.ID, assignedAgentID).Scan(&assignedCount); err != nil {
+		t.Fatalf("count assigned agent tasks: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2`, issue.ID, mentionedAgentID).Scan(&mentionedCount); err != nil {
+		t.Fatalf("count mentioned agent tasks: %v", err)
+	}
+	if assignedCount != 1 || mentionedCount != 1 {
+		t.Fatalf("expected one pending task for assigned and mentioned agents, got assigned=%d mentioned=%d", assignedCount, mentionedCount)
+	}
+}
+
+func TestCreateComment_NonOrchestrationChildIssueMentionOfParentAssigneeStillEnqueuesTask(t *testing.T) {
+	ctx := context.Background()
+
+	var parentAssigneeRuntimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (
+			workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, owner_id
+		)
+		VALUES ($1, NULL, 'Parent Assignee Runtime Mention', 'local', 'claude', 'online', 'test', '{}'::jsonb, now(), $2)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&parentAssigneeRuntimeID); err != nil {
+		t.Fatalf("insert parent assignee runtime: %v", err)
+	}
+
+	var workerRuntimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (
+			workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, owner_id
+		)
+		VALUES ($1, NULL, 'Worker Runtime Non-Orch Mention', 'local', 'codex', 'online', 'test', '{}'::jsonb, now(), $2)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&workerRuntimeID); err != nil {
+		t.Fatalf("insert worker runtime: %v", err)
+	}
+
+	var parentAssigneeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (
+			workspace_id, name, description, runtime_mode, runtime_config,
+			runtime_id, visibility, max_concurrent_tasks, owner_id
+		)
+		VALUES ($1, 'Parent Assignee', '', 'local', '{}'::jsonb, $2, 'workspace', 10, $3)
+		RETURNING id
+	`, testWorkspaceID, parentAssigneeRuntimeID, testUserID).Scan(&parentAssigneeID); err != nil {
+		t.Fatalf("insert parent assignee agent: %v", err)
+	}
+
+	var workerAgentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (
+			workspace_id, name, description, runtime_mode, runtime_config,
+			runtime_id, visibility, max_concurrent_tasks, owner_id
+		)
+		VALUES ($1, 'Worker Agent Non-Orch Mention', '', 'local', '{}'::jsonb, $2, 'workspace', 1, $3)
+		RETURNING id
+	`, testWorkspaceID, workerRuntimeID, testUserID).Scan(&workerAgentID); err != nil {
+		t.Fatalf("insert worker agent: %v", err)
+	}
+
+	createIssue := func(title string, assigneeType *string, assigneeID *string, parentIssueID *string) IssueResponse {
+		w := httptest.NewRecorder()
+		req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+			"title":           title,
+			"status":          "todo",
+			"assignee_type":   assigneeType,
+			"assignee_id":     assigneeID,
+			"parent_issue_id": parentIssueID,
+		})
+		testHandler.CreateIssue(w, req)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("CreateIssue %q: expected 201, got %d: %s", title, w.Code, w.Body.String())
+		}
+		var issue IssueResponse
+		if err := json.NewDecoder(w.Body).Decode(&issue); err != nil {
+			t.Fatalf("decode issue %q: %v", title, err)
+		}
+		return issue
+	}
+
+	agentType := "agent"
+	parent := createIssue("Parent non-orchestration mention issue", &agentType, &parentAssigneeID, nil)
+	child := createIssue("Child non-orchestration mention issue", &agentType, &workerAgentID, &parent.ID)
+
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1 OR issue_id = $2`, parent.ID, child.ID)
+		testPool.Exec(ctx, `DELETE FROM comment WHERE issue_id = $1 OR issue_id = $2`, parent.ID, child.ID)
+		testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1 OR id = $2`, parent.ID, child.ID)
+		testPool.Exec(ctx, `DELETE FROM agent WHERE id = $1 OR id = $2`, parentAssigneeID, workerAgentID)
+		testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE id = $1 OR id = $2`, parentAssigneeRuntimeID, workerRuntimeID)
+	})
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues/"+child.ID+"/comments", map[string]any{
+		"content": fmt.Sprintf("Please review [@ParentAssignee](mention://agent/%s)", parentAssigneeID),
+	})
+	req = withURLParam(req, "id", child.ID)
+	testHandler.CreateComment(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateComment: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var parentAssigneeTaskCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM agent_task_queue
+		WHERE issue_id = $1 AND agent_id = $2
+	`, child.ID, parentAssigneeID).Scan(&parentAssigneeTaskCount); err != nil {
+		t.Fatalf("count parent assignee child tasks: %v", err)
+	}
+	if parentAssigneeTaskCount != 1 {
+		t.Fatalf("expected explicit mention on non-orchestration child to enqueue one task, got %d", parentAssigneeTaskCount)
+	}
+}
+
+func TestCreateComment_ChildIssueMentionOfOrchestratorDoesNotEnqueueOrchestratorTask(t *testing.T) {
+	ctx := context.Background()
+
+	var orchestratorRuntimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (
+			workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, owner_id
+		)
+		VALUES ($1, NULL, 'Orchestrator Runtime Mention', 'local', 'claude', 'online', 'test', '{}'::jsonb, now(), $2)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&orchestratorRuntimeID); err != nil {
+		t.Fatalf("insert orchestrator runtime: %v", err)
+	}
+
+	var workerRuntimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (
+			workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, owner_id
+		)
+		VALUES ($1, NULL, 'Worker Runtime Mention', 'local', 'codex', 'online', 'test', '{}'::jsonb, now(), $2)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&workerRuntimeID); err != nil {
+		t.Fatalf("insert worker runtime: %v", err)
+	}
+
+	var orchestratorAgentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (
+			workspace_id, name, description, runtime_mode, runtime_config,
+			runtime_id, visibility, max_concurrent_tasks, owner_id
+		)
+		VALUES ($1, 'Orchestrator', '', 'local', '{}'::jsonb, $2, 'workspace', 10, $3)
+		RETURNING id
+	`, testWorkspaceID, orchestratorRuntimeID, testUserID).Scan(&orchestratorAgentID); err != nil {
+		t.Fatalf("insert orchestrator agent: %v", err)
+	}
+
+	var workerAgentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (
+			workspace_id, name, description, runtime_mode, runtime_config,
+			runtime_id, visibility, max_concurrent_tasks, owner_id
+		)
+		VALUES ($1, 'Worker Agent Mention', '', 'local', '{}'::jsonb, $2, 'workspace', 1, $3)
+		RETURNING id
+	`, testWorkspaceID, workerRuntimeID, testUserID).Scan(&workerAgentID); err != nil {
+		t.Fatalf("insert worker agent: %v", err)
+	}
+
+	createIssue := func(title string, assigneeType *string, assigneeID *string, parentIssueID *string) IssueResponse {
+		w := httptest.NewRecorder()
+		req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+			"title":           title,
+			"status":          "todo",
+			"assignee_type":   assigneeType,
+			"assignee_id":     assigneeID,
+			"parent_issue_id": parentIssueID,
+		})
+		testHandler.CreateIssue(w, req)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("CreateIssue %q: expected 201, got %d: %s", title, w.Code, w.Body.String())
+		}
+		var issue IssueResponse
+		if err := json.NewDecoder(w.Body).Decode(&issue); err != nil {
+			t.Fatalf("decode issue %q: %v", title, err)
+		}
+		return issue
+	}
+
+	agentType := "agent"
+	parent := createIssue("Parent mention issue", &agentType, &orchestratorAgentID, nil)
+	child := createIssue("Child mention issue", &agentType, &workerAgentID, &parent.ID)
+
+	if _, err := testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1 OR issue_id = $2`, parent.ID, child.ID); err != nil {
+		t.Fatalf("clear pending tasks: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO child_spec (workspace_id, parent_issue_id, child_issue_id, worker_agent_id, orchestrator_agent_id)
+		VALUES ($1, $2, $3, $4, $5)
+	`, testWorkspaceID, parent.ID, child.ID, workerAgentID, orchestratorAgentID); err != nil {
+		t.Fatalf("insert child spec: %v", err)
+	}
+
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1 OR issue_id = $2`, parent.ID, child.ID)
+		testPool.Exec(ctx, `DELETE FROM comment WHERE issue_id = $1 OR issue_id = $2`, parent.ID, child.ID)
+		testPool.Exec(ctx, `DELETE FROM child_spec WHERE child_issue_id = $1`, child.ID)
+		testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1 OR id = $2`, parent.ID, child.ID)
+		testPool.Exec(ctx, `DELETE FROM agent WHERE id = $1 OR id = $2`, orchestratorAgentID, workerAgentID)
+		testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE id = $1 OR id = $2`, orchestratorRuntimeID, workerRuntimeID)
+	})
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues/"+child.ID+"/comments", map[string]any{
+		"content": fmt.Sprintf("Please review [@Orchestrator](mention://agent/%s)", orchestratorAgentID),
+	})
+	req = withURLParam(req, "id", child.ID)
+	testHandler.CreateComment(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateComment: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var orchestratorTaskCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM agent_task_queue
+		WHERE issue_id = $1 AND agent_id = $2
+	`, child.ID, orchestratorAgentID).Scan(&orchestratorTaskCount); err != nil {
+		t.Fatalf("count orchestrator child tasks: %v", err)
+	}
+	if orchestratorTaskCount != 0 {
+		t.Fatalf("expected child comment mention to remain narrative-only for orchestrator, got %d tasks", orchestratorTaskCount)
 	}
 }
 

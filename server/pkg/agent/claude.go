@@ -52,7 +52,12 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	}
 	args = append(args, "-p", prompt)
 
-	cmd := exec.CommandContext(runCtx, execPath, args...)
+	cmdPath, cmdArgs, err := wrapCommandWithSandbox(execPath, args, opts)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("wrap claude with sandbox: %w", err)
+	}
+	cmd := exec.CommandContext(runCtx, cmdPath, cmdArgs...)
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
