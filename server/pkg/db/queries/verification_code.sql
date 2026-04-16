@@ -28,6 +28,10 @@ WHERE email = $1
 ORDER BY created_at DESC
 LIMIT 1;
 
+-- name: DeleteVerificationCodeByID :exec
+DELETE FROM verification_code
+WHERE id = $1;
+
 -- name: DeleteExpiredVerificationCodes :exec
 DELETE FROM verification_code
 WHERE expires_at < now() - interval '1 hour';

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -183,6 +184,201 @@ func (h *Handler) issueJWT(user db.User) (string, error) {
 	return token.SignedString(auth.JWTSecret())
 }
 
+const (
+	authAbuseEventSendCodeRequested = "send_code_requested"
+	authAbuseEventSendCodeBlocked   = "send_code_blocked"
+	authAbuseEventVerifyCodeFailed  = "verify_code_failed"
+	authAbuseEventVerifyCodeBlocked = "verify_code_blocked"
+
+	sendCodeCooldown               = 60 * time.Second
+	sendCodeIdentifierWindow       = 15 * time.Minute
+	sendCodeIdentifierLimit        = 5
+	sendCodeIdentifierDailyWindow  = 24 * time.Hour
+	sendCodeIdentifierDailyLimit   = 20
+	sendCodeIPWindow               = 15 * time.Minute
+	sendCodeIPLimit                = 20
+	sendCodeIPDailyWindow          = 24 * time.Hour
+	sendCodeIPDailyLimit           = 100
+	sendCodeIPIdentifierWindow     = 15 * time.Minute
+	sendCodeIPIdentifierLimit      = 3
+	verifyCodeIdentifierFailWindow = 15 * time.Minute
+	verifyCodeIdentifierFailLimit  = 10
+	verifyCodeIPFailWindow         = 15 * time.Minute
+	verifyCodeIPFailLimit          = 25
+)
+
+type authGuardDecision struct {
+	Allow  bool
+	Reason string
+}
+
+func normalizeEmailIdentifier(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
+
+func clientIP(r *http.Request) string {
+	host := strings.TrimSpace(r.RemoteAddr)
+	if host == "" {
+		return "unknown"
+	}
+	if strings.Contains(host, ":") {
+		if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+			return parsedHost
+		}
+	}
+	return host
+}
+
+func (h *Handler) recordAuthAbuseEvent(ctx context.Context, eventType, identifier, ip string) {
+	_, err := h.Queries.CreateAuthAbuseEvent(ctx, db.CreateAuthAbuseEventParams{
+		EventType:  eventType,
+		Identifier: identifier,
+		Ip:         ip,
+	})
+	if err != nil {
+		slog.Warn("record auth abuse event failed", "event_type", eventType, "identifier", identifier, "ip", ip, "error", err)
+	}
+}
+
+func (h *Handler) countAuthEventsByIdentifier(ctx context.Context, eventType, identifier string, since time.Time) (int32, error) {
+	count, err := h.Queries.CountAuthAbuseEventsByIdentifierSince(ctx, db.CountAuthAbuseEventsByIdentifierSinceParams{
+		EventType:  eventType,
+		Identifier: identifier,
+		CreatedAt:  pgtype.Timestamptz{Time: since, Valid: true},
+	})
+	if err != nil {
+		slog.Warn("count auth abuse event by identifier failed", "event_type", eventType, "identifier", identifier, "error", err)
+		return 0, err
+	}
+	return count, nil
+}
+
+func (h *Handler) countAuthEventsByIP(ctx context.Context, eventType, ip string, since time.Time) (int32, error) {
+	count, err := h.Queries.CountAuthAbuseEventsByIPSince(ctx, db.CountAuthAbuseEventsByIPSinceParams{
+		EventType: eventType,
+		Ip:        ip,
+		CreatedAt: pgtype.Timestamptz{Time: since, Valid: true},
+	})
+	if err != nil {
+		slog.Warn("count auth abuse event by ip failed", "event_type", eventType, "ip", ip, "error", err)
+		return 0, err
+	}
+	return count, nil
+}
+
+func (h *Handler) countAuthEventsByIPAndIdentifier(ctx context.Context, eventType, ip, identifier string, since time.Time) (int32, error) {
+	count, err := h.Queries.CountAuthAbuseEventsByIPAndIdentifierSince(ctx, db.CountAuthAbuseEventsByIPAndIdentifierSinceParams{
+		EventType:  eventType,
+		Ip:         ip,
+		Identifier: identifier,
+		CreatedAt:  pgtype.Timestamptz{Time: since, Valid: true},
+	})
+	if err != nil {
+		slog.Warn("count auth abuse event by ip and identifier failed", "event_type", eventType, "ip", ip, "identifier", identifier, "error", err)
+		return 0, err
+	}
+	return count, nil
+}
+
+func (h *Handler) evaluateSendCodeGuard(ctx context.Context, identifier, ip string, now time.Time) authGuardDecision {
+	cooldownCount, err := h.countAuthEventsByIdentifier(ctx, authAbuseEventSendCodeRequested, identifier, now.Add(-sendCodeCooldown))
+	if err != nil {
+		return authGuardDecision{Allow: false, Reason: "cooldown_lookup_error"}
+	}
+	if cooldownCount > 0 {
+		return authGuardDecision{Allow: false, Reason: "cooldown"}
+	}
+
+	identifierRequestedCount, err := h.countAuthEventsByIdentifier(ctx, authAbuseEventSendCodeRequested, identifier, now.Add(-sendCodeIdentifierWindow))
+	if err != nil {
+		return authGuardDecision{Allow: false, Reason: "identifier_window_lookup_error"}
+	}
+	identifierBlockedCount, err := h.countAuthEventsByIdentifier(ctx, authAbuseEventSendCodeBlocked, identifier, now.Add(-sendCodeIdentifierWindow))
+	if err != nil {
+		return authGuardDecision{Allow: false, Reason: "identifier_window_lookup_error"}
+	}
+	if identifierRequestedCount+identifierBlockedCount >= sendCodeIdentifierLimit {
+		return authGuardDecision{Allow: false, Reason: "identifier_window"}
+	}
+
+	identifierDailyRequestedCount, err := h.countAuthEventsByIdentifier(ctx, authAbuseEventSendCodeRequested, identifier, now.Add(-sendCodeIdentifierDailyWindow))
+	if err != nil {
+		return authGuardDecision{Allow: false, Reason: "identifier_daily_window_lookup_error"}
+	}
+	identifierDailyBlockedCount, err := h.countAuthEventsByIdentifier(ctx, authAbuseEventSendCodeBlocked, identifier, now.Add(-sendCodeIdentifierDailyWindow))
+	if err != nil {
+		return authGuardDecision{Allow: false, Reason: "identifier_daily_window_lookup_error"}
+	}
+	if identifierDailyRequestedCount+identifierDailyBlockedCount >= sendCodeIdentifierDailyLimit {
+		return authGuardDecision{Allow: false, Reason: "identifier_daily_window"}
+	}
+
+	ipRequestedCount, err := h.countAuthEventsByIP(ctx, authAbuseEventSendCodeRequested, ip, now.Add(-sendCodeIPWindow))
+	if err != nil {
+		return authGuardDecision{Allow: false, Reason: "ip_window_lookup_error"}
+	}
+	ipBlockedCount, err := h.countAuthEventsByIP(ctx, authAbuseEventSendCodeBlocked, ip, now.Add(-sendCodeIPWindow))
+	if err != nil {
+		return authGuardDecision{Allow: false, Reason: "ip_window_lookup_error"}
+	}
+	if ipRequestedCount+ipBlockedCount >= sendCodeIPLimit {
+		return authGuardDecision{Allow: false, Reason: "ip_window"}
+	}
+
+	ipDailyRequestedCount, err := h.countAuthEventsByIP(ctx, authAbuseEventSendCodeRequested, ip, now.Add(-sendCodeIPDailyWindow))
+	if err != nil {
+		return authGuardDecision{Allow: false, Reason: "ip_daily_window_lookup_error"}
+	}
+	ipDailyBlockedCount, err := h.countAuthEventsByIP(ctx, authAbuseEventSendCodeBlocked, ip, now.Add(-sendCodeIPDailyWindow))
+	if err != nil {
+		return authGuardDecision{Allow: false, Reason: "ip_daily_window_lookup_error"}
+	}
+	if ipDailyRequestedCount+ipDailyBlockedCount >= sendCodeIPDailyLimit {
+		return authGuardDecision{Allow: false, Reason: "ip_daily_window"}
+	}
+
+	ipIdentifierRequestedCount, err := h.countAuthEventsByIPAndIdentifier(ctx, authAbuseEventSendCodeRequested, ip, identifier, now.Add(-sendCodeIPIdentifierWindow))
+	if err != nil {
+		return authGuardDecision{Allow: false, Reason: "ip_identifier_window_lookup_error"}
+	}
+	ipIdentifierBlockedCount, err := h.countAuthEventsByIPAndIdentifier(ctx, authAbuseEventSendCodeBlocked, ip, identifier, now.Add(-sendCodeIPIdentifierWindow))
+	if err != nil {
+		return authGuardDecision{Allow: false, Reason: "ip_identifier_window_lookup_error"}
+	}
+	if ipIdentifierRequestedCount+ipIdentifierBlockedCount >= sendCodeIPIdentifierLimit {
+		return authGuardDecision{Allow: false, Reason: "ip_identifier_window"}
+	}
+
+	return authGuardDecision{Allow: true}
+}
+
+func (h *Handler) evaluateVerifyCodeGuard(ctx context.Context, identifier, ip string, now time.Time) authGuardDecision {
+	identifierFailedCount, err := h.countAuthEventsByIdentifier(ctx, authAbuseEventVerifyCodeFailed, identifier, now.Add(-verifyCodeIdentifierFailWindow))
+	if err != nil {
+		return authGuardDecision{Allow: false, Reason: "identifier_failed_window_lookup_error"}
+	}
+	identifierBlockedCount, err := h.countAuthEventsByIdentifier(ctx, authAbuseEventVerifyCodeBlocked, identifier, now.Add(-verifyCodeIdentifierFailWindow))
+	if err != nil {
+		return authGuardDecision{Allow: false, Reason: "identifier_failed_window_lookup_error"}
+	}
+	if identifierFailedCount+identifierBlockedCount >= verifyCodeIdentifierFailLimit {
+		return authGuardDecision{Allow: false, Reason: "identifier_failed_window"}
+	}
+
+	ipFailedCount, err := h.countAuthEventsByIP(ctx, authAbuseEventVerifyCodeFailed, ip, now.Add(-verifyCodeIPFailWindow))
+	if err != nil {
+		return authGuardDecision{Allow: false, Reason: "ip_failed_window_lookup_error"}
+	}
+	ipBlockedCount, err := h.countAuthEventsByIP(ctx, authAbuseEventVerifyCodeBlocked, ip, now.Add(-verifyCodeIPFailWindow))
+	if err != nil {
+		return authGuardDecision{Allow: false, Reason: "ip_failed_window_lookup_error"}
+	}
+	if ipFailedCount+ipBlockedCount >= verifyCodeIPFailLimit {
+		return authGuardDecision{Allow: false, Reason: "ip_failed_window"}
+	}
+	return authGuardDecision{Allow: true}
+}
+
 func (h *Handler) findOrCreateUser(ctx context.Context, email string) (db.User, error) {
 	user, err := h.Queries.GetUserByEmail(ctx, email)
 	if err != nil {
@@ -211,16 +407,21 @@ func (h *Handler) SendCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	email := strings.ToLower(strings.TrimSpace(req.Email))
+	email := normalizeEmailIdentifier(req.Email)
 	if email == "" {
 		writeError(w, http.StatusBadRequest, "email is required")
 		return
 	}
 
-	// Rate limit: max 1 code per 10 seconds per email
-	latest, err := h.Queries.GetLatestCodeByEmail(r.Context(), email)
-	if err == nil && time.Since(latest.CreatedAt.Time) < 10*time.Second {
-		writeError(w, http.StatusTooManyRequests, "please wait before requesting another code")
+	now := time.Now()
+	ip := clientIP(r)
+	decision := h.evaluateSendCodeGuard(r.Context(), email, ip, now)
+	if !decision.Allow {
+		slog.Warn("send code blocked", append(logger.RequestAttrs(r), "reason", decision.Reason, "identifier", email, "ip", ip)...)
+		h.recordAuthAbuseEvent(r.Context(), authAbuseEventSendCodeBlocked, email, ip)
+		_ = h.Queries.DeleteOldAuthAbuseEvents(r.Context())
+		_ = h.Queries.DeleteExpiredVerificationCodes(r.Context())
+		writeJSON(w, http.StatusOK, map[string]string{"message": "Verification code sent"})
 		return
 	}
 
@@ -230,10 +431,10 @@ func (h *Handler) SendCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = h.Queries.CreateVerificationCode(r.Context(), db.CreateVerificationCodeParams{
+	verificationCode, err := h.Queries.CreateVerificationCode(r.Context(), db.CreateVerificationCodeParams{
 		Email:     email,
 		Code:      code,
-		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(10 * time.Minute), Valid: true},
+		ExpiresAt: pgtype.Timestamptz{Time: now.Add(10 * time.Minute), Valid: true},
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to store verification code")
@@ -241,13 +442,14 @@ func (h *Handler) SendCode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.EmailService.SendVerificationCode(email, code); err != nil {
+		_ = h.Queries.DeleteVerificationCodeByID(r.Context(), verificationCode.ID)
 		writeError(w, http.StatusInternalServerError, "failed to send verification code")
 		return
 	}
+	h.recordAuthAbuseEvent(r.Context(), authAbuseEventSendCodeRequested, email, ip)
 
-	// Best-effort cleanup of expired codes
+	_ = h.Queries.DeleteOldAuthAbuseEvents(r.Context())
 	_ = h.Queries.DeleteExpiredVerificationCodes(r.Context())
-
 	writeJSON(w, http.StatusOK, map[string]string{"message": "Verification code sent"})
 }
 
@@ -258,23 +460,37 @@ func (h *Handler) VerifyCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	email := strings.ToLower(strings.TrimSpace(req.Email))
+	email := normalizeEmailIdentifier(req.Email)
 	code := strings.TrimSpace(req.Code)
-
 	if email == "" || code == "" {
 		writeError(w, http.StatusBadRequest, "email and code are required")
 		return
 	}
 
+	now := time.Now()
+	ip := clientIP(r)
+	decision := h.evaluateVerifyCodeGuard(r.Context(), email, ip, now)
+	if !decision.Allow {
+		slog.Warn("verify code blocked", append(logger.RequestAttrs(r), "reason", decision.Reason, "identifier", email, "ip", ip)...)
+		h.recordAuthAbuseEvent(r.Context(), authAbuseEventVerifyCodeBlocked, email, ip)
+		writeError(w, http.StatusBadRequest, "invalid or expired code")
+		return
+	}
+
 	dbCode, err := h.Queries.GetLatestVerificationCode(r.Context(), email)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid or expired code")
+		if isNotFound(err) {
+			writeError(w, http.StatusBadRequest, "invalid or expired code")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to verify code")
 		return
 	}
 
 	isMasterCode := code == "888888" && os.Getenv("APP_ENV") != "production"
 	if !isMasterCode && subtle.ConstantTimeCompare([]byte(code), []byte(dbCode.Code)) != 1 {
 		_ = h.Queries.IncrementVerificationCodeAttempts(r.Context(), dbCode.ID)
+		h.recordAuthAbuseEvent(r.Context(), authAbuseEventVerifyCodeFailed, email, ip)
 		writeError(w, http.StatusBadRequest, "invalid or expired code")
 		return
 	}
@@ -302,7 +518,6 @@ func (h *Handler) VerifyCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set CloudFront signed cookies for CDN access.
 	if h.CFSigner != nil {
 		for _, cookie := range h.CFSigner.SignedCookies(time.Now().Add(30 * 24 * time.Hour)) {
 			http.SetCookie(w, cookie)
@@ -310,10 +525,7 @@ func (h *Handler) VerifyCode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slog.Info("user logged in", append(logger.RequestAttrs(r), "user_id", uuidToString(user.ID), "email", user.Email)...)
-	writeJSON(w, http.StatusOK, LoginResponse{
-		Token: tokenString,
-		User:  userToResponse(user),
-	})
+	writeJSON(w, http.StatusOK, LoginResponse{Token: tokenString, User: userToResponse(user)})
 }
 
 func (h *Handler) GetMe(w http.ResponseWriter, r *http.Request) {
