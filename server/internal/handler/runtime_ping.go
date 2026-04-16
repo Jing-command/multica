@@ -59,8 +59,11 @@ func runtimePingToRequest(p db.RuntimePing) PingRequest {
 	}
 }
 
-func (h *Handler) getPingRequest(ctx context.Context, pingID string) (*PingRequest, error) {
-	ping, err := h.Queries.GetRuntimePing(ctx, parseUUID(pingID))
+func (h *Handler) getPingRequest(ctx context.Context, runtimeID, pingID string) (*PingRequest, error) {
+	ping, err := h.Queries.GetRuntimePingForRuntime(ctx, db.GetRuntimePingForRuntimeParams{
+		ID:        parseUUID(pingID),
+		RuntimeID: parseUUID(runtimeID),
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +74,10 @@ func (h *Handler) getPingRequest(ctx context.Context, pingID string) (*PingReque
 		} else if !isNotFound(err) {
 			return nil, err
 		} else {
-			ping, err = h.Queries.GetRuntimePing(ctx, ping.ID)
+			ping, err = h.Queries.GetRuntimePingForRuntime(ctx, db.GetRuntimePingForRuntimeParams{
+				ID:        ping.ID,
+				RuntimeID: parseUUID(runtimeID),
+			})
 			if err != nil {
 				return nil, err
 			}
@@ -93,18 +99,20 @@ func (h *Handler) popPendingPingRequest(ctx context.Context, runtimeID string) (
 	return &result, nil
 }
 
-func (h *Handler) completePingRequest(ctx context.Context, pingID, output string, durationMs int64) error {
-	_, err := h.Queries.SetRuntimePingCompleted(ctx, db.SetRuntimePingCompletedParams{
+func (h *Handler) completePingRequest(ctx context.Context, runtimeID, pingID, output string, durationMs int64) error {
+	_, err := h.Queries.SetRuntimePingCompletedForRuntime(ctx, db.SetRuntimePingCompletedForRuntimeParams{
 		ID:         parseUUID(pingID),
+		RuntimeID:  parseUUID(runtimeID),
 		Output:     output,
 		DurationMs: pgtype.Int8{Int64: durationMs, Valid: true},
 	})
 	return err
 }
 
-func (h *Handler) failPingRequest(ctx context.Context, pingID, errMsg string, durationMs int64) error {
-	_, err := h.Queries.SetRuntimePingFailed(ctx, db.SetRuntimePingFailedParams{
+func (h *Handler) failPingRequest(ctx context.Context, runtimeID, pingID, errMsg string, durationMs int64) error {
+	_, err := h.Queries.SetRuntimePingFailedForRuntime(ctx, db.SetRuntimePingFailedForRuntimeParams{
 		ID:         parseUUID(pingID),
+		RuntimeID:  parseUUID(runtimeID),
 		Error:      errMsg,
 		DurationMs: pgtype.Int8{Int64: durationMs, Valid: true},
 	})
@@ -136,9 +144,20 @@ func (h *Handler) InitiatePing(w http.ResponseWriter, r *http.Request) {
 
 // GetPing returns the status of a ping request (protected route, called by frontend).
 func (h *Handler) GetPing(w http.ResponseWriter, r *http.Request) {
+	runtimeID := chi.URLParam(r, "runtimeId")
 	pingID := chi.URLParam(r, "pingId")
 
-	ping, err := h.getPingRequest(r.Context(), pingID)
+	rt, err := h.Queries.GetAgentRuntime(r.Context(), parseUUID(runtimeID))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "runtime not found")
+		return
+	}
+
+	if _, ok := h.requireWorkspaceMember(w, r, uuidToString(rt.WorkspaceID), "runtime not found"); !ok {
+		return
+	}
+
+	ping, err := h.getPingRequest(r.Context(), runtimeID, pingID)
 	if err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, "ping not found")
@@ -174,9 +193,9 @@ func (h *Handler) ReportPingResult(w http.ResponseWriter, r *http.Request) {
 
 	var err error
 	if req.Status == "completed" {
-		err = h.completePingRequest(r.Context(), pingID, req.Output, req.DurationMs)
+		err = h.completePingRequest(r.Context(), runtimeID, pingID, req.Output, req.DurationMs)
 	} else {
-		err = h.failPingRequest(r.Context(), pingID, req.Error, req.DurationMs)
+		err = h.failPingRequest(r.Context(), runtimeID, pingID, req.Error, req.DurationMs)
 	}
 	if err != nil {
 		if isNotFound(err) {

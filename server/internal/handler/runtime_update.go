@@ -51,8 +51,11 @@ func runtimeUpdateToRequest(u db.RuntimeUpdate) UpdateRequest {
 	}
 }
 
-func (h *Handler) getUpdateRequest(ctx context.Context, updateID string) (*UpdateRequest, error) {
-	update, err := h.Queries.GetRuntimeUpdate(ctx, parseUUID(updateID))
+func (h *Handler) getUpdateRequest(ctx context.Context, runtimeID, updateID string) (*UpdateRequest, error) {
+	update, err := h.Queries.GetRuntimeUpdateForRuntime(ctx, db.GetRuntimeUpdateForRuntimeParams{
+		ID:        parseUUID(updateID),
+		RuntimeID: parseUUID(runtimeID),
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +66,10 @@ func (h *Handler) getUpdateRequest(ctx context.Context, updateID string) (*Updat
 		} else if !isNotFound(err) {
 			return nil, err
 		} else {
-			update, err = h.Queries.GetRuntimeUpdate(ctx, update.ID)
+			update, err = h.Queries.GetRuntimeUpdateForRuntime(ctx, db.GetRuntimeUpdateForRuntimeParams{
+				ID:        update.ID,
+				RuntimeID: parseUUID(runtimeID),
+			})
 			if err != nil {
 				return nil, err
 			}
@@ -85,18 +91,20 @@ func (h *Handler) popPendingUpdateRequest(ctx context.Context, runtimeID string)
 	return &result, nil
 }
 
-func (h *Handler) completeUpdateRequest(ctx context.Context, updateID, output string) error {
-	_, err := h.Queries.SetRuntimeUpdateCompleted(ctx, db.SetRuntimeUpdateCompletedParams{
-		ID:     parseUUID(updateID),
-		Output: output,
+func (h *Handler) completeUpdateRequest(ctx context.Context, runtimeID, updateID, output string) error {
+	_, err := h.Queries.SetRuntimeUpdateCompletedForRuntime(ctx, db.SetRuntimeUpdateCompletedForRuntimeParams{
+		ID:        parseUUID(updateID),
+		RuntimeID: parseUUID(runtimeID),
+		Output:    output,
 	})
 	return err
 }
 
-func (h *Handler) failUpdateRequest(ctx context.Context, updateID, errMsg string) error {
-	_, err := h.Queries.SetRuntimeUpdateFailed(ctx, db.SetRuntimeUpdateFailedParams{
-		ID:    parseUUID(updateID),
-		Error: errMsg,
+func (h *Handler) failUpdateRequest(ctx context.Context, runtimeID, updateID, errMsg string) error {
+	_, err := h.Queries.SetRuntimeUpdateFailedForRuntime(ctx, db.SetRuntimeUpdateFailedForRuntimeParams{
+		ID:        parseUUID(updateID),
+		RuntimeID: parseUUID(runtimeID),
+		Error:     errMsg,
 	})
 	return err
 }
@@ -145,9 +153,20 @@ func (h *Handler) InitiateUpdate(w http.ResponseWriter, r *http.Request) {
 
 // GetUpdate returns the status of an update request (protected route, called by frontend).
 func (h *Handler) GetUpdate(w http.ResponseWriter, r *http.Request) {
+	runtimeID := chi.URLParam(r, "runtimeId")
 	updateID := chi.URLParam(r, "updateId")
 
-	update, err := h.getUpdateRequest(r.Context(), updateID)
+	rt, err := h.Queries.GetAgentRuntime(r.Context(), parseUUID(runtimeID))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "runtime not found")
+		return
+	}
+
+	if _, ok := h.requireWorkspaceMember(w, r, uuidToString(rt.WorkspaceID), "runtime not found"); !ok {
+		return
+	}
+
+	update, err := h.getUpdateRequest(r.Context(), runtimeID, updateID)
 	if err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, "update not found")
@@ -183,9 +202,9 @@ func (h *Handler) ReportUpdateResult(w http.ResponseWriter, r *http.Request) {
 	var err error
 	switch req.Status {
 	case "completed":
-		err = h.completeUpdateRequest(r.Context(), updateID, req.Output)
+		err = h.completeUpdateRequest(r.Context(), runtimeID, updateID, req.Output)
 	case "failed":
-		err = h.failUpdateRequest(r.Context(), updateID, req.Error)
+		err = h.failUpdateRequest(r.Context(), runtimeID, updateID, req.Error)
 	case "running":
 		err = nil
 	default:
