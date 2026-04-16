@@ -40,11 +40,8 @@ export function WSProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!user || !workspace) return;
 
-    const token = localStorage.getItem("multica_token");
-    if (!token) return;
-
     const ws = new WSClient(WS_URL, { logger: createLogger("ws") });
-    ws.setAuth(token, workspace.id);
+    ws.setAuth("", workspace.id);
     wsRef.current = ws;
     setWsClient(ws);
     ws.connect();

@@ -3,7 +3,7 @@
 import { create } from "zustand";
 import type { User } from "@/shared/types";
 import { api } from "@/shared/api";
-import { setLoggedInCookie, clearLoggedInCookie } from "./auth-cookie";
+import { hasLoggedInCookie, setLoggedInCookie, clearLoggedInCookie } from "./auth-cookie";
 
 interface AuthState {
   user: User | null;
@@ -22,13 +22,12 @@ export const useAuthStore = create<AuthState>((set) => ({
   isLoading: true,
 
   initialize: async () => {
-    const token = localStorage.getItem("multica_token");
-    if (!token) {
+    if (!hasLoggedInCookie()) {
+      api.setToken(null);
+      api.setWorkspaceId(null);
       set({ isLoading: false });
       return;
     }
-
-    api.setToken(token);
 
     try {
       const user = await api.getMe();
@@ -37,6 +36,7 @@ export const useAuthStore = create<AuthState>((set) => ({
       api.setToken(null);
       api.setWorkspaceId(null);
       localStorage.removeItem("multica_token");
+      clearLoggedInCookie();
       set({ user: null, isLoading: false });
     }
   },
@@ -46,18 +46,18 @@ export const useAuthStore = create<AuthState>((set) => ({
   },
 
   verifyCode: async (email: string, code: string) => {
-    const { token, user } = await api.verifyCode(email, code);
-    localStorage.setItem("multica_token", token);
-    api.setToken(token);
+    const { user } = await api.verifyCode(email, code);
+    localStorage.removeItem("multica_token");
+    api.setToken(null);
     setLoggedInCookie();
     set({ user });
     return user;
   },
 
   loginWithGoogle: async (code: string, redirectUri: string) => {
-    const { token, user } = await api.googleLogin(code, redirectUri);
-    localStorage.setItem("multica_token", token);
-    api.setToken(token);
+    const { user } = await api.googleLogin(code, redirectUri);
+    localStorage.removeItem("multica_token");
+    api.setToken(null);
     setLoggedInCookie();
     set({ user });
     return user;

@@ -27,7 +27,6 @@ export class WSClient {
 
   connect() {
     const url = new URL(this.baseUrl);
-    if (this.token) url.searchParams.set("token", this.token);
     if (this.workspaceId)
       url.searchParams.set("workspace_id", this.workspaceId);
 
