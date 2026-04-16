@@ -251,7 +251,7 @@ func (q *Queries) SetRuntimePingFailed(ctx context.Context, arg SetRuntimePingFa
 const setRuntimePingTimeout = `-- name: SetRuntimePingTimeout :one
 UPDATE runtime_ping
 SET status = 'timeout', error = 'daemon did not respond within 60 seconds', updated_at = now()
-WHERE id = $1 AND status = 'pending'
+WHERE id = $1 AND status IN ('pending', 'running')
 RETURNING id, runtime_id, status, output, error, duration_ms, created_at, updated_at
 `
 

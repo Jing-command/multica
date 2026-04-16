@@ -1390,3 +1390,46 @@ func TestGetUpdateReturnsPersistedTerminalStateWhenTimeoutUpdateLosesRace(t *tes
 		t.Fatal("timed out waiting for getUpdateRequest")
 	}
 }
+
+func TestGetPingTimesOutAfterHeartbeatClaimsIt(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/ping", nil), "runtimeId", runtimeID)
+	testHandler.InitiatePing(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiatePing: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created PingRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created ping: %v", err)
+	}
+
+	heartbeatW := httptest.NewRecorder()
+	heartbeatReq := newRequest("POST", "/api/daemon/heartbeat", map[string]any{"runtime_id": runtimeID})
+	testHandler.DaemonHeartbeat(heartbeatW, heartbeatReq)
+	if heartbeatW.Code != http.StatusOK {
+		t.Fatalf("DaemonHeartbeat: expected 200, got %d: %s", heartbeatW.Code, heartbeatW.Body.String())
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE runtime_ping
+		SET created_at = $2, updated_at = $2
+		WHERE id = $1
+	`, created.ID, time.Now().Add(-2*time.Minute)); err != nil {
+		t.Fatalf("age claimed ping request: %v", err)
+	}
+
+	got, err := testHandler.getPingRequest(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("getPingRequest returned error: %v", err)
+	}
+	if got.Status != PingTimeout {
+		t.Fatalf("ping status = %q, want %q", got.Status, PingTimeout)
+	}
+	if got.Error != "daemon did not respond within 60 seconds" {
+		t.Fatalf("ping error = %q, want timeout error", got.Error)
+	}
+}

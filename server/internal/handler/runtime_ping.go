@@ -64,7 +64,7 @@ func (h *Handler) getPingRequest(ctx context.Context, pingID string) (*PingReque
 	if err != nil {
 		return nil, err
 	}
-	if ping.Status == string(PingPending) && ping.CreatedAt.Valid && time.Since(ping.CreatedAt.Time) > 60*time.Second {
+	if (ping.Status == string(PingPending) || ping.Status == string(PingRunning)) && ping.CreatedAt.Valid && time.Since(ping.CreatedAt.Time) > 60*time.Second {
 		timedOut, err := h.Queries.SetRuntimePingTimeout(ctx, ping.ID)
 		if err == nil {
 			ping = timedOut

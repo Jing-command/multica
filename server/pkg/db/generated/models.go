@@ -94,6 +94,14 @@ type Attachment struct {
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
 }
 
+type AuthAbuseEvent struct {
+	ID         pgtype.UUID        `json:"id"`
+	EventType  string             `json:"event_type"`
+	Identifier string             `json:"identifier"`
+	Ip         string             `json:"ip"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+}
+
 type ChildAcceptanceCriterium struct {
 	ID            pgtype.UUID        `json:"id"`
 	ChildSpecID   pgtype.UUID        `json:"child_spec_id"`
@@ -323,6 +331,28 @@ type RepoPermissionPolicy struct {
 	CreatedBy   pgtype.UUID        `json:"created_by"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RuntimePing struct {
+	ID         pgtype.UUID        `json:"id"`
+	RuntimeID  pgtype.UUID        `json:"runtime_id"`
+	Status     string             `json:"status"`
+	Output     string             `json:"output"`
+	Error      string             `json:"error"`
+	DurationMs pgtype.Int8        `json:"duration_ms"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RuntimeUpdate struct {
+	ID            pgtype.UUID        `json:"id"`
+	RuntimeID     pgtype.UUID        `json:"runtime_id"`
+	Status        string             `json:"status"`
+	TargetVersion string             `json:"target_version"`
+	Output        string             `json:"output"`
+	Error         string             `json:"error"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 }
 
 type RuntimeUsage struct {

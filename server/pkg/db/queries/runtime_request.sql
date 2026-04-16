@@ -36,7 +36,7 @@ RETURNING *;
 -- name: SetRuntimePingTimeout :one
 UPDATE runtime_ping
 SET status = 'timeout', error = 'daemon did not respond within 60 seconds', updated_at = now()
-WHERE id = $1 AND status = 'pending'
+WHERE id = $1 AND status IN ('pending', 'running')
 RETURNING *;
 
 -- name: CreateRuntimeUpdate :one
