@@ -1,17 +1,14 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
-
-// ---------------------------------------------------------------------------
-// In-memory update store
-// ---------------------------------------------------------------------------
 
 type UpdateStatus string
 
@@ -35,111 +32,69 @@ type UpdateRequest struct {
 	UpdatedAt     time.Time    `json:"updated_at"`
 }
 
-// UpdateStore is a thread-safe in-memory store for CLI update requests.
-type UpdateStore struct {
-	mu       sync.Mutex
-	requests map[string]*UpdateRequest // keyed by update ID
-}
-
-func NewUpdateStore() *UpdateStore {
-	return &UpdateStore{
-		requests: make(map[string]*UpdateRequest),
-	}
-}
-
-func (s *UpdateStore) Create(runtimeID, targetVersion string) (*UpdateRequest, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Clean up old requests (>5 minutes).
-	for id, req := range s.requests {
-		if time.Since(req.CreatedAt) > 5*time.Minute {
-			delete(s.requests, id)
-		}
-	}
-
-	// Reject if there is already a pending or running update for this runtime.
-	for _, req := range s.requests {
-		if req.RuntimeID == runtimeID && (req.Status == UpdatePending || req.Status == UpdateRunning) {
-			return nil, errUpdateInProgress
-		}
-	}
-
-	req := &UpdateRequest{
-		ID:            randomID(),
-		RuntimeID:     runtimeID,
-		Status:        UpdatePending,
-		TargetVersion: targetVersion,
-		CreatedAt:     time.Now(),
-		UpdatedAt:     time.Now(),
-	}
-	s.requests[req.ID] = req
-	return req, nil
-}
-
 var errUpdateInProgress = &updateError{msg: "an update is already in progress for this runtime"}
 
 type updateError struct{ msg string }
 
 func (e *updateError) Error() string { return e.msg }
 
-func (s *UpdateStore) Get(id string) *UpdateRequest {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	req, ok := s.requests[id]
-	if !ok {
-		return nil
+func runtimeUpdateToRequest(u db.RuntimeUpdate) UpdateRequest {
+	return UpdateRequest{
+		ID:            uuidToString(u.ID),
+		RuntimeID:     uuidToString(u.RuntimeID),
+		Status:        UpdateStatus(u.Status),
+		TargetVersion: u.TargetVersion,
+		Output:        u.Output,
+		Error:         u.Error,
+		CreatedAt:     u.CreatedAt.Time,
+		UpdatedAt:     u.UpdatedAt.Time,
 	}
-	// Check for timeout (both pending and running states).
-	if (req.Status == UpdatePending || req.Status == UpdateRunning) && time.Since(req.CreatedAt) > 120*time.Second {
-		req.Status = UpdateTimeout
-		req.Error = "update did not complete within 120 seconds"
-		req.UpdatedAt = time.Now()
-	}
-	return req
 }
 
-// PopPending returns and marks as running the pending update for a runtime.
-func (s *UpdateStore) PopPending(runtimeID string) *UpdateRequest {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for _, req := range s.requests {
-		if req.RuntimeID == runtimeID && req.Status == UpdatePending {
-			req.Status = UpdateRunning
-			req.UpdatedAt = time.Now()
-			return req
+func (h *Handler) getUpdateRequest(ctx context.Context, updateID string) (*UpdateRequest, error) {
+	update, err := h.Queries.GetRuntimeUpdate(ctx, parseUUID(updateID))
+	if err != nil {
+		return nil, err
+	}
+	if (update.Status == string(UpdatePending) || update.Status == string(UpdateRunning)) && update.CreatedAt.Valid && time.Since(update.CreatedAt.Time) > 120*time.Second {
+		timedOut, err := h.Queries.SetRuntimeUpdateTimeout(ctx, update.ID)
+		if err == nil {
+			update = timedOut
+		} else if !isNotFound(err) {
+			return nil, err
 		}
 	}
-	return nil
+	result := runtimeUpdateToRequest(update)
+	return &result, nil
 }
 
-func (s *UpdateStore) Complete(id string, output string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if req, ok := s.requests[id]; ok {
-		req.Status = UpdateCompleted
-		req.Output = output
-		req.UpdatedAt = time.Now()
+func (h *Handler) popPendingUpdateRequest(ctx context.Context, runtimeID string) (*UpdateRequest, error) {
+	items, err := h.Queries.PopPendingRuntimeUpdate(ctx, parseUUID(runtimeID))
+	if err != nil {
+		return nil, err
 	}
-}
-
-func (s *UpdateStore) Fail(id string, errMsg string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if req, ok := s.requests[id]; ok {
-		req.Status = UpdateFailed
-		req.Error = errMsg
-		req.UpdatedAt = time.Now()
+	if len(items) == 0 {
+		return nil, nil
 	}
+	result := runtimeUpdateToRequest(items[0])
+	return &result, nil
 }
 
-// ---------------------------------------------------------------------------
-// Handlers
-// ---------------------------------------------------------------------------
+func (h *Handler) completeUpdateRequest(ctx context.Context, updateID, output string) error {
+	_, err := h.Queries.SetRuntimeUpdateCompleted(ctx, db.SetRuntimeUpdateCompletedParams{
+		ID:     parseUUID(updateID),
+		Output: output,
+	})
+	return err
+}
+
+func (h *Handler) failUpdateRequest(ctx context.Context, updateID, errMsg string) error {
+	_, err := h.Queries.SetRuntimeUpdateFailed(ctx, db.SetRuntimeUpdateFailedParams{
+		ID:    parseUUID(updateID),
+		Error: errMsg,
+	})
+	return err
+}
 
 // InitiateUpdate creates a new CLI update request (protected route, called by frontend).
 func (h *Handler) InitiateUpdate(w http.ResponseWriter, r *http.Request) {
@@ -167,22 +122,33 @@ func (h *Handler) InitiateUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	update, err := h.UpdateStore.Create(runtimeID, req.TargetVersion)
+	update, err := h.Queries.CreateRuntimeUpdate(r.Context(), db.CreateRuntimeUpdateParams{
+		RuntimeID:     parseUUID(runtimeID),
+		TargetVersion: req.TargetVersion,
+	})
 	if err != nil {
-		writeError(w, http.StatusConflict, err.Error())
+		if isUniqueViolation(err) {
+			writeError(w, http.StatusConflict, errUpdateInProgress.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to create update")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, update)
+	writeJSON(w, http.StatusOK, runtimeUpdateToRequest(update))
 }
 
 // GetUpdate returns the status of an update request (protected route, called by frontend).
 func (h *Handler) GetUpdate(w http.ResponseWriter, r *http.Request) {
 	updateID := chi.URLParam(r, "updateId")
 
-	update := h.UpdateStore.Get(updateID)
-	if update == nil {
-		writeError(w, http.StatusNotFound, "update not found")
+	update, err := h.getUpdateRequest(r.Context(), updateID)
+	if err != nil {
+		if isNotFound(err) {
+			writeError(w, http.StatusNotFound, "update not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load update")
 		return
 	}
 
@@ -194,7 +160,7 @@ func (h *Handler) ReportUpdateResult(w http.ResponseWriter, r *http.Request) {
 	updateID := chi.URLParam(r, "updateId")
 
 	var req struct {
-		Status string `json:"status"` // "running", "completed", or "failed"
+		Status string `json:"status"`
 		Output string `json:"output"`
 		Error  string `json:"error"`
 	}
@@ -203,17 +169,24 @@ func (h *Handler) ReportUpdateResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var err error
 	switch req.Status {
 	case "completed":
-		h.UpdateStore.Complete(updateID, req.Output)
+		err = h.completeUpdateRequest(r.Context(), updateID, req.Output)
 	case "failed":
-		h.UpdateStore.Fail(updateID, req.Error)
+		err = h.failUpdateRequest(r.Context(), updateID, req.Error)
 	case "running":
-		// No-op: status is already "running" from PopPending. This call is
-		// just a progress signal from the daemon to confirm it received the
-		// update command and is executing it.
+		err = nil
 	default:
 		writeError(w, http.StatusBadRequest, "invalid status: "+req.Status)
+		return
+	}
+	if err != nil {
+		if isNotFound(err) {
+			writeError(w, http.StatusNotFound, "update not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to store update result")
 		return
 	}
 
