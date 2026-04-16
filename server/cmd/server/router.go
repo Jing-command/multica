@@ -83,7 +83,6 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus) chi.Route
 	r.Post("/auth/send-code", h.SendCode)
 	r.Post("/auth/verify-code", h.VerifyCode)
 	r.Post("/auth/google", h.GoogleLogin)
-	r.Post("/auth/logout", h.Logout)
 
 	// Authenticated session routes
 	r.Group(func(r chi.Router) {

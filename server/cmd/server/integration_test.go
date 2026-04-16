@@ -490,6 +490,18 @@ func TestVerifyCodeCreatesWorkspaceForNewUser(t *testing.T) {
 	}
 }
 
+func TestRouterSourceRegistersLogoutRouteOnlyOnce(t *testing.T) {
+	source, err := os.ReadFile("router.go")
+	if err != nil {
+		t.Fatalf("read router source: %v", err)
+	}
+
+	logoutPostCount := strings.Count(string(source), `r.Post("/auth/logout", h.Logout)`)
+	if logoutPostCount != 1 {
+		t.Fatalf("expected exactly 1 logout route registration, got %d", logoutPostCount)
+	}
+}
+
 func TestProtectedRoutesRequireAuth(t *testing.T) {
 	paths := []string{"/api/me", "/api/issues", "/api/agents", "/api/inbox", "/api/workspaces"}
 
