@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -1238,5 +1239,154 @@ func TestUpdatePersistsAcrossHandlerRestart(t *testing.T) {
 	}
 	if got.TargetVersion != "v9.9.9" {
 		t.Fatalf("update target_version = %q, want v9.9.9", got.TargetVersion)
+	}
+}
+
+func TestGetPingReturnsPersistedTerminalStateWhenTimeoutUpdateLosesRace(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/ping", nil), "runtimeId", runtimeID)
+	testHandler.InitiatePing(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiatePing: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created PingRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created ping: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE runtime_ping
+		SET created_at = $2, updated_at = $2
+		WHERE id = $1
+	`, created.ID, time.Now().Add(-2*time.Minute)); err != nil {
+		t.Fatalf("age ping request: %v", err)
+	}
+
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT id FROM runtime_ping WHERE id = $1 FOR UPDATE`, created.ID); err != nil {
+		t.Fatalf("lock ping row: %v", err)
+	}
+
+	resultCh := make(chan *PingRequest, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, err := testHandler.getPingRequest(ctx, created.ID)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resultCh <- result
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE runtime_ping
+		SET status = 'completed', output = 'pong', duration_ms = 7, updated_at = now()
+		WHERE id = $1
+	`, created.ID); err != nil {
+		t.Fatalf("complete ping in tx: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit tx: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("getPingRequest returned error: %v", err)
+	case got := <-resultCh:
+		if got.Status != PingCompleted {
+			t.Fatalf("ping status = %q, want %q", got.Status, PingCompleted)
+		}
+		if got.Output != "pong" {
+			t.Fatalf("ping output = %q, want pong", got.Output)
+		}
+		if got.DurationMs != 7 {
+			t.Fatalf("ping duration_ms = %d, want 7", got.DurationMs)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for getPingRequest")
+	}
+}
+
+func TestGetUpdateReturnsPersistedTerminalStateWhenTimeoutUpdateLosesRace(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/update", map[string]any{
+		"target_version": "v1.2.3",
+	}), "runtimeId", runtimeID)
+	testHandler.InitiateUpdate(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiateUpdate: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created UpdateRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created update: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE runtime_update
+		SET created_at = $2, updated_at = $2
+		WHERE id = $1
+	`, created.ID, time.Now().Add(-3*time.Minute)); err != nil {
+		t.Fatalf("age update request: %v", err)
+	}
+
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT id FROM runtime_update WHERE id = $1 FOR UPDATE`, created.ID); err != nil {
+		t.Fatalf("lock update row: %v", err)
+	}
+
+	resultCh := make(chan *UpdateRequest, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, err := testHandler.getUpdateRequest(ctx, created.ID)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resultCh <- result
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE runtime_update
+		SET status = 'completed', output = 'updated', updated_at = now()
+		WHERE id = $1
+	`, created.ID); err != nil {
+		t.Fatalf("complete update in tx: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit tx: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("getUpdateRequest returned error: %v", err)
+	case got := <-resultCh:
+		if got.Status != UpdateCompleted {
+			t.Fatalf("update status = %q, want %q", got.Status, UpdateCompleted)
+		}
+		if got.Output != "updated" {
+			t.Fatalf("update output = %q, want updated", got.Output)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for getUpdateRequest")
 	}
 }

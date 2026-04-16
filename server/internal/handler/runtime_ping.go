@@ -71,9 +71,10 @@ func (h *Handler) getPingRequest(ctx context.Context, pingID string) (*PingReque
 		} else if !isNotFound(err) {
 			return nil, err
 		} else {
-			ping.Status = string(PingTimeout)
-			ping.Error = "daemon did not respond within 60 seconds"
-			ping.UpdatedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+			ping, err = h.Queries.GetRuntimePing(ctx, ping.ID)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	result := runtimePingToRequest(ping)

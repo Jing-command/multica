@@ -62,6 +62,11 @@ func (h *Handler) getUpdateRequest(ctx context.Context, updateID string) (*Updat
 			update = timedOut
 		} else if !isNotFound(err) {
 			return nil, err
+		} else {
+			update, err = h.Queries.GetRuntimeUpdate(ctx, update.ID)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	result := runtimeUpdateToRequest(update)
