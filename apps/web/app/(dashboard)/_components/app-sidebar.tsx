@@ -87,9 +87,9 @@ export function AppSidebar() {
     [inboxItems],
   );
 
-  const logout = () => {
+  const logout = async () => {
     router.push("/");
-    authLogout();
+    await authLogout();
     useWorkspaceStore.getState().clearWorkspace();
   };
 

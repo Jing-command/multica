@@ -84,6 +84,12 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus) chi.Route
 	r.Post("/auth/verify-code", h.VerifyCode)
 	r.Post("/auth/google", h.GoogleLogin)
 
+	// Authenticated session routes
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.Auth(queries))
+		r.Post("/auth/logout", h.Logout)
+	})
+
 	// Daemon API routes (all require daemon machine auth)
 	r.Route("/api/daemon", func(r chi.Router) {
 		r.Use(middleware.DaemonAuth(queries))

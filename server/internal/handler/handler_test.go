@@ -1217,6 +1217,32 @@ func TestVerifyCodeCreatesWorkspace(t *testing.T) {
 	}
 }
 
+func TestLogoutClearsAuthCookie(t *testing.T) {
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/auth/logout", nil)
+	req.Header.Set("X-User-ID", testUserID)
+
+	testHandler.Logout(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("Logout: expected 204, got %d: %s", w.Code, w.Body.String())
+	}
+
+	cookies := w.Result().Cookies()
+	for _, cookie := range cookies {
+		if cookie.Name == "multica_auth" {
+			if cookie.Value != "" {
+				t.Fatalf("expected auth cookie to be cleared, got %q", cookie.Value)
+			}
+			if cookie.MaxAge >= 0 {
+				t.Fatalf("expected cleared auth cookie MaxAge < 0, got %d", cookie.MaxAge)
+			}
+			return
+		}
+	}
+
+	t.Fatal("expected logout to clear multica_auth cookie")
+}
+
 func TestResolveActor(t *testing.T) {
 	ctx := context.Background()
 

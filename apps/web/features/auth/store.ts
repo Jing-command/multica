@@ -13,7 +13,7 @@ interface AuthState {
   sendCode: (email: string) => Promise<void>;
   verifyCode: (email: string, code: string) => Promise<User>;
   loginWithGoogle: (code: string, redirectUri: string) => Promise<User>;
-  logout: () => void;
+  logout: () => Promise<void>;
   setUser: (user: User) => void;
 }
 
@@ -63,12 +63,16 @@ export const useAuthStore = create<AuthState>((set) => ({
     return user;
   },
 
-  logout: () => {
-    localStorage.removeItem("multica_token");
-    api.setToken(null);
-    api.setWorkspaceId(null);
-    clearLoggedInCookie();
-    set({ user: null });
+  logout: async () => {
+    try {
+      await api.logout();
+    } finally {
+      localStorage.removeItem("multica_token");
+      api.setToken(null);
+      api.setWorkspaceId(null);
+      clearLoggedInCookie();
+      set({ user: null });
+    }
   },
 
   setUser: (user: User) => {

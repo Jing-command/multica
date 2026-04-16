@@ -532,6 +532,15 @@ func (h *Handler) VerifyCode(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, LoginResponse{Token: tokenString, User: userToResponse(user)})
 }
 
+func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
+	if _, ok := requireUserID(w, r); !ok {
+		return
+	}
+
+	middleware.ClearAuthCookie(w)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (h *Handler) GetMe(w http.ResponseWriter, r *http.Request) {
 	userID, ok := requireUserID(w, r)
 	if !ok {
