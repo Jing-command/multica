@@ -7,6 +7,10 @@ RETURNING *;
 SELECT * FROM runtime_ping
 WHERE id = $1;
 
+-- name: GetRuntimePingForRuntime :one
+SELECT * FROM runtime_ping
+WHERE id = $1 AND runtime_id = $2;
+
 -- name: PopPendingRuntimePing :many
 WITH next_ping AS (
     SELECT id
@@ -27,10 +31,22 @@ SET status = 'completed', output = $2, duration_ms = $3, updated_at = now()
 WHERE id = $1
 RETURNING *;
 
+-- name: SetRuntimePingCompletedForRuntime :one
+UPDATE runtime_ping
+SET status = 'completed', output = $3, duration_ms = $4, updated_at = now()
+WHERE id = $1 AND runtime_id = $2
+RETURNING *;
+
 -- name: SetRuntimePingFailed :one
 UPDATE runtime_ping
 SET status = 'failed', error = $2, duration_ms = $3, updated_at = now()
 WHERE id = $1
+RETURNING *;
+
+-- name: SetRuntimePingFailedForRuntime :one
+UPDATE runtime_ping
+SET status = 'failed', error = $3, duration_ms = $4, updated_at = now()
+WHERE id = $1 AND runtime_id = $2
 RETURNING *;
 
 -- name: SetRuntimePingTimeout :one
@@ -47,6 +63,10 @@ RETURNING *;
 -- name: GetRuntimeUpdate :one
 SELECT * FROM runtime_update
 WHERE id = $1;
+
+-- name: GetRuntimeUpdateForRuntime :one
+SELECT * FROM runtime_update
+WHERE id = $1 AND runtime_id = $2;
 
 -- name: PopPendingRuntimeUpdate :many
 WITH next_update AS (
@@ -68,10 +88,22 @@ SET status = 'completed', output = $2, updated_at = now()
 WHERE id = $1
 RETURNING *;
 
+-- name: SetRuntimeUpdateCompletedForRuntime :one
+UPDATE runtime_update
+SET status = 'completed', output = $3, updated_at = now()
+WHERE id = $1 AND runtime_id = $2
+RETURNING *;
+
 -- name: SetRuntimeUpdateFailed :one
 UPDATE runtime_update
 SET status = 'failed', error = $2, updated_at = now()
 WHERE id = $1
+RETURNING *;
+
+-- name: SetRuntimeUpdateFailedForRuntime :one
+UPDATE runtime_update
+SET status = 'failed', error = $3, updated_at = now()
+WHERE id = $1 AND runtime_id = $2
 RETURNING *;
 
 -- name: SetRuntimeUpdateTimeout :one

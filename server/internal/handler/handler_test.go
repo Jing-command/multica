@@ -249,6 +249,100 @@ func withURLParam(req *http.Request, key, value string) *http.Request {
 	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
 }
 
+func createHandlerTestRuntime(t *testing.T, workspaceID, daemonID, name string) string {
+	t.Helper()
+
+	var runtimeID string
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO agent_runtime (
+			workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at
+		)
+		VALUES ($1, $2, $3, 'cloud', $4, 'online', $5, '{}'::jsonb, now())
+		RETURNING id
+	`, workspaceID, daemonID, name, name+"-provider", name).Scan(&runtimeID); err != nil {
+		t.Fatalf("create handler test runtime: %v", err)
+	}
+	return runtimeID
+}
+
+func createHandlerTestWorkspaceMember(t *testing.T) (workspaceID string, cleanup func()) {
+	t.Helper()
+
+	slug := fmt.Sprintf("handler-tests-extra-%d", time.Now().UnixNano())
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO workspace (name, slug, description, issue_prefix)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id
+	`, "Handler Tests Extra", slug, "Temporary workspace for handler tests", "HEX").Scan(&workspaceID); err != nil {
+		t.Fatalf("create extra workspace: %v", err)
+	}
+	if _, err := testPool.Exec(context.Background(), `
+		INSERT INTO member (workspace_id, user_id, role)
+		VALUES ($1, $2, 'owner')
+	`, workspaceID, testUserID); err != nil {
+		t.Fatalf("create extra workspace member: %v", err)
+	}
+
+	cleanup = func() {
+		if _, err := testPool.Exec(context.Background(), `DELETE FROM workspace WHERE id = $1`, workspaceID); err != nil {
+			t.Fatalf("cleanup extra workspace: %v", err)
+		}
+	}
+	return workspaceID, cleanup
+}
+
+func ensureRuntimeRequestTables(t *testing.T) {
+	t.Helper()
+
+	if _, err := testPool.Exec(context.Background(), `
+		CREATE TABLE IF NOT EXISTS runtime_ping (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			runtime_id UUID NOT NULL REFERENCES agent_runtime(id) ON DELETE CASCADE,
+			status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed', 'timeout')),
+			output TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT '',
+			duration_ms BIGINT,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`); err != nil {
+		t.Fatalf("ensure runtime_ping table: %v", err)
+	}
+	if _, err := testPool.Exec(context.Background(), `
+		CREATE INDEX IF NOT EXISTS idx_runtime_ping_runtime_status_created_at
+			ON runtime_ping(runtime_id, status, created_at)
+	`); err != nil {
+		t.Fatalf("ensure runtime_ping index: %v", err)
+	}
+	if _, err := testPool.Exec(context.Background(), `
+		CREATE TABLE IF NOT EXISTS runtime_update (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			runtime_id UUID NOT NULL REFERENCES agent_runtime(id) ON DELETE CASCADE,
+			status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed', 'timeout')),
+			target_version TEXT NOT NULL,
+			output TEXT NOT NULL DEFAULT '',
+			error TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`); err != nil {
+		t.Fatalf("ensure runtime_update table: %v", err)
+	}
+	if _, err := testPool.Exec(context.Background(), `
+		CREATE INDEX IF NOT EXISTS idx_runtime_update_runtime_status_created_at
+			ON runtime_update(runtime_id, status, created_at)
+	`); err != nil {
+		t.Fatalf("ensure runtime_update index: %v", err)
+	}
+	if _, err := testPool.Exec(context.Background(), `
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_update_runtime_active
+			ON runtime_update(runtime_id)
+			WHERE status IN ('pending', 'running')
+	`); err != nil {
+		t.Fatalf("ensure runtime_update active index: %v", err)
+	}
+}
+
 func TestIssueCRUD(t *testing.T) {
 	// Create
 	w := httptest.NewRecorder()
@@ -1492,7 +1586,8 @@ func TestPingPersistsAcrossHandlerRestart(t *testing.T) {
 
 	restartedAgain := newRestartedTestHandler()
 	getW := httptest.NewRecorder()
-	getReq := withURLParam(newRequest("GET", "/api/pings/"+created.ID, nil), "pingId", created.ID)
+	getReq := withURLParam(newRequest("GET", "/api/runtimes/"+runtimeID+"/ping/"+created.ID, nil), "runtimeId", runtimeID)
+	getReq = withURLParam(getReq, "pingId", created.ID)
 	restartedAgain.GetPing(getW, getReq)
 	if getW.Code != http.StatusOK {
 		t.Fatalf("GetPing after restart: expected 200, got %d: %s", getW.Code, getW.Body.String())
@@ -1579,7 +1674,8 @@ func TestUpdatePersistsAcrossHandlerRestart(t *testing.T) {
 
 	restartedAgain := newRestartedTestHandler()
 	getW := httptest.NewRecorder()
-	getReq := withURLParam(newRequest("GET", "/api/updates/"+created.ID, nil), "updateId", created.ID)
+	getReq := withURLParam(newRequest("GET", "/api/runtimes/"+runtimeID+"/update/"+created.ID, nil), "runtimeId", runtimeID)
+	getReq = withURLParam(getReq, "updateId", created.ID)
 	restartedAgain.GetUpdate(getW, getReq)
 	if getW.Code != http.StatusOK {
 		t.Fatalf("GetUpdate after restart: expected 200, got %d: %s", getW.Code, getW.Body.String())
@@ -1636,7 +1732,7 @@ func TestGetPingReturnsPersistedTerminalStateWhenTimeoutUpdateLosesRace(t *testi
 	resultCh := make(chan *PingRequest, 1)
 	errCh := make(chan error, 1)
 	go func() {
-		result, err := testHandler.getPingRequest(ctx, created.ID)
+		result, err := testHandler.getPingRequest(ctx, runtimeID, created.ID)
 		if err != nil {
 			errCh <- err
 			return
@@ -1713,7 +1809,7 @@ func TestGetUpdateReturnsPersistedTerminalStateWhenTimeoutUpdateLosesRace(t *tes
 	resultCh := make(chan *UpdateRequest, 1)
 	errCh := make(chan error, 1)
 	go func() {
-		result, err := testHandler.getUpdateRequest(ctx, created.ID)
+		result, err := testHandler.getUpdateRequest(ctx, runtimeID, created.ID)
 		if err != nil {
 			errCh <- err
 			return
@@ -1781,7 +1877,7 @@ func TestGetPingTimesOutAfterHeartbeatClaimsIt(t *testing.T) {
 		t.Fatalf("age claimed ping request: %v", err)
 	}
 
-	got, err := testHandler.getPingRequest(ctx, created.ID)
+	got, err := testHandler.getPingRequest(ctx, runtimeID, created.ID)
 	if err != nil {
 		t.Fatalf("getPingRequest returned error: %v", err)
 	}
@@ -1790,5 +1886,126 @@ func TestGetPingTimesOutAfterHeartbeatClaimsIt(t *testing.T) {
 	}
 	if got.Error != "daemon did not respond within 60 seconds" {
 		t.Fatalf("ping error = %q, want timeout error", got.Error)
+	}
+}
+
+func TestGetPingRejectsPingFromAnotherWorkspaceRuntime(t *testing.T) {
+	ensureRuntimeRequestTables(t)
+	otherWorkspaceID, cleanup := createHandlerTestWorkspaceMember(t)
+	defer cleanup()
+	otherRuntimeID := createHandlerTestRuntime(t, otherWorkspaceID, "other-daemon", "Other Workspace Runtime")
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+otherRuntimeID+"/ping", nil), "runtimeId", otherRuntimeID)
+	createReq.Header.Set("X-Workspace-ID", otherWorkspaceID)
+	testHandler.InitiatePing(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiatePing in other workspace: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created PingRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created ping: %v", err)
+	}
+
+	getW := httptest.NewRecorder()
+	getReq := withURLParam(newRequest("GET", "/api/runtimes/"+mustGetHandlerTestRuntimeID(t)+"/ping/"+created.ID, nil), "runtimeId", mustGetHandlerTestRuntimeID(t))
+	getReq = withURLParam(getReq, "pingId", created.ID)
+	testHandler.GetPing(getW, getReq)
+	if getW.Code != http.StatusNotFound {
+		t.Fatalf("GetPing: expected 404 for foreign ping, got %d: %s", getW.Code, getW.Body.String())
+	}
+}
+
+func TestGetUpdateRejectsUpdateFromAnotherWorkspaceRuntime(t *testing.T) {
+	ensureRuntimeRequestTables(t)
+	otherWorkspaceID, cleanup := createHandlerTestWorkspaceMember(t)
+	defer cleanup()
+	otherRuntimeID := createHandlerTestRuntime(t, otherWorkspaceID, "other-daemon", "Other Workspace Update Runtime")
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+otherRuntimeID+"/update", map[string]any{
+		"target_version": "v2.0.0",
+	}), "runtimeId", otherRuntimeID)
+	createReq.Header.Set("X-Workspace-ID", otherWorkspaceID)
+	testHandler.InitiateUpdate(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiateUpdate in other workspace: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created UpdateRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created update: %v", err)
+	}
+
+	getW := httptest.NewRecorder()
+	getReq := withURLParam(newRequest("GET", "/api/runtimes/"+mustGetHandlerTestRuntimeID(t)+"/update/"+created.ID, nil), "runtimeId", mustGetHandlerTestRuntimeID(t))
+	getReq = withURLParam(getReq, "updateId", created.ID)
+	testHandler.GetUpdate(getW, getReq)
+	if getW.Code != http.StatusNotFound {
+		t.Fatalf("GetUpdate: expected 404 for foreign update, got %d: %s", getW.Code, getW.Body.String())
+	}
+}
+
+func TestReportPingResultRejectsPingBoundToAnotherRuntime(t *testing.T) {
+	ensureRuntimeRequestTables(t)
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+	otherRuntimeID := createHandlerTestRuntime(t, testWorkspaceID, handlerTestDaemonID, "Sibling Runtime For Ping")
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+otherRuntimeID+"/ping", nil), "runtimeId", otherRuntimeID)
+	testHandler.InitiatePing(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiatePing on sibling runtime: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created PingRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created ping: %v", err)
+	}
+
+	reportW := httptest.NewRecorder()
+	reportReq := withURLParam(newRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/ping/"+created.ID+"/result", map[string]any{
+		"status":      "completed",
+		"output":      "cross-runtime",
+		"duration_ms": 9,
+	}), "runtimeId", runtimeID)
+	reportReq = withURLParam(reportReq, "pingId", created.ID)
+	reportReq = withDaemonIdentity(reportReq, testWorkspaceID, handlerTestDaemonID)
+	testHandler.ReportPingResult(reportW, reportReq)
+	if reportW.Code != http.StatusNotFound {
+		t.Fatalf("ReportPingResult: expected 404 for ping bound to another runtime, got %d: %s", reportW.Code, reportW.Body.String())
+	}
+}
+
+func TestReportUpdateResultRejectsUpdateBoundToAnotherRuntime(t *testing.T) {
+	ensureRuntimeRequestTables(t)
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+	otherRuntimeID := createHandlerTestRuntime(t, testWorkspaceID, handlerTestDaemonID, "Sibling Runtime For Update")
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+otherRuntimeID+"/update", map[string]any{
+		"target_version": "v3.0.0",
+	}), "runtimeId", otherRuntimeID)
+	testHandler.InitiateUpdate(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiateUpdate on sibling runtime: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created UpdateRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created update: %v", err)
+	}
+
+	reportW := httptest.NewRecorder()
+	reportReq := withURLParam(newRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/update/"+created.ID+"/result", map[string]any{
+		"status": "completed",
+		"output": "cross-runtime",
+	}), "runtimeId", runtimeID)
+	reportReq = withURLParam(reportReq, "updateId", created.ID)
+	reportReq = withDaemonIdentity(reportReq, testWorkspaceID, handlerTestDaemonID)
+	testHandler.ReportUpdateResult(reportW, reportReq)
+	if reportW.Code != http.StatusNotFound {
+		t.Fatalf("ReportUpdateResult: expected 404 for update bound to another runtime, got %d: %s", reportW.Code, reportW.Body.String())
 	}
 }

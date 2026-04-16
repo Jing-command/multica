@@ -81,6 +81,32 @@ func (q *Queries) GetRuntimePing(ctx context.Context, id pgtype.UUID) (RuntimePi
 	return i, err
 }
 
+const getRuntimePingForRuntime = `-- name: GetRuntimePingForRuntime :one
+SELECT id, runtime_id, status, output, error, duration_ms, created_at, updated_at FROM runtime_ping
+WHERE id = $1 AND runtime_id = $2
+`
+
+type GetRuntimePingForRuntimeParams struct {
+	ID        pgtype.UUID `json:"id"`
+	RuntimeID pgtype.UUID `json:"runtime_id"`
+}
+
+func (q *Queries) GetRuntimePingForRuntime(ctx context.Context, arg GetRuntimePingForRuntimeParams) (RuntimePing, error) {
+	row := q.db.QueryRow(ctx, getRuntimePingForRuntime, arg.ID, arg.RuntimeID)
+	var i RuntimePing
+	err := row.Scan(
+		&i.ID,
+		&i.RuntimeID,
+		&i.Status,
+		&i.Output,
+		&i.Error,
+		&i.DurationMs,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getRuntimeUpdate = `-- name: GetRuntimeUpdate :one
 SELECT id, runtime_id, status, target_version, output, error, created_at, updated_at FROM runtime_update
 WHERE id = $1
@@ -88,6 +114,32 @@ WHERE id = $1
 
 func (q *Queries) GetRuntimeUpdate(ctx context.Context, id pgtype.UUID) (RuntimeUpdate, error) {
 	row := q.db.QueryRow(ctx, getRuntimeUpdate, id)
+	var i RuntimeUpdate
+	err := row.Scan(
+		&i.ID,
+		&i.RuntimeID,
+		&i.Status,
+		&i.TargetVersion,
+		&i.Output,
+		&i.Error,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getRuntimeUpdateForRuntime = `-- name: GetRuntimeUpdateForRuntime :one
+SELECT id, runtime_id, status, target_version, output, error, created_at, updated_at FROM runtime_update
+WHERE id = $1 AND runtime_id = $2
+`
+
+type GetRuntimeUpdateForRuntimeParams struct {
+	ID        pgtype.UUID `json:"id"`
+	RuntimeID pgtype.UUID `json:"runtime_id"`
+}
+
+func (q *Queries) GetRuntimeUpdateForRuntime(ctx context.Context, arg GetRuntimeUpdateForRuntimeParams) (RuntimeUpdate, error) {
+	row := q.db.QueryRow(ctx, getRuntimeUpdateForRuntime, arg.ID, arg.RuntimeID)
 	var i RuntimeUpdate
 	err := row.Scan(
 		&i.ID,
@@ -219,6 +271,36 @@ func (q *Queries) SetRuntimePingCompleted(ctx context.Context, arg SetRuntimePin
 	return i, err
 }
 
+const setRuntimePingCompletedForRuntime = `-- name: SetRuntimePingCompletedForRuntime :one
+UPDATE runtime_ping
+SET status = 'completed', output = $3, duration_ms = $4, updated_at = now()
+WHERE id = $1 AND runtime_id = $2
+RETURNING id, runtime_id, status, output, error, duration_ms, created_at, updated_at
+`
+
+type SetRuntimePingCompletedForRuntimeParams struct {
+	ID         pgtype.UUID `json:"id"`
+	RuntimeID  pgtype.UUID `json:"runtime_id"`
+	Output     string      `json:"output"`
+	DurationMs pgtype.Int8 `json:"duration_ms"`
+}
+
+func (q *Queries) SetRuntimePingCompletedForRuntime(ctx context.Context, arg SetRuntimePingCompletedForRuntimeParams) (RuntimePing, error) {
+	row := q.db.QueryRow(ctx, setRuntimePingCompletedForRuntime, arg.ID, arg.RuntimeID, arg.Output, arg.DurationMs)
+	var i RuntimePing
+	err := row.Scan(
+		&i.ID,
+		&i.RuntimeID,
+		&i.Status,
+		&i.Output,
+		&i.Error,
+		&i.DurationMs,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const setRuntimePingFailed = `-- name: SetRuntimePingFailed :one
 UPDATE runtime_ping
 SET status = 'failed', error = $2, duration_ms = $3, updated_at = now()
@@ -234,6 +316,36 @@ type SetRuntimePingFailedParams struct {
 
 func (q *Queries) SetRuntimePingFailed(ctx context.Context, arg SetRuntimePingFailedParams) (RuntimePing, error) {
 	row := q.db.QueryRow(ctx, setRuntimePingFailed, arg.ID, arg.Error, arg.DurationMs)
+	var i RuntimePing
+	err := row.Scan(
+		&i.ID,
+		&i.RuntimeID,
+		&i.Status,
+		&i.Output,
+		&i.Error,
+		&i.DurationMs,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const setRuntimePingFailedForRuntime = `-- name: SetRuntimePingFailedForRuntime :one
+UPDATE runtime_ping
+SET status = 'failed', error = $3, duration_ms = $4, updated_at = now()
+WHERE id = $1 AND runtime_id = $2
+RETURNING id, runtime_id, status, output, error, duration_ms, created_at, updated_at
+`
+
+type SetRuntimePingFailedForRuntimeParams struct {
+	ID         pgtype.UUID `json:"id"`
+	RuntimeID  pgtype.UUID `json:"runtime_id"`
+	Error      string      `json:"error"`
+	DurationMs pgtype.Int8 `json:"duration_ms"`
+}
+
+func (q *Queries) SetRuntimePingFailedForRuntime(ctx context.Context, arg SetRuntimePingFailedForRuntimeParams) (RuntimePing, error) {
+	row := q.db.QueryRow(ctx, setRuntimePingFailedForRuntime, arg.ID, arg.RuntimeID, arg.Error, arg.DurationMs)
 	var i RuntimePing
 	err := row.Scan(
 		&i.ID,
@@ -299,6 +411,35 @@ func (q *Queries) SetRuntimeUpdateCompleted(ctx context.Context, arg SetRuntimeU
 	return i, err
 }
 
+const setRuntimeUpdateCompletedForRuntime = `-- name: SetRuntimeUpdateCompletedForRuntime :one
+UPDATE runtime_update
+SET status = 'completed', output = $3, updated_at = now()
+WHERE id = $1 AND runtime_id = $2
+RETURNING id, runtime_id, status, target_version, output, error, created_at, updated_at
+`
+
+type SetRuntimeUpdateCompletedForRuntimeParams struct {
+	ID        pgtype.UUID `json:"id"`
+	RuntimeID pgtype.UUID `json:"runtime_id"`
+	Output    string      `json:"output"`
+}
+
+func (q *Queries) SetRuntimeUpdateCompletedForRuntime(ctx context.Context, arg SetRuntimeUpdateCompletedForRuntimeParams) (RuntimeUpdate, error) {
+	row := q.db.QueryRow(ctx, setRuntimeUpdateCompletedForRuntime, arg.ID, arg.RuntimeID, arg.Output)
+	var i RuntimeUpdate
+	err := row.Scan(
+		&i.ID,
+		&i.RuntimeID,
+		&i.Status,
+		&i.TargetVersion,
+		&i.Output,
+		&i.Error,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const setRuntimeUpdateFailed = `-- name: SetRuntimeUpdateFailed :one
 UPDATE runtime_update
 SET status = 'failed', error = $2, updated_at = now()
@@ -313,6 +454,35 @@ type SetRuntimeUpdateFailedParams struct {
 
 func (q *Queries) SetRuntimeUpdateFailed(ctx context.Context, arg SetRuntimeUpdateFailedParams) (RuntimeUpdate, error) {
 	row := q.db.QueryRow(ctx, setRuntimeUpdateFailed, arg.ID, arg.Error)
+	var i RuntimeUpdate
+	err := row.Scan(
+		&i.ID,
+		&i.RuntimeID,
+		&i.Status,
+		&i.TargetVersion,
+		&i.Output,
+		&i.Error,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const setRuntimeUpdateFailedForRuntime = `-- name: SetRuntimeUpdateFailedForRuntime :one
+UPDATE runtime_update
+SET status = 'failed', error = $3, updated_at = now()
+WHERE id = $1 AND runtime_id = $2
+RETURNING id, runtime_id, status, target_version, output, error, created_at, updated_at
+`
+
+type SetRuntimeUpdateFailedForRuntimeParams struct {
+	ID        pgtype.UUID `json:"id"`
+	RuntimeID pgtype.UUID `json:"runtime_id"`
+	Error     string      `json:"error"`
+}
+
+func (q *Queries) SetRuntimeUpdateFailedForRuntime(ctx context.Context, arg SetRuntimeUpdateFailedForRuntimeParams) (RuntimeUpdate, error) {
+	row := q.db.QueryRow(ctx, setRuntimeUpdateFailedForRuntime, arg.ID, arg.RuntimeID, arg.Error)
 	var i RuntimeUpdate
 	err := row.Scan(
 		&i.ID,
