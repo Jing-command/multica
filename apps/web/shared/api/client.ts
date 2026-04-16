@@ -152,8 +152,22 @@ export class ApiClient {
     });
   }
 
+  async logout(): Promise<void> {
+    await this.fetch("/auth/logout", {
+      method: "POST",
+    });
+  }
+
   async getMe(): Promise<User> {
     return this.fetch("/api/me");
+  }
+
+  async getSessionToken(): Promise<{ token: string }> {
+    return this.fetch("/api/me/session-token");
+  }
+
+  async logout(): Promise<void> {
+    await this.fetch("/auth/logout", { method: "POST" });
   }
 
   async updateMe(data: UpdateMeRequest): Promise<User> {

@@ -68,18 +68,12 @@ function LoginPageContent() {
   const [cooldown, setCooldown] = useState(0);
   const [existingUser, setExistingUser] = useState<User | null>(null);
 
-  // Check for existing session when CLI callback is present.
+  // Check for existing browser session when CLI callback is present.
   useEffect(() => {
     const cliCallback = searchParams.get("cli_callback");
     if (!cliCallback) return;
-
-    const token = localStorage.getItem("multica_token");
-    if (!token) return;
-
     if (!validateCliCallback(cliCallback)) return;
 
-    // Verify the existing token is still valid.
-    api.setToken(token);
     api
       .getMe()
       .then((user) => {
@@ -87,9 +81,7 @@ function LoginPageContent() {
         setStep("cli_confirm");
       })
       .catch(() => {
-        // Token expired/invalid — clear and fall through to normal login.
         api.setToken(null);
-        localStorage.removeItem("multica_token");
       });
   }, [searchParams]);
 
@@ -101,11 +93,18 @@ function LoginPageContent() {
 
   const handleCliAuthorize = async () => {
     const cliCallback = searchParams.get("cli_callback");
-    const token = localStorage.getItem("multica_token");
-    if (!cliCallback || !token) return;
+    if (!cliCallback) return;
     const cliState = searchParams.get("cli_state") || "";
     setSubmitting(true);
-    redirectToCliCallback(cliCallback, token, cliState);
+    try {
+      const { token } = await api.getSessionToken();
+      redirectToCliCallback(cliCallback, token, cliState);
+    } catch {
+      setSubmitting(false);
+      setExistingUser(null);
+      setStep("email");
+      setError("Session expired. Please sign in again.");
+    }
   };
 
   const handleSendCode = async (e?: React.FormEvent) => {
@@ -146,9 +145,6 @@ function LoginPageContent() {
             return;
           }
           const { token } = await api.verifyCode(email, value);
-          // Persist session in the browser so the web app stays logged in
-          localStorage.setItem("multica_token", token);
-          api.setToken(token);
           setLoggedInCookie();
           const cliState = searchParams.get("cli_state") || "";
           redirectToCliCallback(cliCallback, token, cliState);

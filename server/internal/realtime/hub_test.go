@@ -2,6 +2,7 @@ package realtime
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -37,6 +38,7 @@ func makeTestToken(t *testing.T) string {
 
 func newTestHub(t *testing.T) (*Hub, *httptest.Server) {
 	t.Helper()
+	t.Setenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000")
 	hub := NewHub()
 	go hub.Run()
 
@@ -52,8 +54,11 @@ func newTestHub(t *testing.T) (*Hub, *httptest.Server) {
 func connectWS(t *testing.T, server *httptest.Server) *websocket.Conn {
 	t.Helper()
 	token := makeTestToken(t)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws?token=" + token + "&workspace_id=" + testWorkspaceID
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws?workspace_id=" + testWorkspaceID
+	headers := http.Header{}
+	headers.Set("Cookie", fmt.Sprintf("multica_auth=%s", token))
+	headers.Set("Origin", "http://localhost:3000")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, headers)
 	if err != nil {
 		t.Fatalf("failed to connect WebSocket: %v", err)
 	}
@@ -202,5 +207,37 @@ func TestHub_MultipleBroadcasts(t *testing.T) {
 		if string(received) != expected {
 			t.Fatalf("message %d: expected %s, got %s", i, expected, received)
 		}
+	}
+}
+
+func TestHandleWebSocket_RejectsMissingCookieToken(t *testing.T) {
+	t.Setenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000")
+	hub := NewHub()
+	mc := &mockMembershipChecker{}
+	req := httptest.NewRequest(http.MethodGet, "/ws?workspace_id="+testWorkspaceID, nil)
+	req.Header.Set("Origin", "http://localhost:3000")
+	w := httptest.NewRecorder()
+
+	HandleWebSocket(hub, mc, w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestHandleWebSocket_RejectsDisallowedOrigin(t *testing.T) {
+	t.Setenv("CORS_ALLOWED_ORIGINS", "http://allowed.example")
+	hub := NewHub()
+	mc := &mockMembershipChecker{}
+	token := makeTestToken(t)
+	req := httptest.NewRequest(http.MethodGet, "/ws?workspace_id="+testWorkspaceID, nil)
+	req.AddCookie(&http.Cookie{Name: "multica_auth", Value: token})
+	req.Header.Set("Origin", "http://blocked.example")
+	w := httptest.NewRecorder()
+
+	HandleWebSocket(hub, mc, w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", w.Code)
 	}
 }

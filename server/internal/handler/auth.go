@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/logger"
+	"github.com/multica-ai/multica/server/internal/middleware"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -519,14 +520,30 @@ func (h *Handler) VerifyCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	expiresAt := time.Now().Add(30 * 24 * time.Hour)
+	middleware.SetAuthCookie(w, tokenString, expiresAt)
 	if h.CFSigner != nil {
-		for _, cookie := range h.CFSigner.SignedCookies(time.Now().Add(30 * 24 * time.Hour)) {
+		for _, cookie := range h.CFSigner.SignedCookies(expiresAt) {
 			http.SetCookie(w, cookie)
 		}
 	}
 
 	slog.Info("user logged in", append(logger.RequestAttrs(r), "user_id", uuidToString(user.ID), "email", user.Email)...)
 	writeJSON(w, http.StatusOK, LoginResponse{Token: tokenString, User: userToResponse(user)})
+}
+
+func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
+	if _, ok := requireUserID(w, r); !ok {
+		return
+	}
+
+	middleware.ClearAuthCookie(w)
+	if h.CFSigner != nil {
+		for _, cookie := range h.CFSigner.ClearCookies() {
+			http.SetCookie(w, cookie)
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) GetMe(w http.ResponseWriter, r *http.Request) {
@@ -542,6 +559,16 @@ func (h *Handler) GetMe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, userToResponse(user))
+}
+
+func (h *Handler) GetSessionToken(w http.ResponseWriter, r *http.Request) {
+	token := middleware.JWTFromRequest(r)
+	if strings.TrimSpace(token) == "" {
+		writeError(w, http.StatusUnauthorized, "missing authorization header")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"token": token})
 }
 
 type UpdateMeRequest struct {
@@ -692,8 +719,10 @@ func (h *Handler) GoogleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	expiresAt := time.Now().Add(30 * 24 * time.Hour)
+	middleware.SetAuthCookie(w, tokenString, expiresAt)
 	if h.CFSigner != nil {
-		for _, cookie := range h.CFSigner.SignedCookies(time.Now().Add(72 * time.Hour)) {
+		for _, cookie := range h.CFSigner.SignedCookies(expiresAt) {
 			http.SetCookie(w, cookie)
 		}
 	}

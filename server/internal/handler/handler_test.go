@@ -3,6 +3,8 @@ package handler
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/realtime"
@@ -1093,6 +1096,10 @@ func setPrivateField(target any, fieldName string, value any) {
 	reflect.NewAt(v.Type(), unsafe.Pointer(v.UnsafeAddr())).Elem().Set(reflect.ValueOf(value))
 }
 
+func authTestPrivateKey() (*rsa.PrivateKey, error) {
+	return rsa.GenerateKey(rand.Reader, 2048)
+}
+
 func TestVerifyCodeRejectsMagicCodeWithoutExplicitOptIn(t *testing.T) {
 	const email = "magic-code-disabled@multica.ai"
 	const ip = "203.0.113.48"
@@ -1214,6 +1221,80 @@ func TestVerifyCodeCreatesWorkspace(t *testing.T) {
 	}
 	if !strings.Contains(workspaces[0].Name, "Workspace") {
 		t.Fatalf("expected auto-created workspace name, got %q", workspaces[0].Name)
+	}
+}
+
+func TestLogoutClearsAuthCookie(t *testing.T) {
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/auth/logout", nil)
+	req.Header.Set("X-User-ID", testUserID)
+
+	testHandler.Logout(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("Logout: expected 204, got %d: %s", w.Code, w.Body.String())
+	}
+
+	cookies := w.Result().Cookies()
+	for _, cookie := range cookies {
+		if cookie.Name == "multica_auth" {
+			if cookie.Value != "" {
+				t.Fatalf("expected auth cookie to be cleared, got %q", cookie.Value)
+			}
+			if cookie.MaxAge >= 0 {
+				t.Fatalf("expected cleared auth cookie MaxAge < 0, got %d", cookie.MaxAge)
+			}
+			return
+		}
+	}
+
+	t.Fatal("expected logout to clear multica_auth cookie")
+}
+
+func TestVerifyCodeClearsCloudFrontCookiesOnLogout(t *testing.T) {
+	privateKey, err := authTestPrivateKey()
+	if err != nil {
+		t.Fatalf("authTestPrivateKey: %v", err)
+	}
+
+	signer := &auth.CloudFrontSigner{}
+	setPrivateField(signer, "keyPairID", "K123456789")
+	setPrivateField(signer, "privateKey", privateKey)
+	setPrivateField(signer, "domain", "static.multica.test")
+	setPrivateField(signer, "cookieDomain", ".multica.test")
+
+	h := *testHandler
+	h.CFSigner = signer
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/auth/logout", nil)
+	req.Header.Set("X-User-ID", testUserID)
+
+	h.Logout(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("Logout with CloudFront signer: expected 204, got %d: %s", w.Code, w.Body.String())
+	}
+
+	resp := w.Result()
+	cookies := resp.Cookies()
+	cookieByName := make(map[string]*http.Cookie, len(cookies))
+	for _, cookie := range cookies {
+		cookieByName[cookie.Name] = cookie
+	}
+
+	for _, name := range []string{"CloudFront-Policy", "CloudFront-Signature", "CloudFront-Key-Pair-Id"} {
+		cookie := cookieByName[name]
+		if cookie == nil {
+			t.Fatalf("expected %s cookie to be cleared", name)
+		}
+		if cookie.Value != "" {
+			t.Fatalf("expected %s cookie value to be cleared, got %q", name, cookie.Value)
+		}
+		if cookie.MaxAge != -1 {
+			t.Fatalf("expected %s MaxAge=-1, got %d", name, cookie.MaxAge)
+		}
+		if !cookie.Expires.Equal(time.Unix(0, 0)) {
+			t.Fatalf("expected %s expiry to be unix epoch, got %v", name, cookie.Expires)
+		}
 	}
 }
 

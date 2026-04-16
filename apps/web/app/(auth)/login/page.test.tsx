@@ -2,26 +2,51 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
-// Mock next/navigation
-vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: vi.fn() }),
-  usePathname: () => "/login",
-  useSearchParams: () => new URLSearchParams(),
+const {
+  mockPush,
+  mockReplace,
+  mockSearchParams,
+  mockSendCode,
+  mockVerifyCode,
+  mockSetLoggedInCookie,
+  mockHydrateWorkspace,
+  mockListWorkspaces,
+  mockApiVerifyCode,
+  mockSetToken,
+  mockGetMe,
+  mockGetSessionToken,
+} = vi.hoisted(() => ({
+  mockPush: vi.fn(),
+  mockReplace: vi.fn(),
+  mockSearchParams: new URLSearchParams(),
+  mockSendCode: vi.fn(),
+  mockVerifyCode: vi.fn(),
+  mockSetLoggedInCookie: vi.fn(),
+  mockHydrateWorkspace: vi.fn(),
+  mockListWorkspaces: vi.fn().mockResolvedValue([]),
+  mockApiVerifyCode: vi.fn(),
+  mockSetToken: vi.fn(),
+  mockGetMe: vi.fn(),
+  mockGetSessionToken: vi.fn(),
 }));
 
-// Mock auth store
-const mockSendCode = vi.fn();
-const mockVerifyCode = vi.fn();
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ push: mockPush, replace: mockReplace }),
+  usePathname: () => "/login",
+  useSearchParams: () => mockSearchParams,
+}));
+
 vi.mock("@/features/auth", () => ({
   useAuthStore: (selector: (s: any) => any) =>
     selector({
+      user: null,
+      isLoading: false,
       sendCode: mockSendCode,
       verifyCode: mockVerifyCode,
     }),
+  setLoggedInCookie: mockSetLoggedInCookie,
 }));
 
-// Mock workspace store
-const mockHydrateWorkspace = vi.fn();
 vi.mock("@/features/workspace", () => ({
   useWorkspaceStore: (selector: (s: any) => any) =>
     selector({
@@ -29,13 +54,13 @@ vi.mock("@/features/workspace", () => ({
     }),
 }));
 
-// Mock api
 vi.mock("@/shared/api", () => ({
   api: {
-    listWorkspaces: vi.fn().mockResolvedValue([]),
-    verifyCode: vi.fn(),
-    setToken: vi.fn(),
-    getMe: vi.fn(),
+    listWorkspaces: mockListWorkspaces,
+    verifyCode: mockApiVerifyCode,
+    setToken: mockSetToken,
+    getMe: mockGetMe,
+    getSessionToken: mockGetSessionToken,
   },
 }));
 
@@ -44,6 +69,18 @@ import LoginPage from "./page";
 describe("LoginPage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockSearchParams.forEach((_, key) => {
+      mockSearchParams.delete(key);
+    });
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: {
+        href: "http://localhost/login",
+        assign: vi.fn((href: string) => {
+          window.location.href = href;
+        }),
+      },
+    });
   });
 
   it("renders login form with email input and continue button", () => {
@@ -52,9 +89,7 @@ describe("LoginPage", () => {
     expect(screen.getByText("Multica")).toBeInTheDocument();
     expect(screen.getByText("Turn coding agents into real teammates")).toBeInTheDocument();
     expect(screen.getByLabelText("Email")).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "Continue" })
-    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continue" })).toBeInTheDocument();
   });
 
   it("does not call sendCode when email is empty", async () => {
@@ -115,5 +150,25 @@ describe("LoginPage", () => {
     await waitFor(() => {
       expect(screen.getByText("Network error")).toBeInTheDocument();
     });
+  });
+
+  it("authorizes CLI from an existing cookie-backed session", async () => {
+    mockSearchParams.set("cli_callback", "http://localhost:8765/callback");
+    mockSearchParams.set("cli_state", "state-123");
+    mockGetMe.mockResolvedValueOnce({ id: "user-1", email: "user@example.com" });
+    mockGetSessionToken.mockResolvedValueOnce({ token: "session-jwt" });
+    const user = userEvent.setup();
+
+    render(<LoginPage />);
+
+    await screen.findByText("Authorize CLI");
+    await user.click(screen.getByRole("button", { name: "Authorize" }));
+
+    await waitFor(() => {
+      expect(mockGetSessionToken).toHaveBeenCalledTimes(1);
+    });
+    expect(window.location.href).toBe(
+      "http://localhost:8765/callback?token=session-jwt&state=state-123",
+    );
   });
 });

@@ -41,4 +41,18 @@ test.describe("Authentication", () => {
     await page.waitForURL("**/", { timeout: 10000 });
     await expect(page).toHaveURL(/\/$/);
   });
+
+  test("logout remains logged out after reload", async ({ page }) => {
+    await loginAsDefault(page);
+
+    await openWorkspaceMenu(page);
+    await page.getByText("Log out").click();
+
+    await page.waitForURL("**/", { timeout: 10000 });
+    await expect(page).toHaveURL(/\/$/);
+
+    await page.goto("/issues");
+    await page.waitForURL("**/", { timeout: 10000 });
+    await expect(page).toHaveURL(/\/$/);
+  });
 });

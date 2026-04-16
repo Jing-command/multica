@@ -5,27 +5,27 @@ import { useAuthStore } from "./store";
 import { useWorkspaceStore } from "@/features/workspace";
 import { api } from "@/shared/api";
 import { createLogger } from "@/shared/logger";
-import { setLoggedInCookie, clearLoggedInCookie } from "./auth-cookie";
+import { hasLoggedInCookie, setLoggedInCookie, clearLoggedInCookie } from "./auth-cookie";
 
 const logger = createLogger("auth");
 
 /**
- * Initializes auth + workspace state from localStorage on mount.
- * Fires getMe() and listWorkspaces() in parallel when a cached token exists.
+ * Initializes browser auth state from the session cookie on mount.
+ * Fires getMe() and listWorkspaces() in parallel when a logged-in cookie exists.
  */
 export function AuthInitializer({ children }: { children: ReactNode }) {
   useEffect(() => {
-    const token = localStorage.getItem("multica_token");
-    if (!token) {
+    if (!hasLoggedInCookie()) {
+      api.setToken(null);
+      api.setWorkspaceId(null);
       clearLoggedInCookie();
       useAuthStore.setState({ isLoading: false });
       return;
     }
 
-    api.setToken(token);
     const wsId = localStorage.getItem("multica_workspace_id");
 
-    // Fire getMe and listWorkspaces in parallel
+    // Fire getMe and listWorkspaces in parallel using the cookie-backed session.
     const mePromise = api.getMe();
     const wsPromise = api.listWorkspaces();
 

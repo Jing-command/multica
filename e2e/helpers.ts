@@ -60,17 +60,34 @@ async function getDefaultApi(): Promise<TestApiClient> {
 
 /**
  * Log in as the default E2E user and ensure the workspace exists first.
- * Authenticates via API (send-code → DB read → verify-code), then injects
- * the token into localStorage so the browser session is authenticated.
+ * Authenticates via API and seeds the browser with the same session cookies.
  */
 export async function loginAsDefault(page: Page) {
   const api = await getDefaultApi();
-
   const token = api.getToken();
-  await page.goto("/login");
-  await page.evaluate((t) => {
-    localStorage.setItem("multica_token", t);
-  }, token);
+  if (!token) {
+    throw new Error("Default E2E login returned no token");
+  }
+
+  await page.context().addCookies([
+    {
+      name: "multica_auth",
+      value: token,
+      url: "http://localhost:3000",
+      httpOnly: true,
+      sameSite: "Lax",
+      secure: false,
+    },
+    {
+      name: "multica_logged_in",
+      value: "1",
+      url: "http://localhost:3000",
+      httpOnly: false,
+      sameSite: "Lax",
+      secure: false,
+    },
+  ]);
+
   await page.goto("/issues");
   await page.waitForURL("**/issues", { timeout: 10000 });
 }

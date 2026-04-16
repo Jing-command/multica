@@ -4,12 +4,12 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
-	"github.com/multica-ai/multica/server/internal/auth"
+	"github.com/multica-ai/multica/server/internal/middleware"
 )
 
 // MembershipChecker verifies a user belongs to a workspace.
@@ -17,11 +17,44 @@ type MembershipChecker interface {
 	IsMember(ctx context.Context, userID, workspaceID string) bool
 }
 
+func allowedOrigins() []string {
+	raw := strings.TrimSpace(os.Getenv("CORS_ALLOWED_ORIGINS"))
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv("FRONTEND_ORIGIN"))
+	}
+	if raw == "" {
+		return []string{"http://localhost:3000"}
+	}
+
+	parts := strings.Split(raw, ",")
+	origins := make([]string, 0, len(parts))
+	for _, part := range parts {
+		origin := strings.TrimSpace(part)
+		if origin != "" {
+			origins = append(origins, origin)
+		}
+	}
+	if len(origins) == 0 {
+		return []string{"http://localhost:3000"}
+	}
+	return origins
+}
+
+func originAllowed(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return false
+	}
+	for _, allowed := range allowedOrigins() {
+		if origin == allowed {
+			return true
+		}
+	}
+	return false
+}
+
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		// TODO: Restrict origins in production
-		return true
-	},
+	CheckOrigin: originAllowed,
 }
 
 // Client represents a single WebSocket connection with identity.
@@ -214,31 +247,27 @@ func (h *Hub) Broadcast(message []byte) {
 	h.broadcast <- message
 }
 
-// HandleWebSocket upgrades an HTTP connection to WebSocket with JWT auth.
+// HandleWebSocket upgrades an HTTP connection to WebSocket with cookie-backed JWT auth.
 func HandleWebSocket(hub *Hub, mc MembershipChecker, w http.ResponseWriter, r *http.Request) {
-	tokenStr := r.URL.Query().Get("token")
 	workspaceID := r.URL.Query().Get("workspace_id")
-
-	if tokenStr == "" || workspaceID == "" {
-		http.Error(w, `{"error":"token and workspace_id required"}`, http.StatusUnauthorized)
+	if workspaceID == "" {
+		http.Error(w, `{"error":"workspace_id required"}`, http.StatusUnauthorized)
+		return
+	}
+	if !originAllowed(r) {
+		http.Error(w, `{"error":"origin not allowed"}`, http.StatusForbidden)
 		return
 	}
 
-	// Validate JWT
-	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (any, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, jwt.ErrSignatureInvalid
-		}
-		return auth.JWTSecret(), nil
-	})
-	if err != nil || !token.Valid {
+	tokenStr := middleware.JWTFromRequest(r)
+	if tokenStr == "" {
+		http.Error(w, `{"error":"missing auth token"}`, http.StatusUnauthorized)
+		return
+	}
+
+	claims, err := middleware.ParseJWT(tokenStr)
+	if err != nil {
 		http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
-		return
-	}
-
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		http.Error(w, `{"error":"invalid claims"}`, http.StatusUnauthorized)
 		return
 	}
 
