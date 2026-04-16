@@ -1,19 +1,17 @@
 package handler
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
-
-// ---------------------------------------------------------------------------
-// In-memory ping store
-// ---------------------------------------------------------------------------
 
 // PingStatus represents the lifecycle of a runtime ping test.
 type PingStatus string
@@ -28,110 +26,14 @@ const (
 
 // PingRequest represents a pending or completed ping test.
 type PingRequest struct {
-	ID        string     `json:"id"`
-	RuntimeID string     `json:"runtime_id"`
-	Status    PingStatus `json:"status"`
-	Output    string     `json:"output,omitempty"`
-	Error     string     `json:"error,omitempty"`
-	DurationMs int64    `json:"duration_ms,omitempty"`
-	CreatedAt time.Time  `json:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
-}
-
-// PingStore is a thread-safe in-memory store for ping requests.
-// Pings expire after 2 minutes.
-type PingStore struct {
-	mu    sync.Mutex
-	pings map[string]*PingRequest // keyed by ping ID
-}
-
-func NewPingStore() *PingStore {
-	return &PingStore{
-		pings: make(map[string]*PingRequest),
-	}
-}
-
-func (s *PingStore) Create(runtimeID string) *PingRequest {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Clean up old pings for this runtime
-	for id, p := range s.pings {
-		if time.Since(p.CreatedAt) > 2*time.Minute {
-			delete(s.pings, id)
-		}
-	}
-
-	ping := &PingRequest{
-		ID:        randomID(),
-		RuntimeID: runtimeID,
-		Status:    PingPending,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-	s.pings[ping.ID] = ping
-	return ping
-}
-
-func (s *PingStore) Get(id string) *PingRequest {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	p, ok := s.pings[id]
-	if !ok {
-		return nil
-	}
-	// Check for timeout
-	if p.Status == PingPending && time.Since(p.CreatedAt) > 60*time.Second {
-		p.Status = PingTimeout
-		p.Error = "daemon did not respond within 60 seconds"
-		p.UpdatedAt = time.Now()
-	}
-	return p
-}
-
-// PopPending returns and removes the oldest pending ping for a runtime.
-func (s *PingStore) PopPending(runtimeID string) *PingRequest {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var oldest *PingRequest
-	for _, p := range s.pings {
-		if p.RuntimeID == runtimeID && p.Status == PingPending {
-			if oldest == nil || p.CreatedAt.Before(oldest.CreatedAt) {
-				oldest = p
-			}
-		}
-	}
-	if oldest != nil {
-		oldest.Status = PingRunning
-		oldest.UpdatedAt = time.Now()
-	}
-	return oldest
-}
-
-func (s *PingStore) Complete(id string, output string, durationMs int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if p, ok := s.pings[id]; ok {
-		p.Status = PingCompleted
-		p.Output = output
-		p.DurationMs = durationMs
-		p.UpdatedAt = time.Now()
-	}
-}
-
-func (s *PingStore) Fail(id string, errMsg string, durationMs int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if p, ok := s.pings[id]; ok {
-		p.Status = PingFailed
-		p.Error = errMsg
-		p.DurationMs = durationMs
-		p.UpdatedAt = time.Now()
-	}
+	ID         string     `json:"id"`
+	RuntimeID  string     `json:"runtime_id"`
+	Status     PingStatus `json:"status"`
+	Output     string     `json:"output,omitempty"`
+	Error      string     `json:"error,omitempty"`
+	DurationMs int64      `json:"duration_ms,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
 }
 
 func randomID() string {
@@ -140,9 +42,74 @@ func randomID() string {
 	return hex.EncodeToString(b)
 }
 
-// ---------------------------------------------------------------------------
-// Handlers
-// ---------------------------------------------------------------------------
+func runtimePingToRequest(p db.RuntimePing) PingRequest {
+	var durationMs int64
+	if p.DurationMs.Valid {
+		durationMs = p.DurationMs.Int64
+	}
+	return PingRequest{
+		ID:         uuidToString(p.ID),
+		RuntimeID:  uuidToString(p.RuntimeID),
+		Status:     PingStatus(p.Status),
+		Output:     p.Output,
+		Error:      p.Error,
+		DurationMs: durationMs,
+		CreatedAt:  p.CreatedAt.Time,
+		UpdatedAt:  p.UpdatedAt.Time,
+	}
+}
+
+func (h *Handler) getPingRequest(ctx context.Context, pingID string) (*PingRequest, error) {
+	ping, err := h.Queries.GetRuntimePing(ctx, parseUUID(pingID))
+	if err != nil {
+		return nil, err
+	}
+	if (ping.Status == string(PingPending) || ping.Status == string(PingRunning)) && ping.CreatedAt.Valid && time.Since(ping.CreatedAt.Time) > 60*time.Second {
+		timedOut, err := h.Queries.SetRuntimePingTimeout(ctx, ping.ID)
+		if err == nil {
+			ping = timedOut
+		} else if !isNotFound(err) {
+			return nil, err
+		} else {
+			ping, err = h.Queries.GetRuntimePing(ctx, ping.ID)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	result := runtimePingToRequest(ping)
+	return &result, nil
+}
+
+func (h *Handler) popPendingPingRequest(ctx context.Context, runtimeID string) (*PingRequest, error) {
+	items, err := h.Queries.PopPendingRuntimePing(ctx, parseUUID(runtimeID))
+	if err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return nil, nil
+	}
+	result := runtimePingToRequest(items[0])
+	return &result, nil
+}
+
+func (h *Handler) completePingRequest(ctx context.Context, pingID, output string, durationMs int64) error {
+	_, err := h.Queries.SetRuntimePingCompleted(ctx, db.SetRuntimePingCompletedParams{
+		ID:         parseUUID(pingID),
+		Output:     output,
+		DurationMs: pgtype.Int8{Int64: durationMs, Valid: true},
+	})
+	return err
+}
+
+func (h *Handler) failPingRequest(ctx context.Context, pingID, errMsg string, durationMs int64) error {
+	_, err := h.Queries.SetRuntimePingFailed(ctx, db.SetRuntimePingFailedParams{
+		ID:         parseUUID(pingID),
+		Error:      errMsg,
+		DurationMs: pgtype.Int8{Int64: durationMs, Valid: true},
+	})
+	return err
+}
 
 // InitiatePing creates a new ping request (protected route, called by frontend).
 func (h *Handler) InitiatePing(w http.ResponseWriter, r *http.Request) {
@@ -158,17 +125,26 @@ func (h *Handler) InitiatePing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ping := h.PingStore.Create(runtimeID)
-	writeJSON(w, http.StatusOK, ping)
+	ping, err := h.Queries.CreateRuntimePing(r.Context(), parseUUID(runtimeID))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create ping")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, runtimePingToRequest(ping))
 }
 
 // GetPing returns the status of a ping request (protected route, called by frontend).
 func (h *Handler) GetPing(w http.ResponseWriter, r *http.Request) {
 	pingID := chi.URLParam(r, "pingId")
 
-	ping := h.PingStore.Get(pingID)
-	if ping == nil {
-		writeError(w, http.StatusNotFound, "ping not found")
+	ping, err := h.getPingRequest(r.Context(), pingID)
+	if err != nil {
+		if isNotFound(err) {
+			writeError(w, http.StatusNotFound, "ping not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load ping")
 		return
 	}
 
@@ -180,7 +156,7 @@ func (h *Handler) ReportPingResult(w http.ResponseWriter, r *http.Request) {
 	pingID := chi.URLParam(r, "pingId")
 
 	var req struct {
-		Status     string `json:"status"` // "completed" or "failed"
+		Status     string `json:"status"`
 		Output     string `json:"output"`
 		Error      string `json:"error"`
 		DurationMs int64  `json:"duration_ms"`
@@ -190,10 +166,19 @@ func (h *Handler) ReportPingResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var err error
 	if req.Status == "completed" {
-		h.PingStore.Complete(pingID, req.Output, req.DurationMs)
+		err = h.completePingRequest(r.Context(), pingID, req.Output, req.DurationMs)
 	} else {
-		h.PingStore.Fail(pingID, req.Error, req.DurationMs)
+		err = h.failPingRequest(r.Context(), pingID, req.Error, req.DurationMs)
+	}
+	if err != nil {
+		if isNotFound(err) {
+			writeError(w, http.StatusNotFound, "ping not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to store ping result")
+		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

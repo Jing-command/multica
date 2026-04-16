@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -23,6 +24,27 @@ var testHandler *Handler
 var testPool *pgxpool.Pool
 var testUserID string
 var testWorkspaceID string
+
+func newRestartedTestHandler() *Handler {
+	hub := realtime.NewHub()
+	go hub.Run()
+	return New(db.New(testPool), testPool, hub, events.New(), service.NewEmailService(), nil, nil)
+}
+
+func mustGetHandlerTestRuntimeID(t *testing.T) string {
+	t.Helper()
+
+	var runtimeID string
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT id
+		FROM agent_runtime
+		WHERE workspace_id = $1 AND name = $2
+		LIMIT 1
+	`, testWorkspaceID, "Handler Test Runtime").Scan(&runtimeID); err != nil {
+		t.Fatalf("lookup handler test runtime id: %v", err)
+	}
+	return runtimeID
+}
 
 const (
 	handlerTestEmail         = "handler-test@multica.ai"
@@ -737,5 +759,358 @@ func TestDaemonRegisterMissingWorkspaceReturns404(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "workspace not found") {
 		t.Fatalf("DaemonRegister: expected workspace not found error, got %s", w.Body.String())
+	}
+}
+
+func TestPingPersistsAcrossHandlerRestart(t *testing.T) {
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/ping", nil), "runtimeId", runtimeID)
+	testHandler.InitiatePing(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiatePing: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created PingRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created ping: %v", err)
+	}
+	defer func() {
+		w := httptest.NewRecorder()
+		req := withURLParam(newRequest("POST", "/api/daemon/pings/"+created.ID+"/result", map[string]any{
+			"status":      "completed",
+			"output":      "cleanup",
+			"duration_ms": 1,
+		}), "pingId", created.ID)
+		testHandler.ReportPingResult(w, req)
+	}()
+
+	restarted := newRestartedTestHandler()
+
+	heartbeatW := httptest.NewRecorder()
+	heartbeatReq := newRequest("POST", "/api/daemon/heartbeat", map[string]any{"runtime_id": runtimeID})
+	restarted.DaemonHeartbeat(heartbeatW, heartbeatReq)
+	if heartbeatW.Code != http.StatusOK {
+		t.Fatalf("DaemonHeartbeat: expected 200, got %d: %s", heartbeatW.Code, heartbeatW.Body.String())
+	}
+
+	var heartbeatResp map[string]any
+	if err := json.NewDecoder(heartbeatW.Body).Decode(&heartbeatResp); err != nil {
+		t.Fatalf("decode heartbeat response: %v", err)
+	}
+	pendingPing, ok := heartbeatResp["pending_ping"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected pending_ping after restart, got %s", heartbeatW.Body.String())
+	}
+	if pendingPing["id"] != created.ID {
+		t.Fatalf("pending_ping.id = %v, want %s", pendingPing["id"], created.ID)
+	}
+
+	reportW := httptest.NewRecorder()
+	reportReq := withURLParam(newRequest("POST", "/api/daemon/pings/"+created.ID+"/result", map[string]any{
+		"status":      "completed",
+		"output":      "pong",
+		"duration_ms": 12,
+	}), "pingId", created.ID)
+	restarted.ReportPingResult(reportW, reportReq)
+	if reportW.Code != http.StatusOK {
+		t.Fatalf("ReportPingResult: expected 200, got %d: %s", reportW.Code, reportW.Body.String())
+	}
+
+	restartedAgain := newRestartedTestHandler()
+	getW := httptest.NewRecorder()
+	getReq := withURLParam(newRequest("GET", "/api/pings/"+created.ID, nil), "pingId", created.ID)
+	restartedAgain.GetPing(getW, getReq)
+	if getW.Code != http.StatusOK {
+		t.Fatalf("GetPing after restart: expected 200, got %d: %s", getW.Code, getW.Body.String())
+	}
+
+	var got PingRequest
+	if err := json.NewDecoder(getW.Body).Decode(&got); err != nil {
+		t.Fatalf("decode persisted ping: %v", err)
+	}
+	if got.Status != PingCompleted {
+		t.Fatalf("ping status = %q, want %q", got.Status, PingCompleted)
+	}
+	if got.Output != "pong" {
+		t.Fatalf("ping output = %q, want pong", got.Output)
+	}
+	if got.DurationMs != 12 {
+		t.Fatalf("ping duration_ms = %d, want 12", got.DurationMs)
+	}
+}
+
+func TestUpdatePersistsAcrossHandlerRestart(t *testing.T) {
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/update", map[string]any{
+		"target_version": "v9.9.9",
+	}), "runtimeId", runtimeID)
+	testHandler.InitiateUpdate(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiateUpdate: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created UpdateRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created update: %v", err)
+	}
+	defer func() {
+		w := httptest.NewRecorder()
+		req := withURLParam(newRequest("POST", "/api/daemon/updates/"+created.ID+"/result", map[string]any{
+			"status": "completed",
+			"output": "cleanup",
+		}), "updateId", created.ID)
+		testHandler.ReportUpdateResult(w, req)
+	}()
+
+	restarted := newRestartedTestHandler()
+
+	heartbeatW := httptest.NewRecorder()
+	heartbeatReq := newRequest("POST", "/api/daemon/heartbeat", map[string]any{"runtime_id": runtimeID})
+	restarted.DaemonHeartbeat(heartbeatW, heartbeatReq)
+	if heartbeatW.Code != http.StatusOK {
+		t.Fatalf("DaemonHeartbeat: expected 200, got %d: %s", heartbeatW.Code, heartbeatW.Body.String())
+	}
+
+	var heartbeatResp map[string]any
+	if err := json.NewDecoder(heartbeatW.Body).Decode(&heartbeatResp); err != nil {
+		t.Fatalf("decode heartbeat response: %v", err)
+	}
+	pendingUpdate, ok := heartbeatResp["pending_update"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected pending_update after restart, got %s", heartbeatW.Body.String())
+	}
+	if pendingUpdate["id"] != created.ID {
+		t.Fatalf("pending_update.id = %v, want %s", pendingUpdate["id"], created.ID)
+	}
+	if pendingUpdate["target_version"] != "v9.9.9" {
+		t.Fatalf("pending_update.target_version = %v, want v9.9.9", pendingUpdate["target_version"])
+	}
+
+	reportW := httptest.NewRecorder()
+	reportReq := withURLParam(newRequest("POST", "/api/daemon/updates/"+created.ID+"/result", map[string]any{
+		"status": "completed",
+		"output": "updated",
+	}), "updateId", created.ID)
+	restarted.ReportUpdateResult(reportW, reportReq)
+	if reportW.Code != http.StatusOK {
+		t.Fatalf("ReportUpdateResult: expected 200, got %d: %s", reportW.Code, reportW.Body.String())
+	}
+
+	restartedAgain := newRestartedTestHandler()
+	getW := httptest.NewRecorder()
+	getReq := withURLParam(newRequest("GET", "/api/updates/"+created.ID, nil), "updateId", created.ID)
+	restartedAgain.GetUpdate(getW, getReq)
+	if getW.Code != http.StatusOK {
+		t.Fatalf("GetUpdate after restart: expected 200, got %d: %s", getW.Code, getW.Body.String())
+	}
+
+	var got UpdateRequest
+	if err := json.NewDecoder(getW.Body).Decode(&got); err != nil {
+		t.Fatalf("decode persisted update: %v", err)
+	}
+	if got.Status != UpdateCompleted {
+		t.Fatalf("update status = %q, want %q", got.Status, UpdateCompleted)
+	}
+	if got.Output != "updated" {
+		t.Fatalf("update output = %q, want updated", got.Output)
+	}
+	if got.TargetVersion != "v9.9.9" {
+		t.Fatalf("update target_version = %q, want v9.9.9", got.TargetVersion)
+	}
+}
+
+func TestGetPingReturnsPersistedTerminalStateWhenTimeoutUpdateLosesRace(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/ping", nil), "runtimeId", runtimeID)
+	testHandler.InitiatePing(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiatePing: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created PingRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created ping: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE runtime_ping
+		SET created_at = $2, updated_at = $2
+		WHERE id = $1
+	`, created.ID, time.Now().Add(-2*time.Minute)); err != nil {
+		t.Fatalf("age ping request: %v", err)
+	}
+
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT id FROM runtime_ping WHERE id = $1 FOR UPDATE`, created.ID); err != nil {
+		t.Fatalf("lock ping row: %v", err)
+	}
+
+	resultCh := make(chan *PingRequest, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, err := testHandler.getPingRequest(ctx, created.ID)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resultCh <- result
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE runtime_ping
+		SET status = 'completed', output = 'pong', duration_ms = 7, updated_at = now()
+		WHERE id = $1
+	`, created.ID); err != nil {
+		t.Fatalf("complete ping in tx: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit tx: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("getPingRequest returned error: %v", err)
+	case got := <-resultCh:
+		if got.Status != PingCompleted {
+			t.Fatalf("ping status = %q, want %q", got.Status, PingCompleted)
+		}
+		if got.Output != "pong" {
+			t.Fatalf("ping output = %q, want pong", got.Output)
+		}
+		if got.DurationMs != 7 {
+			t.Fatalf("ping duration_ms = %d, want 7", got.DurationMs)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for getPingRequest")
+	}
+}
+
+func TestGetUpdateReturnsPersistedTerminalStateWhenTimeoutUpdateLosesRace(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/update", map[string]any{
+		"target_version": "v1.2.3",
+	}), "runtimeId", runtimeID)
+	testHandler.InitiateUpdate(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiateUpdate: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created UpdateRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created update: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE runtime_update
+		SET created_at = $2, updated_at = $2
+		WHERE id = $1
+	`, created.ID, time.Now().Add(-3*time.Minute)); err != nil {
+		t.Fatalf("age update request: %v", err)
+	}
+
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT id FROM runtime_update WHERE id = $1 FOR UPDATE`, created.ID); err != nil {
+		t.Fatalf("lock update row: %v", err)
+	}
+
+	resultCh := make(chan *UpdateRequest, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, err := testHandler.getUpdateRequest(ctx, created.ID)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resultCh <- result
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE runtime_update
+		SET status = 'completed', output = 'updated', updated_at = now()
+		WHERE id = $1
+	`, created.ID); err != nil {
+		t.Fatalf("complete update in tx: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit tx: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("getUpdateRequest returned error: %v", err)
+	case got := <-resultCh:
+		if got.Status != UpdateCompleted {
+			t.Fatalf("update status = %q, want %q", got.Status, UpdateCompleted)
+		}
+		if got.Output != "updated" {
+			t.Fatalf("update output = %q, want updated", got.Output)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for getUpdateRequest")
+	}
+}
+
+func TestGetPingTimesOutAfterHeartbeatClaimsIt(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/ping", nil), "runtimeId", runtimeID)
+	testHandler.InitiatePing(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiatePing: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created PingRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created ping: %v", err)
+	}
+
+	heartbeatW := httptest.NewRecorder()
+	heartbeatReq := newRequest("POST", "/api/daemon/heartbeat", map[string]any{"runtime_id": runtimeID})
+	testHandler.DaemonHeartbeat(heartbeatW, heartbeatReq)
+	if heartbeatW.Code != http.StatusOK {
+		t.Fatalf("DaemonHeartbeat: expected 200, got %d: %s", heartbeatW.Code, heartbeatW.Body.String())
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE runtime_ping
+		SET created_at = $2, updated_at = $2
+		WHERE id = $1
+	`, created.ID, time.Now().Add(-2*time.Minute)); err != nil {
+		t.Fatalf("age claimed ping request: %v", err)
+	}
+
+	got, err := testHandler.getPingRequest(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("getPingRequest returned error: %v", err)
+	}
+	if got.Status != PingTimeout {
+		t.Fatalf("ping status = %q, want %q", got.Status, PingTimeout)
+	}
+	if got.Error != "daemon did not respond within 60 seconds" {
+		t.Fatalf("ping error = %q, want timeout error", got.Error)
 	}
 }
