@@ -708,7 +708,7 @@ func TestDaemonRegister_CreatesOrchestratorOnPreferredClaudeRuntime(t *testing.T
 		]
 	}`, workspaceID)))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-User-ID", testUserID)
+	req = withDaemonIdentity(req, workspaceID, "daemon-preferred-runtime")
 
 	testHandler.DaemonRegister(w, req)
 	if w.Code != http.StatusOK {

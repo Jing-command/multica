@@ -17,6 +17,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -52,6 +53,7 @@ const (
 	handlerTestEmail         = "handler-test@multica.ai"
 	handlerTestName          = "Handler Test User"
 	handlerTestWorkspaceSlug = "handler-tests"
+	handlerTestDaemonID      = "handler-test-daemon"
 )
 
 func TestMain(m *testing.M) {
@@ -133,9 +135,9 @@ func setupHandlerTestFixture(ctx context.Context, pool *pgxpool.Pool) (string, s
 		INSERT INTO agent_runtime (
 			workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at
 		)
-		VALUES ($1, NULL, $2, 'cloud', $3, 'online', $4, '{}'::jsonb, now())
+		VALUES ($1, $2, $3, 'cloud', $4, 'online', $5, '{}'::jsonb, now())
 		RETURNING id
-	`, workspaceID, "Handler Test Runtime", "handler_test_runtime", "Handler test runtime").Scan(&runtimeID); err != nil {
+	`, workspaceID, handlerTestDaemonID, "Handler Test Runtime", "handler_test_runtime", "Handler test runtime").Scan(&runtimeID); err != nil {
 		return "", "", err
 	}
 
@@ -229,8 +231,16 @@ func newRequest(method, path string, body any) *http.Request {
 	return req
 }
 
+func withDaemonIdentity(req *http.Request, workspaceID, daemonID string) *http.Request {
+	ctx := middleware.DaemonContextWithIdentity(req.Context(), workspaceID, daemonID)
+	return req.WithContext(ctx)
+}
+
 func withURLParam(req *http.Request, key, value string) *http.Request {
-	rctx := chi.NewRouteContext()
+	rctx, _ := req.Context().Value(chi.RouteCtxKey).(*chi.Context)
+	if rctx == nil {
+		rctx = chi.NewRouteContext()
+	}
 	rctx.URLParams.Add(key, value)
 	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
 }
@@ -1268,7 +1278,7 @@ func TestDaemonRegisterMissingWorkspaceReturns404(t *testing.T) {
 		"runtimes":[{"name":"Local Codex","type":"codex","version":"1.0.0","status":"online"}]
 	}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-User-ID", testUserID)
+	req = withDaemonIdentity(req, "00000000-0000-0000-0000-000000000001", "local-daemon")
 
 	testHandler.DaemonRegister(w, req)
 	if w.Code != http.StatusNotFound {
@@ -1295,11 +1305,13 @@ func TestPingPersistsAcrossHandlerRestart(t *testing.T) {
 	}
 	defer func() {
 		w := httptest.NewRecorder()
-		req := withURLParam(newRequest("POST", "/api/daemon/pings/"+created.ID+"/result", map[string]any{
+		req := withURLParam(newRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/ping/"+created.ID+"/result", map[string]any{
 			"status":      "completed",
 			"output":      "cleanup",
 			"duration_ms": 1,
 		}), "pingId", created.ID)
+		req = withURLParam(req, "runtimeId", runtimeID)
+		req = withDaemonIdentity(req, testWorkspaceID, handlerTestDaemonID)
 		testHandler.ReportPingResult(w, req)
 	}()
 
@@ -1307,6 +1319,7 @@ func TestPingPersistsAcrossHandlerRestart(t *testing.T) {
 
 	heartbeatW := httptest.NewRecorder()
 	heartbeatReq := newRequest("POST", "/api/daemon/heartbeat", map[string]any{"runtime_id": runtimeID})
+	heartbeatReq = withDaemonIdentity(heartbeatReq, testWorkspaceID, handlerTestDaemonID)
 	restarted.DaemonHeartbeat(heartbeatW, heartbeatReq)
 	if heartbeatW.Code != http.StatusOK {
 		t.Fatalf("DaemonHeartbeat: expected 200, got %d: %s", heartbeatW.Code, heartbeatW.Body.String())
@@ -1325,11 +1338,13 @@ func TestPingPersistsAcrossHandlerRestart(t *testing.T) {
 	}
 
 	reportW := httptest.NewRecorder()
-	reportReq := withURLParam(newRequest("POST", "/api/daemon/pings/"+created.ID+"/result", map[string]any{
+	reportReq := withURLParam(newRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/ping/"+created.ID+"/result", map[string]any{
 		"status":      "completed",
 		"output":      "pong",
 		"duration_ms": 12,
 	}), "pingId", created.ID)
+	reportReq = withURLParam(reportReq, "runtimeId", runtimeID)
+	reportReq = withDaemonIdentity(reportReq, testWorkspaceID, handlerTestDaemonID)
 	restarted.ReportPingResult(reportW, reportReq)
 	if reportW.Code != http.StatusOK {
 		t.Fatalf("ReportPingResult: expected 200, got %d: %s", reportW.Code, reportW.Body.String())
@@ -1376,10 +1391,12 @@ func TestUpdatePersistsAcrossHandlerRestart(t *testing.T) {
 	}
 	defer func() {
 		w := httptest.NewRecorder()
-		req := withURLParam(newRequest("POST", "/api/daemon/updates/"+created.ID+"/result", map[string]any{
+		req := withURLParam(newRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/update/"+created.ID+"/result", map[string]any{
 			"status": "completed",
 			"output": "cleanup",
 		}), "updateId", created.ID)
+		req = withURLParam(req, "runtimeId", runtimeID)
+		req = withDaemonIdentity(req, testWorkspaceID, handlerTestDaemonID)
 		testHandler.ReportUpdateResult(w, req)
 	}()
 
@@ -1387,6 +1404,7 @@ func TestUpdatePersistsAcrossHandlerRestart(t *testing.T) {
 
 	heartbeatW := httptest.NewRecorder()
 	heartbeatReq := newRequest("POST", "/api/daemon/heartbeat", map[string]any{"runtime_id": runtimeID})
+	heartbeatReq = withDaemonIdentity(heartbeatReq, testWorkspaceID, handlerTestDaemonID)
 	restarted.DaemonHeartbeat(heartbeatW, heartbeatReq)
 	if heartbeatW.Code != http.StatusOK {
 		t.Fatalf("DaemonHeartbeat: expected 200, got %d: %s", heartbeatW.Code, heartbeatW.Body.String())
@@ -1408,10 +1426,12 @@ func TestUpdatePersistsAcrossHandlerRestart(t *testing.T) {
 	}
 
 	reportW := httptest.NewRecorder()
-	reportReq := withURLParam(newRequest("POST", "/api/daemon/updates/"+created.ID+"/result", map[string]any{
+	reportReq := withURLParam(newRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/update/"+created.ID+"/result", map[string]any{
 		"status": "completed",
 		"output": "updated",
 	}), "updateId", created.ID)
+	reportReq = withURLParam(reportReq, "runtimeId", runtimeID)
+	reportReq = withDaemonIdentity(reportReq, testWorkspaceID, handlerTestDaemonID)
 	restarted.ReportUpdateResult(reportW, reportReq)
 	if reportW.Code != http.StatusOK {
 		t.Fatalf("ReportUpdateResult: expected 200, got %d: %s", reportW.Code, reportW.Body.String())
@@ -1607,6 +1627,7 @@ func TestGetPingTimesOutAfterHeartbeatClaimsIt(t *testing.T) {
 
 	heartbeatW := httptest.NewRecorder()
 	heartbeatReq := newRequest("POST", "/api/daemon/heartbeat", map[string]any{"runtime_id": runtimeID})
+	heartbeatReq = withDaemonIdentity(heartbeatReq, testWorkspaceID, handlerTestDaemonID)
 	testHandler.DaemonHeartbeat(heartbeatW, heartbeatReq)
 	if heartbeatW.Code != http.StatusOK {
 		t.Fatalf("DaemonHeartbeat: expected 200, got %d: %s", heartbeatW.Code, heartbeatW.Body.String())
