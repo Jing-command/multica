@@ -93,11 +93,18 @@ function LoginPageContent() {
 
   const handleCliAuthorize = async () => {
     const cliCallback = searchParams.get("cli_callback");
-    const token = localStorage.getItem("multica_token");
-    if (!cliCallback || !token) return;
+    if (!cliCallback) return;
     const cliState = searchParams.get("cli_state") || "";
     setSubmitting(true);
-    redirectToCliCallback(cliCallback, token, cliState);
+    try {
+      const { token } = await api.getSessionToken();
+      redirectToCliCallback(cliCallback, token, cliState);
+    } catch {
+      setSubmitting(false);
+      setExistingUser(null);
+      setStep("email");
+      setError("Session expired. Please sign in again.");
+    }
   };
 
   const handleSendCode = async (e?: React.FormEvent) => {

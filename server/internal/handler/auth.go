@@ -538,6 +538,11 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	middleware.ClearAuthCookie(w)
+	if h.CFSigner != nil {
+		for _, cookie := range h.CFSigner.ClearCookies() {
+			http.SetCookie(w, cookie)
+		}
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -554,6 +559,16 @@ func (h *Handler) GetMe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, userToResponse(user))
+}
+
+func (h *Handler) GetSessionToken(w http.ResponseWriter, r *http.Request) {
+	token := middleware.JWTFromRequest(r)
+	if strings.TrimSpace(token) == "" {
+		writeError(w, http.StatusUnauthorized, "missing authorization header")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"token": token})
 }
 
 type UpdateMeRequest struct {

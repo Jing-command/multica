@@ -29,6 +29,25 @@ type CloudFrontSigner struct {
 	cookieDomain string // cookie scope, e.g. ".multica.ai"
 }
 
+func (s *CloudFrontSigner) cookie(name, value string, expiry time.Time) *http.Cookie {
+	return &http.Cookie{
+		Name:     name,
+		Value:    value,
+		Domain:   s.cookieDomain,
+		Path:     "/",
+		Expires:  expiry,
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteNoneMode,
+	}
+}
+
+func (s *CloudFrontSigner) clearCookie(name string, expiry time.Time) *http.Cookie {
+	cookie := s.cookie(name, "", expiry)
+	cookie.MaxAge = -1
+	return cookie
+}
+
 // NewCloudFrontSignerFromEnv creates a signer from environment variables.
 // Returns nil if CLOUDFRONT_KEY_PAIR_ID is not set (disables signed cookies).
 //
@@ -152,23 +171,19 @@ func (s *CloudFrontSigner) SignedCookies(expiry time.Time) []*http.Cookie {
 	}
 	encodedSig := cfBase64Encode(sig)
 
-	cookieAttrs := func(name, value string) *http.Cookie {
-		return &http.Cookie{
-			Name:     name,
-			Value:    value,
-			Domain:   s.cookieDomain,
-			Path:     "/",
-			Expires:  expiry,
-			Secure:   true,
-			HttpOnly: true,
-			SameSite: http.SameSiteNoneMode,
-		}
-	}
-
 	return []*http.Cookie{
-		cookieAttrs("CloudFront-Policy", encodedPolicy),
-		cookieAttrs("CloudFront-Signature", encodedSig),
-		cookieAttrs("CloudFront-Key-Pair-Id", s.keyPairID),
+		s.cookie("CloudFront-Policy", encodedPolicy, expiry),
+		s.cookie("CloudFront-Signature", encodedSig, expiry),
+		s.cookie("CloudFront-Key-Pair-Id", s.keyPairID, expiry),
+	}
+}
+
+func (s *CloudFrontSigner) ClearCookies() []*http.Cookie {
+	expiry := time.Unix(0, 0)
+	return []*http.Cookie{
+		s.clearCookie("CloudFront-Policy", expiry),
+		s.clearCookie("CloudFront-Signature", expiry),
+		s.clearCookie("CloudFront-Key-Pair-Id", expiry),
 	}
 }
 
