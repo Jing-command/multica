@@ -6,10 +6,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 )
-
-const defaultJWTSecret = "multica-dev-secret-change-in-production"
 
 var (
 	jwtSecret     []byte
@@ -18,14 +17,15 @@ var (
 
 func JWTSecret() []byte {
 	jwtSecretOnce.Do(func() {
-		secret := os.Getenv("JWT_SECRET")
-		if secret == "" {
-			secret = defaultJWTSecret
-		}
-		jwtSecret = []byte(secret)
+		jwtSecret = []byte(strings.TrimSpace(os.Getenv("JWT_SECRET")))
 	})
 
 	return jwtSecret
+}
+
+func resetJWTSecretForTest() {
+	jwtSecret = nil
+	jwtSecretOnce = sync.Once{}
 }
 
 // GeneratePATToken creates a new personal access token: "mul_" + 40 random hex chars.

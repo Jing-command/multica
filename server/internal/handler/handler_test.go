@@ -23,6 +23,7 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/resend/resend-go/v2"
 )
+
 var testHandler *Handler
 var testPool *pgxpool.Pool
 var testUserID string
@@ -1092,6 +1093,64 @@ func setPrivateField(target any, fieldName string, value any) {
 	reflect.NewAt(v.Type(), unsafe.Pointer(v.UnsafeAddr())).Elem().Set(reflect.ValueOf(value))
 }
 
+func TestVerifyCodeRejectsMagicCodeWithoutExplicitOptIn(t *testing.T) {
+	const email = "magic-code-disabled@multica.ai"
+	const ip = "203.0.113.48"
+	ctx := context.Background()
+	ensureAuthAbuseEventTable(ctx, t)
+
+	prevAppEnv, hadAppEnv := os.LookupEnv("APP_ENV")
+	prevMagicOptIn, hadMagicOptIn := os.LookupEnv("AUTH_ENABLE_MAGIC_CODE")
+	if err := os.Setenv("APP_ENV", "development"); err != nil {
+		t.Fatalf("set APP_ENV: %v", err)
+	}
+	if err := os.Unsetenv("AUTH_ENABLE_MAGIC_CODE"); err != nil {
+		t.Fatalf("unset AUTH_ENABLE_MAGIC_CODE: %v", err)
+	}
+	defer func() {
+		if hadAppEnv {
+			_ = os.Setenv("APP_ENV", prevAppEnv)
+		} else {
+			_ = os.Unsetenv("APP_ENV")
+		}
+		if hadMagicOptIn {
+			_ = os.Setenv("AUTH_ENABLE_MAGIC_CODE", prevMagicOptIn)
+		} else {
+			_ = os.Unsetenv("AUTH_ENABLE_MAGIC_CODE")
+		}
+	}()
+
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email)
+		cleanupAuthAbuseEvents(ctx, t, email)
+		cleanupAuthAbuseEventsByIP(ctx, t, ip)
+	})
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO verification_code (email, code, expires_at)
+		VALUES ($1, '123456', now() + interval '10 minutes')
+	`, email); err != nil {
+		t.Fatalf("seed verification_code: %v", err)
+	}
+
+	var buf bytes.Buffer
+	json.NewEncoder(&buf).Encode(map[string]string{"email": email, "code": "888888"})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/auth/verify-code", &buf)
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = ip + ":1234"
+	testHandler.VerifyCode(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("VerifyCode magic code without opt-in: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]string
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["error"] != "invalid or expired code" {
+		t.Fatalf("expected generic verify error, got %#v", resp)
+	}
+}
+
 func TestVerifyCodeCreatesWorkspace(t *testing.T) {
 	const email = "workspace-verify-test@multica.ai"
 	const ip = "203.0.113.45"
@@ -1205,11 +1264,11 @@ func TestResolveActor(t *testing.T) {
 	})
 
 	tests := []struct {
-		name            string
-		agentIDHeader   string
-		taskIDHeader    string
-		wantActorType   string
-		wantIsAgent     bool
+		name          string
+		agentIDHeader string
+		taskIDHeader  string
+		wantActorType string
+		wantIsAgent   bool
 	}{
 		{
 			name:          "no headers returns member",
