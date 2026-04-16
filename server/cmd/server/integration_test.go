@@ -201,6 +201,106 @@ func generateTestJWT(userID, email, name string) (string, error) {
 	return token.SignedString(auth.JWTSecret())
 }
 
+func createDaemonTokenForTest(t *testing.T, workspaceID, daemonID string) string {
+	t.Helper()
+
+	rawToken, err := auth.GenerateDaemonToken()
+	if err != nil {
+		t.Fatalf("generate daemon token: %v", err)
+	}
+	if _, err := testPool.Exec(context.Background(), `
+		INSERT INTO daemon_token (token_hash, workspace_id, daemon_id, expires_at)
+		VALUES ($1, $2, $3, now() + interval '1 day')
+	`, auth.HashToken(rawToken), workspaceID, daemonID); err != nil {
+		t.Fatalf("insert daemon token: %v", err)
+	}
+	return rawToken
+}
+
+func createWorkspaceRuntimeForTest(t *testing.T, slug, runtimeName, daemonID string) string {
+	t.Helper()
+
+	ctx := context.Background()
+	var workspaceID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO workspace (name, slug, description)
+		VALUES ($1, $2, $3)
+		RETURNING id
+	`, runtimeName+" Workspace", slug, "Temporary workspace for daemon auth integration tests").Scan(&workspaceID); err != nil {
+		t.Fatalf("create workspace: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO member (workspace_id, user_id, role)
+		VALUES ($1, $2, 'owner')
+	`, workspaceID, testUserID); err != nil {
+		t.Fatalf("create workspace membership: %v", err)
+	}
+
+	runtimeID := createRuntimeForWorkspaceAndDaemon(t, workspaceID, runtimeName, daemonID)
+
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(ctx, `DELETE FROM workspace WHERE id = $1`, workspaceID); err != nil {
+			t.Fatalf("cleanup workspace: %v", err)
+		}
+	})
+
+	return runtimeID
+}
+
+func createRuntimeForWorkspaceAndDaemon(t *testing.T, workspaceID, runtimeName, daemonID string) string {
+	t.Helper()
+
+	ctx := context.Background()
+	var runtimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (
+			workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at
+		)
+		VALUES ($1, $2, $3, 'local', 'claude', 'online', $4, '{}'::jsonb, now())
+		RETURNING id
+	`, workspaceID, daemonID, runtimeName, runtimeName+" device").Scan(&runtimeID); err != nil {
+		t.Fatalf("create runtime: %v", err)
+	}
+	return runtimeID
+}
+
+func createTaskForRuntimeTest(t *testing.T, workspaceID, runtimeID, suffix string) string {
+	t.Helper()
+
+	ctx := context.Background()
+	var agentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (
+			workspace_id, name, description, runtime_mode, runtime_config,
+			runtime_id, visibility, max_concurrent_tasks, owner_id
+		)
+		VALUES ($1, $2, '', 'local', '{}'::jsonb, $3, 'workspace', 1, $4)
+		RETURNING id
+	`, workspaceID, "Daemon Task Agent "+suffix, runtimeID, testUserID).Scan(&agentID); err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number, position)
+		VALUES ($1, $2, 'todo', 'none', 'member', $3, 8000 + floor(random() * 1000)::int, 0)
+		RETURNING id
+	`, workspaceID, "Daemon Task Issue "+suffix, testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+
+	var taskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority)
+		VALUES ($1, $2, $3, 'queued', 0)
+		RETURNING id
+	`, agentID, runtimeID, issueID).Scan(&taskID); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	return taskID
+}
+
 // ---- Health ----
 
 func TestHealth(t *testing.T) {
@@ -439,6 +539,99 @@ func TestInvalidJWT(t *testing.T) {
 				t.Fatalf("expected 401, got %d", resp.StatusCode)
 			}
 		})
+	}
+}
+
+func TestDaemonRoutesRejectUserJWT(t *testing.T) {
+	req, err := http.NewRequest("POST", testServer.URL+"/api/daemon/heartbeat", bytes.NewReader([]byte(`{"runtime_id":"00000000-0000-0000-0000-000000000001"}`)))
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 401, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestDaemonHeartbeatRejectsCrossWorkspaceRuntime(t *testing.T) {
+	const daemonID = "daemon-heartbeat-cross-workspace"
+	runtimeID := createWorkspaceRuntimeForTest(t, "daemon-heartbeat-cross-workspace", "Cross Workspace Runtime", daemonID)
+	daemonToken := createDaemonTokenForTest(t, testWorkspaceID, daemonID)
+
+	body, _ := json.Marshal(map[string]string{"runtime_id": runtimeID})
+	req, err := http.NewRequest("POST", testServer.URL+"/api/daemon/heartbeat", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+daemonToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 404, got %d: %s", resp.StatusCode, respBody)
+	}
+}
+
+func TestDaemonClaimRejectsCrossWorkspaceRuntime(t *testing.T) {
+	const daemonID = "daemon-claim-cross-workspace"
+	runtimeID := createWorkspaceRuntimeForTest(t, "daemon-claim-cross-workspace", "Cross Workspace Claim Runtime", daemonID)
+	daemonToken := createDaemonTokenForTest(t, testWorkspaceID, daemonID)
+
+	req, err := http.NewRequest("POST", testServer.URL+"/api/daemon/runtimes/"+runtimeID+"/tasks/claim", bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+daemonToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 404, got %d: %s", resp.StatusCode, respBody)
+	}
+}
+
+func TestDaemonTaskStatusRejectsCrossRuntimeTask(t *testing.T) {
+	const daemonID = "daemon-task-cross-runtime"
+	otherRuntimeID := createRuntimeForWorkspaceAndDaemon(t, testWorkspaceID, "Mismatched Runtime", "other-daemon")
+	taskID := createTaskForRuntimeTest(t, testWorkspaceID, otherRuntimeID, "cross-runtime")
+	daemonToken := createDaemonTokenForTest(t, testWorkspaceID, daemonID)
+
+	req, err := http.NewRequest("GET", testServer.URL+"/api/daemon/tasks/"+taskID+"/status", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+daemonToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 404, got %d: %s", resp.StatusCode, respBody)
 	}
 }
 

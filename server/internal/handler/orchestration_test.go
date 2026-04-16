@@ -24,6 +24,7 @@ type orchestrationHandlerFixture struct {
 	outsiderAgentID      string
 	orchestratorTaskID   string
 	workerChildTaskID    string
+	workerRuntimeID      string
 }
 
 func seedOrchestrationHandlerFixture(t *testing.T, ctx context.Context) orchestrationHandlerFixture {
@@ -129,6 +130,7 @@ func seedOrchestrationHandlerFixture(t *testing.T, ctx context.Context) orchestr
 		outsiderAgentID:     outsiderAgentID,
 		orchestratorTaskID:  orchestratorTaskID,
 		workerChildTaskID:   workerChildTaskID,
+		workerRuntimeID:     workerRuntimeID,
 	}
 }
 
@@ -1283,14 +1285,12 @@ func TestClaimTaskByRuntime_IncludesPermissionSnapshotJSON(t *testing.T) {
 		t.Fatalf("attach permission snapshot to task context: %v", err)
 	}
 
-	var runtimeID string
-	if err := testPool.QueryRow(ctx, `SELECT runtime_id FROM agent_task_queue WHERE id = $1`, fixture.workerChildTaskID).Scan(&runtimeID); err != nil {
-		t.Fatalf("load task runtime id: %v", err)
-	}
+	runtimeID := fixture.workerRuntimeID
 
 	w := httptest.NewRecorder()
 	req := newRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", map[string]any{})
 	req = withURLParam(req, "runtimeId", runtimeID)
+	req = withDaemonIdentity(req, testWorkspaceID, "")
 	testHandler.ClaimTaskByRuntime(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())

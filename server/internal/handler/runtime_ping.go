@@ -153,6 +153,12 @@ func (h *Handler) GetPing(w http.ResponseWriter, r *http.Request) {
 
 // ReportPingResult receives the ping result from the daemon.
 func (h *Handler) ReportPingResult(w http.ResponseWriter, r *http.Request) {
+	runtimeID := chi.URLParam(r, "runtimeId")
+	if _, ok := h.loadDaemonRuntime(r, runtimeID); !ok {
+		writeError(w, http.StatusNotFound, "runtime not found")
+		return
+	}
+
 	pingID := chi.URLParam(r, "pingId")
 
 	var req struct {
