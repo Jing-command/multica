@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -18,8 +20,8 @@ import (
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/resend/resend-go/v2"
 )
-
 var testHandler *Handler
 var testPool *pgxpool.Pool
 var testUserID string
@@ -158,6 +160,61 @@ func cleanupHandlerTestFixture(ctx context.Context, pool *pgxpool.Pool) error {
 		return err
 	}
 	return nil
+}
+
+func ensureAuthAbuseEventTable(ctx context.Context, t *testing.T) {
+	t.Helper()
+	if _, err := testPool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS auth_abuse_event (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			event_type TEXT NOT NULL,
+			identifier TEXT NOT NULL,
+			ip TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`); err != nil {
+		t.Fatalf("ensure auth_abuse_event table: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_auth_abuse_event_type_created_at
+			ON auth_abuse_event(event_type, created_at)
+	`); err != nil {
+		t.Fatalf("ensure auth_abuse_event type index: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_auth_abuse_event_identifier_type_created_at
+			ON auth_abuse_event(identifier, event_type, created_at)
+	`); err != nil {
+		t.Fatalf("ensure auth_abuse_event identifier index: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_auth_abuse_event_ip_type_created_at
+			ON auth_abuse_event(ip, event_type, created_at)
+	`); err != nil {
+		t.Fatalf("ensure auth_abuse_event ip index: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_auth_abuse_event_ip_identifier_type_created_at
+			ON auth_abuse_event(ip, identifier, event_type, created_at)
+	`); err != nil {
+		t.Fatalf("ensure auth_abuse_event ip identifier index: %v", err)
+	}
+}
+
+func cleanupAuthAbuseEvents(ctx context.Context, t *testing.T, email string) {
+	t.Helper()
+	ensureAuthAbuseEventTable(ctx, t)
+	if _, err := testPool.Exec(ctx, `DELETE FROM auth_abuse_event WHERE identifier = $1`, email); err != nil {
+		t.Fatalf("cleanup auth_abuse_event by identifier: %v", err)
+	}
+}
+
+func cleanupAuthAbuseEventsByIP(ctx context.Context, t *testing.T, ip string) {
+	t.Helper()
+	ensureAuthAbuseEventTable(ctx, t)
+	if _, err := testPool.Exec(ctx, `DELETE FROM auth_abuse_event WHERE ip = $1`, ip); err != nil {
+		t.Fatalf("cleanup auth_abuse_event by ip: %v", err)
+	}
 }
 
 func newRequest(method, path string, body any) *http.Request {
@@ -385,12 +442,23 @@ func TestWorkspaceCRUD(t *testing.T) {
 }
 
 func TestSendCode(t *testing.T) {
+	const email = "sendcode-test@multica.ai"
+	const ip = "203.0.113.11"
+	ctx := context.Background()
+	ensureAuthAbuseEventTable(ctx, t)
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email)
+		cleanupAuthAbuseEvents(ctx, t, email)
+		cleanupAuthAbuseEventsByIP(ctx, t, ip)
+	})
+
 	w := httptest.NewRecorder()
-	body := map[string]string{"email": "sendcode-test@multica.ai"}
+	body := map[string]string{"email": email}
 	var buf bytes.Buffer
 	json.NewEncoder(&buf).Encode(body)
 	req := httptest.NewRequest("POST", "/auth/send-code", &buf)
 	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = ip + ":1234"
 	testHandler.SendCode(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("SendCode: expected 200, got %d: %s", w.Code, w.Body.String())
@@ -401,48 +469,177 @@ func TestSendCode(t *testing.T) {
 	if resp["message"] == "" {
 		t.Fatal("SendCode: expected non-empty message")
 	}
-
-	t.Cleanup(func() {
-		testPool.Exec(context.Background(), `DELETE FROM verification_code WHERE email = $1`, "sendcode-test@multica.ai")
-	})
 }
 
-func TestSendCodeRateLimit(t *testing.T) {
-	const email = "ratelimit-test@multica.ai"
+func TestSendCodeCooldownReturnsGenericSuccess(t *testing.T) {
+	const email = "cooldown-generic@multica.ai"
+	ctx := context.Background()
+	ensureAuthAbuseEventTable(ctx, t)
 	t.Cleanup(func() {
-		testPool.Exec(context.Background(), `DELETE FROM verification_code WHERE email = $1`, email)
+		testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email)
+		cleanupAuthAbuseEvents(ctx, t, email)
 	})
 
-	// First request should succeed
-	w := httptest.NewRecorder()
 	body := map[string]string{"email": email}
 	var buf bytes.Buffer
 	json.NewEncoder(&buf).Encode(body)
+
+	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/auth/send-code", &buf)
 	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "203.0.113.10:1234"
 	testHandler.SendCode(w, req)
 	if w.Code != http.StatusOK {
-		t.Fatalf("SendCode (first): expected 200, got %d: %s", w.Code, w.Body.String())
+		t.Fatalf("first SendCode: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 
-	// Second request within 60s should be rate limited
 	w = httptest.NewRecorder()
 	buf.Reset()
 	json.NewEncoder(&buf).Encode(body)
 	req = httptest.NewRequest("POST", "/auth/send-code", &buf)
 	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "203.0.113.10:1234"
 	testHandler.SendCode(w, req)
-	if w.Code != http.StatusTooManyRequests {
-		t.Fatalf("SendCode (second): expected 429, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("second SendCode: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]string
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["message"] != "Verification code sent" {
+		t.Fatalf("expected generic success message, got %#v", resp)
+	}
+}
+
+func TestSendCodeBlocksIdentifierWindow(t *testing.T) {
+	const email = "identifier-window@multica.ai"
+	ctx := context.Background()
+	ensureAuthAbuseEventTable(ctx, t)
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email)
+		cleanupAuthAbuseEvents(ctx, t, email)
+	})
+
+	for i := 0; i < 5; i++ {
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO auth_abuse_event (event_type, identifier, ip, created_at)
+			VALUES ('send_code_requested', $1, '203.0.113.20', now() - interval '1 minute')
+		`, email); err != nil {
+			t.Fatalf("seed auth_abuse_event: %v", err)
+		}
+	}
+
+	var buf bytes.Buffer
+	json.NewEncoder(&buf).Encode(map[string]string{"email": email})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/auth/send-code", &buf)
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "203.0.113.20:1234"
+	testHandler.SendCode(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("SendCode identifier window: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var count int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM verification_code WHERE email = $1`, email).Scan(&count); err != nil {
+		t.Fatalf("count verification_code: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no new verification code row, got %d", count)
+	}
+}
+
+func TestSendCodeBlocksIPWindow(t *testing.T) {
+	const email = "ip-window@multica.ai"
+	const ip = "203.0.113.21"
+	ctx := context.Background()
+	ensureAuthAbuseEventTable(ctx, t)
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email)
+		cleanupAuthAbuseEvents(ctx, t, email)
+		cleanupAuthAbuseEventsByIP(ctx, t, ip)
+	})
+
+	for i := 0; i < 20; i++ {
+		seedEmail := fmt.Sprintf("ip-window-seed-%d@multica.ai", i)
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO auth_abuse_event (event_type, identifier, ip, created_at)
+			VALUES ('send_code_requested', $1, $2, now() - interval '1 minute')
+		`, seedEmail, ip); err != nil {
+			t.Fatalf("seed auth_abuse_event: %v", err)
+		}
+	}
+
+	var buf bytes.Buffer
+	json.NewEncoder(&buf).Encode(map[string]string{"email": email})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/auth/send-code", &buf)
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = ip + ":1234"
+	testHandler.SendCode(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("SendCode IP window: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var count int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM verification_code WHERE email = $1`, email).Scan(&count); err != nil {
+		t.Fatalf("count verification_code: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no new verification code row, got %d", count)
+	}
+}
+
+func TestSendCodeBlocksIPIdentifierConcentration(t *testing.T) {
+	const email = "ip-identifier-window@multica.ai"
+	const ip = "203.0.113.22"
+	ctx := context.Background()
+	ensureAuthAbuseEventTable(ctx, t)
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email)
+		cleanupAuthAbuseEvents(ctx, t, email)
+		cleanupAuthAbuseEventsByIP(ctx, t, ip)
+	})
+
+	for i := 0; i < 3; i++ {
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO auth_abuse_event (event_type, identifier, ip, created_at)
+			VALUES ('send_code_requested', $1, $2, now() - interval '1 minute')
+		`, email, ip); err != nil {
+			t.Fatalf("seed auth_abuse_event: %v", err)
+		}
+	}
+
+	var buf bytes.Buffer
+	json.NewEncoder(&buf).Encode(map[string]string{"email": email})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/auth/send-code", &buf)
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = ip + ":1234"
+	testHandler.SendCode(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("SendCode IP+identifier window: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var count int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM verification_code WHERE email = $1`, email).Scan(&count); err != nil {
+		t.Fatalf("count verification_code: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no new verification code row, got %d", count)
 	}
 }
 
 func TestVerifyCode(t *testing.T) {
 	const email = "verify-test@multica.ai"
+	const ip = "203.0.113.42"
 	ctx := context.Background()
+	ensureAuthAbuseEventTable(ctx, t)
 
 	t.Cleanup(func() {
 		testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email)
+		cleanupAuthAbuseEvents(ctx, t, email)
+		cleanupAuthAbuseEventsByIP(ctx, t, ip)
 		user, err := testHandler.Queries.GetUserByEmail(ctx, email)
 		if err == nil {
 			workspaces, listErr := testHandler.Queries.ListWorkspaces(ctx, user.ID)
@@ -461,6 +658,7 @@ func TestVerifyCode(t *testing.T) {
 	json.NewEncoder(&buf).Encode(map[string]string{"email": email})
 	req := httptest.NewRequest("POST", "/auth/send-code", &buf)
 	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = ip + ":1234"
 	testHandler.SendCode(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("SendCode: expected 200, got %d: %s", w.Code, w.Body.String())
@@ -478,6 +676,7 @@ func TestVerifyCode(t *testing.T) {
 	json.NewEncoder(&buf).Encode(map[string]string{"email": email, "code": dbCode.Code})
 	req = httptest.NewRequest("POST", "/auth/verify-code", &buf)
 	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = ip + ":1234"
 	testHandler.VerifyCode(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("VerifyCode: expected 200, got %d: %s", w.Code, w.Body.String())
@@ -495,10 +694,14 @@ func TestVerifyCode(t *testing.T) {
 
 func TestVerifyCodeWrongCode(t *testing.T) {
 	const email = "wrong-code-test@multica.ai"
+	const ip = "203.0.113.43"
 	ctx := context.Background()
+	ensureAuthAbuseEventTable(ctx, t)
 
 	t.Cleanup(func() {
 		testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email)
+		cleanupAuthAbuseEvents(ctx, t, email)
+		cleanupAuthAbuseEventsByIP(ctx, t, ip)
 	})
 
 	// Send code
@@ -507,6 +710,7 @@ func TestVerifyCodeWrongCode(t *testing.T) {
 	json.NewEncoder(&buf).Encode(map[string]string{"email": email})
 	req := httptest.NewRequest("POST", "/auth/send-code", &buf)
 	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = ip + ":1234"
 	testHandler.SendCode(w, req)
 
 	// Verify with wrong code
@@ -515,18 +719,71 @@ func TestVerifyCodeWrongCode(t *testing.T) {
 	json.NewEncoder(&buf).Encode(map[string]string{"email": email, "code": "000000"})
 	req = httptest.NewRequest("POST", "/auth/verify-code", &buf)
 	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = ip + ":1234"
 	testHandler.VerifyCode(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("VerifyCode (wrong code): expected 400, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
+func TestVerifyCodeWithoutActiveCodeDoesNotRecordFailedEvent(t *testing.T) {
+	const email = "verify-no-active-code@multica.ai"
+	const ip = "203.0.113.32"
+	ctx := context.Background()
+	ensureAuthAbuseEventTable(ctx, t)
+	cleanupAuthAbuseEvents(ctx, t, email)
+	cleanupAuthAbuseEventsByIP(ctx, t, ip)
+	if _, err := testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email); err != nil {
+		t.Fatalf("cleanup verification_code: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email); err != nil {
+			t.Fatalf("cleanup verification_code: %v", err)
+		}
+		cleanupAuthAbuseEvents(ctx, t, email)
+		cleanupAuthAbuseEventsByIP(ctx, t, ip)
+	})
+
+	var buf bytes.Buffer
+	json.NewEncoder(&buf).Encode(map[string]string{"email": email, "code": "000000"})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/auth/verify-code", &buf)
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = ip + ":1234"
+	testHandler.VerifyCode(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("VerifyCode without active code: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]string
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["error"] != "invalid or expired code" {
+		t.Fatalf("expected generic verify error, got %#v", resp)
+	}
+
+	var count int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM auth_abuse_event
+		WHERE event_type = 'verify_code_failed' AND identifier = $1 AND ip = $2
+	`, email, ip).Scan(&count); err != nil {
+		t.Fatalf("count verify_code_failed events: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no verify_code_failed events without active code, got %d", count)
+	}
+}
+
 func TestVerifyCodeBruteForceProtection(t *testing.T) {
 	const email = "bruteforce-test@multica.ai"
+	const ip = "203.0.113.44"
 	ctx := context.Background()
+	ensureAuthAbuseEventTable(ctx, t)
 
 	t.Cleanup(func() {
 		testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email)
+		cleanupAuthAbuseEvents(ctx, t, email)
+		cleanupAuthAbuseEventsByIP(ctx, t, ip)
 	})
 
 	// Send code
@@ -535,6 +792,7 @@ func TestVerifyCodeBruteForceProtection(t *testing.T) {
 	json.NewEncoder(&buf).Encode(map[string]string{"email": email})
 	req := httptest.NewRequest("POST", "/auth/send-code", &buf)
 	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = ip + ":1234"
 	testHandler.SendCode(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("SendCode: expected 200, got %d: %s", w.Code, w.Body.String())
@@ -553,6 +811,7 @@ func TestVerifyCodeBruteForceProtection(t *testing.T) {
 		json.NewEncoder(&buf).Encode(map[string]string{"email": email, "code": "000000"})
 		req = httptest.NewRequest("POST", "/auth/verify-code", &buf)
 		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = ip + ":1234"
 		testHandler.VerifyCode(w, req)
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("attempt %d: expected 400, got %d", i+1, w.Code)
@@ -565,18 +824,274 @@ func TestVerifyCodeBruteForceProtection(t *testing.T) {
 	json.NewEncoder(&buf).Encode(map[string]string{"email": email, "code": dbCode.Code})
 	req = httptest.NewRequest("POST", "/auth/verify-code", &buf)
 	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = ip + ":1234"
 	testHandler.VerifyCode(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("after lockout: expected 400, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
+func TestVerifyCodeBlocksIdentifierFailedWindowAcrossCodes(t *testing.T) {
+	const email = "verify-identifier-window@multica.ai"
+	ctx := context.Background()
+	ensureAuthAbuseEventTable(ctx, t)
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email)
+		cleanupAuthAbuseEvents(ctx, t, email)
+	})
+
+	for i := 0; i < 10; i++ {
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO auth_abuse_event (event_type, identifier, ip, created_at)
+			VALUES ('verify_code_failed', $1, '203.0.113.30', now() - interval '1 minute')
+		`, email); err != nil {
+			t.Fatalf("seed verify_code_failed: %v", err)
+		}
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO verification_code (email, code, expires_at)
+		VALUES ($1, '123456', now() + interval '10 minutes')
+	`, email); err != nil {
+		t.Fatalf("seed verification_code: %v", err)
+	}
+
+	var buf bytes.Buffer
+	json.NewEncoder(&buf).Encode(map[string]string{"email": email, "code": "123456"})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/auth/verify-code", &buf)
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "203.0.113.30:1234"
+	testHandler.VerifyCode(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("VerifyCode identifier failed window: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]string
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["error"] != "invalid or expired code" {
+		t.Fatalf("expected generic verify error, got %#v", resp)
+	}
+}
+
+func TestVerifyCodeBlocksIPFailedWindow(t *testing.T) {
+	const email = "verify-ip-window@multica.ai"
+	const ip = "203.0.113.31"
+	ctx := context.Background()
+	ensureAuthAbuseEventTable(ctx, t)
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email)
+		cleanupAuthAbuseEvents(ctx, t, email)
+		cleanupAuthAbuseEventsByIP(ctx, t, ip)
+	})
+
+	for i := 0; i < 25; i++ {
+		seedEmail := fmt.Sprintf("verify-ip-seed-%d@multica.ai", i)
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO auth_abuse_event (event_type, identifier, ip, created_at)
+			VALUES ('verify_code_failed', $1, $2, now() - interval '1 minute')
+		`, seedEmail, ip); err != nil {
+			t.Fatalf("seed verify_code_failed: %v", err)
+		}
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO verification_code (email, code, expires_at)
+		VALUES ($1, '123456', now() + interval '10 minutes')
+	`, email); err != nil {
+		t.Fatalf("seed verification_code: %v", err)
+	}
+
+	var buf bytes.Buffer
+	json.NewEncoder(&buf).Encode(map[string]string{"email": email, "code": "123456"})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/auth/verify-code", &buf)
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = ip + ":1234"
+	testHandler.VerifyCode(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("VerifyCode IP failed window: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]string
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["error"] != "invalid or expired code" {
+		t.Fatalf("expected generic verify error, got %#v", resp)
+	}
+}
+
+func TestSendCodeBlockedAttemptsKeepIdentifierWindowHot(t *testing.T) {
+	const email = "blocked-identifier-window@multica.ai"
+	const ip = "203.0.113.40"
+	ctx := context.Background()
+	ensureAuthAbuseEventTable(ctx, t)
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email)
+		cleanupAuthAbuseEvents(ctx, t, email)
+		cleanupAuthAbuseEventsByIP(ctx, t, ip)
+	})
+
+	for i := 0; i < 5; i++ {
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO auth_abuse_event (event_type, identifier, ip, created_at)
+			VALUES ('send_code_requested', $1, $2, now() - interval '20 minutes')
+		`, email, ip); err != nil {
+			t.Fatalf("seed stale send_code_requested: %v", err)
+		}
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO auth_abuse_event (event_type, identifier, ip, created_at)
+			VALUES ('send_code_blocked', $1, $2, now() - interval '1 minute')
+		`, email, ip); err != nil {
+			t.Fatalf("seed recent send_code_blocked: %v", err)
+		}
+	}
+
+	decision := testHandler.evaluateSendCodeGuard(ctx, email, ip, time.Now())
+	if decision.Allow {
+		t.Fatalf("expected identifier window to stay blocked after sustained blocked attempts")
+	}
+	if decision.Reason != "identifier_window" {
+		t.Fatalf("expected identifier_window reason, got %q", decision.Reason)
+	}
+}
+
+func TestVerifyCodeBlockedAttemptsKeepIdentifierWindowHot(t *testing.T) {
+	const email = "blocked-verify-window@multica.ai"
+	const ip = "203.0.113.41"
+	ctx := context.Background()
+	ensureAuthAbuseEventTable(ctx, t)
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email)
+		cleanupAuthAbuseEvents(ctx, t, email)
+		cleanupAuthAbuseEventsByIP(ctx, t, ip)
+	})
+
+	for i := 0; i < 10; i++ {
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO auth_abuse_event (event_type, identifier, ip, created_at)
+			VALUES ('verify_code_failed', $1, $2, now() - interval '20 minutes')
+		`, email, ip); err != nil {
+			t.Fatalf("seed stale verify_code_failed: %v", err)
+		}
+	}
+	for i := 0; i < 10; i++ {
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO auth_abuse_event (event_type, identifier, ip, created_at)
+			VALUES ('verify_code_blocked', $1, $2, now() - interval '1 minute')
+		`, email, ip); err != nil {
+			t.Fatalf("seed recent verify_code_blocked: %v", err)
+		}
+	}
+
+	decision := testHandler.evaluateVerifyCodeGuard(ctx, email, ip, time.Now())
+	if decision.Allow {
+		t.Fatalf("expected verify failed window to stay blocked after sustained blocked attempts")
+	}
+	if decision.Reason != "identifier_failed_window" {
+		t.Fatalf("expected identifier_failed_window reason, got %q", decision.Reason)
+	}
+}
+
+func TestSendCodeGuardAllowsRetryWhenRecentCodeExistsWithoutRequestedEvent(t *testing.T) {
+	const email = "unsent-code-does-not-cooldown@multica.ai"
+	const ip = "203.0.113.47"
+	ctx := context.Background()
+	ensureAuthAbuseEventTable(ctx, t)
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email)
+		cleanupAuthAbuseEvents(ctx, t, email)
+		cleanupAuthAbuseEventsByIP(ctx, t, ip)
+	})
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO verification_code (email, code, expires_at, created_at)
+		VALUES ($1, '123456', now() + interval '10 minutes', now())
+	`, email); err != nil {
+		t.Fatalf("seed verification_code: %v", err)
+	}
+
+	decision := testHandler.evaluateSendCodeGuard(ctx, email, ip, time.Now())
+	if !decision.Allow {
+		t.Fatalf("expected retry to remain allowed when only an unsent code row exists, got blocked with reason %q", decision.Reason)
+	}
+}
+
+func TestSendCodeEmailFailureDoesNotPoisonCooldownOrAbuseState(t *testing.T) {
+	const email = "sendcode-email-failure@multica.ai"
+	const ip = "203.0.113.46"
+	ctx := context.Background()
+	ensureAuthAbuseEventTable(ctx, t)
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email)
+		cleanupAuthAbuseEvents(ctx, t, email)
+		cleanupAuthAbuseEventsByIP(ctx, t, ip)
+	})
+
+	failingHandler := *testHandler
+	failingHandler.EmailService = service.NewEmailService()
+	setPrivateField(failingHandler.EmailService, "client", resend.NewCustomClient(&http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("smtp unavailable")
+	})}, "test-key"))
+	setPrivateField(failingHandler.EmailService, "fromEmail", "noreply@multica.ai")
+
+	var buf bytes.Buffer
+	json.NewEncoder(&buf).Encode(map[string]string{"email": email})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/auth/send-code", &buf)
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = ip + ":1234"
+	failingHandler.SendCode(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("SendCode email failure: expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+
+	decision := testHandler.evaluateSendCodeGuard(ctx, email, ip, time.Now())
+	if !decision.Allow {
+		t.Fatalf("expected retry to remain allowed after email failure, got blocked with reason %q", decision.Reason)
+	}
+
+	var codeCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM verification_code WHERE email = $1`, email).Scan(&codeCount); err != nil {
+		t.Fatalf("count verification_code: %v", err)
+	}
+	if codeCount != 0 {
+		t.Fatalf("expected no persisted verification code after email failure, got %d", codeCount)
+	}
+
+	var eventCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM auth_abuse_event
+		WHERE identifier = $1 AND ip = $2 AND event_type = 'send_code_requested'
+	`, email, ip).Scan(&eventCount); err != nil {
+		t.Fatalf("count auth_abuse_event: %v", err)
+	}
+	if eventCount != 0 {
+		t.Fatalf("expected no send_code_requested event after email failure, got %d", eventCount)
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func setPrivateField(target any, fieldName string, value any) {
+	v := reflect.ValueOf(target).Elem().FieldByName(fieldName)
+	reflect.NewAt(v.Type(), unsafe.Pointer(v.UnsafeAddr())).Elem().Set(reflect.ValueOf(value))
+}
+
 func TestVerifyCodeCreatesWorkspace(t *testing.T) {
 	const email = "workspace-verify-test@multica.ai"
+	const ip = "203.0.113.45"
 	ctx := context.Background()
+	ensureAuthAbuseEventTable(ctx, t)
 
 	t.Cleanup(func() {
 		testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email)
+		cleanupAuthAbuseEvents(ctx, t, email)
+		cleanupAuthAbuseEventsByIP(ctx, t, ip)
 		user, err := testHandler.Queries.GetUserByEmail(ctx, email)
 		if err == nil {
 			workspaces, listErr := testHandler.Queries.ListWorkspaces(ctx, user.ID)
@@ -595,6 +1110,7 @@ func TestVerifyCodeCreatesWorkspace(t *testing.T) {
 	json.NewEncoder(&buf).Encode(map[string]string{"email": email})
 	req := httptest.NewRequest("POST", "/auth/send-code", &buf)
 	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = ip + ":1234"
 	testHandler.SendCode(w, req)
 
 	// Read code from DB
@@ -609,6 +1125,7 @@ func TestVerifyCodeCreatesWorkspace(t *testing.T) {
 	json.NewEncoder(&buf).Encode(map[string]string{"email": email, "code": dbCode.Code})
 	req = httptest.NewRequest("POST", "/auth/verify-code", &buf)
 	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = ip + ":1234"
 	testHandler.VerifyCode(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("VerifyCode: expected 200, got %d: %s", w.Code, w.Body.String())
