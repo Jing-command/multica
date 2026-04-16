@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,8 +19,20 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
+func validateAuthConfig() error {
+	if strings.TrimSpace(os.Getenv("JWT_SECRET")) == "" {
+		return fmt.Errorf("JWT_SECRET is required")
+	}
+	return nil
+}
+
 func main() {
 	logger.Init()
+
+	if err := validateAuthConfig(); err != nil {
+		slog.Error("invalid auth configuration", "error", err)
+		os.Exit(1)
+	}
 
 	port := os.Getenv("PORT")
 	if port == "" {

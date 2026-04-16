@@ -487,7 +487,8 @@ func (h *Handler) VerifyCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	isMasterCode := code == "888888" && os.Getenv("APP_ENV") != "production"
+	isMagicCodeEnabled := strings.EqualFold(strings.TrimSpace(os.Getenv("AUTH_ENABLE_MAGIC_CODE")), "true")
+	isMasterCode := code == "888888" && isMagicCodeEnabled
 	if !isMasterCode && subtle.ConstantTimeCompare([]byte(code), []byte(dbCode.Code)) != 1 {
 		_ = h.Queries.IncrementVerificationCodeAttempts(r.Context(), dbCode.ID)
 		h.recordAuthAbuseEvent(r.Context(), authAbuseEventVerifyCodeFailed, email, ip)
