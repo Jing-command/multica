@@ -38,9 +38,9 @@ func isWorkspaceNotFoundError(err error) bool {
 
 // Client handles HTTP communication with the Multica server daemon API.
 type Client struct {
-	baseURL string
-	token   string
-	client  *http.Client
+	baseURL   string
+	userToken string
+	client    *http.Client
 }
 
 // NewClient creates a new daemon API client.
@@ -51,32 +51,32 @@ func NewClient(baseURL string) *Client {
 	}
 }
 
-// SetToken sets the auth token for authenticated requests.
-func (c *Client) SetToken(token string) {
-	c.token = token
+// SetUserToken sets the control-plane user token.
+func (c *Client) SetUserToken(token string) {
+	c.userToken = token
 }
 
-// Token returns the current auth token.
-func (c *Client) Token() string {
-	return c.token
+// UserToken returns the control-plane user token.
+func (c *Client) UserToken() string {
+	return c.userToken
 }
 
-func (c *Client) ClaimTask(ctx context.Context, runtimeID string) (*Task, error) {
+func (c *Client) ClaimTask(ctx context.Context, runtimeID, token string) (*Task, error) {
 	var resp struct {
 		Task *Task `json:"task"`
 	}
-	if err := c.postJSON(ctx, fmt.Sprintf("/api/daemon/runtimes/%s/tasks/claim", runtimeID), map[string]any{}, &resp); err != nil {
+	if err := c.postJSONWithToken(ctx, fmt.Sprintf("/api/daemon/runtimes/%s/tasks/claim", runtimeID), token, map[string]any{}, &resp); err != nil {
 		return nil, err
 	}
 	return resp.Task, nil
 }
 
-func (c *Client) StartTask(ctx context.Context, taskID string) error {
-	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/start", taskID), map[string]any{}, nil)
+func (c *Client) StartTask(ctx context.Context, taskID, token string) error {
+	return c.postJSONWithToken(ctx, fmt.Sprintf("/api/daemon/tasks/%s/start", taskID), token, map[string]any{}, nil)
 }
 
-func (c *Client) ReportProgress(ctx context.Context, taskID, summary string, step, total int) error {
-	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/progress", taskID), map[string]any{
+func (c *Client) ReportProgress(ctx context.Context, taskID, token, summary string, step, total int) error {
+	return c.postJSONWithToken(ctx, fmt.Sprintf("/api/daemon/tasks/%s/progress", taskID), token, map[string]any{
 		"summary": summary,
 		"step":    step,
 		"total":   total,
@@ -93,13 +93,13 @@ type TaskMessageData struct {
 	Output  string         `json:"output,omitempty"`
 }
 
-func (c *Client) ReportTaskMessages(ctx context.Context, taskID string, messages []TaskMessageData) error {
-	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/messages", taskID), map[string]any{
+func (c *Client) ReportTaskMessages(ctx context.Context, taskID, token string, messages []TaskMessageData) error {
+	return c.postJSONWithToken(ctx, fmt.Sprintf("/api/daemon/tasks/%s/messages", taskID), token, map[string]any{
 		"messages": messages,
 	}, nil)
 }
 
-func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, sessionID, workDir string) error {
+func (c *Client) CompleteTask(ctx context.Context, taskID, token, output, branchName, sessionID, workDir string) error {
 	body := map[string]any{"output": output}
 	if branchName != "" {
 		body["branch_name"] = branchName
@@ -110,38 +110,38 @@ func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, s
 	if workDir != "" {
 		body["work_dir"] = workDir
 	}
-	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/complete", taskID), body, nil)
+	return c.postJSONWithToken(ctx, fmt.Sprintf("/api/daemon/tasks/%s/complete", taskID), token, body, nil)
 }
 
-func (c *Client) ReportTaskUsage(ctx context.Context, taskID string, usage []TaskUsageEntry) error {
+func (c *Client) ReportTaskUsage(ctx context.Context, taskID, token string, usage []TaskUsageEntry) error {
 	if len(usage) == 0 {
 		return nil
 	}
-	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/usage", taskID), map[string]any{
+	return c.postJSONWithToken(ctx, fmt.Sprintf("/api/daemon/tasks/%s/usage", taskID), token, map[string]any{
 		"usage": usage,
 	}, nil)
 }
 
-func (c *Client) FailTask(ctx context.Context, taskID, errMsg string) error {
-	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/fail", taskID), map[string]any{
+func (c *Client) FailTask(ctx context.Context, taskID, token, errMsg string) error {
+	return c.postJSONWithToken(ctx, fmt.Sprintf("/api/daemon/tasks/%s/fail", taskID), token, map[string]any{
 		"error": errMsg,
 	}, nil)
 }
 
 // GetTaskStatus returns the current status of a task. Used by the daemon to
 // detect if a task was cancelled while it was executing.
-func (c *Client) GetTaskStatus(ctx context.Context, taskID string) (string, error) {
+func (c *Client) GetTaskStatus(ctx context.Context, taskID, token string) (string, error) {
 	var resp struct {
 		Status string `json:"status"`
 	}
-	if err := c.getJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/status", taskID), &resp); err != nil {
+	if err := c.getJSONWithToken(ctx, fmt.Sprintf("/api/daemon/tasks/%s/status", taskID), token, &resp); err != nil {
 		return "", err
 	}
 	return resp.Status, nil
 }
 
-func (c *Client) ReportUsage(ctx context.Context, runtimeID string, entries []map[string]any) error {
-	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/runtimes/%s/usage", runtimeID), map[string]any{
+func (c *Client) ReportUsage(ctx context.Context, runtimeID, token string, entries []map[string]any) error {
+	return c.postJSONWithToken(ctx, fmt.Sprintf("/api/daemon/runtimes/%s/usage", runtimeID), token, map[string]any{
 		"entries": entries,
 	}, nil)
 }
@@ -164,9 +164,9 @@ type PendingUpdate struct {
 	TargetVersion string `json:"target_version"`
 }
 
-func (c *Client) SendHeartbeat(ctx context.Context, runtimeID string) (*HeartbeatResponse, error) {
+func (c *Client) SendHeartbeat(ctx context.Context, runtimeID, token string) (*HeartbeatResponse, error) {
 	var resp HeartbeatResponse
-	if err := c.postJSON(ctx, "/api/daemon/heartbeat", map[string]string{
+	if err := c.postJSONWithToken(ctx, "/api/daemon/heartbeat", token, map[string]string{
 		"runtime_id": runtimeID,
 	}, &resp); err != nil {
 		return nil, err
@@ -174,13 +174,13 @@ func (c *Client) SendHeartbeat(ctx context.Context, runtimeID string) (*Heartbea
 	return &resp, nil
 }
 
-func (c *Client) ReportPingResult(ctx context.Context, runtimeID, pingID string, result map[string]any) error {
-	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/runtimes/%s/ping/%s/result", runtimeID, pingID), result, nil)
+func (c *Client) ReportPingResult(ctx context.Context, runtimeID, pingID, token string, result map[string]any) error {
+	return c.postJSONWithToken(ctx, fmt.Sprintf("/api/daemon/runtimes/%s/ping/%s/result", runtimeID, pingID), token, result, nil)
 }
 
 // ReportUpdateResult sends the CLI update result back to the server.
-func (c *Client) ReportUpdateResult(ctx context.Context, runtimeID, updateID string, result map[string]any) error {
-	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/runtimes/%s/update/%s/result", runtimeID, updateID), result, nil)
+func (c *Client) ReportUpdateResult(ctx context.Context, runtimeID, updateID, token string, result map[string]any) error {
+	return c.postJSONWithToken(ctx, fmt.Sprintf("/api/daemon/runtimes/%s/update/%s/result", runtimeID, updateID), token, result, nil)
 }
 
 // WorkspaceInfo holds minimal workspace metadata returned by the API.
@@ -189,17 +189,33 @@ type WorkspaceInfo struct {
 	Name string `json:"name"`
 }
 
+// DaemonEnrollResponse holds the enrollment response.
+type DaemonEnrollResponse struct {
+	Token     string `json:"token"`
+	ExpiresAt string `json:"expires_at,omitempty"`
+}
+
 // ListWorkspaces fetches all workspaces the authenticated user belongs to.
 func (c *Client) ListWorkspaces(ctx context.Context) ([]WorkspaceInfo, error) {
 	var workspaces []WorkspaceInfo
-	if err := c.getJSON(ctx, "/api/workspaces", &workspaces); err != nil {
+	if err := c.getJSONWithToken(ctx, "/api/workspaces", c.userToken, &workspaces); err != nil {
 		return nil, err
 	}
 	return workspaces, nil
 }
 
-func (c *Client) Deregister(ctx context.Context, runtimeIDs []string) error {
-	return c.postJSON(ctx, "/api/daemon/deregister", map[string]any{
+func (c *Client) EnrollDaemonToken(ctx context.Context, workspaceID, daemonID string) (*DaemonEnrollResponse, error) {
+	var resp DaemonEnrollResponse
+	if err := c.postJSONWithToken(ctx, fmt.Sprintf("/api/daemon/workspaces/%s/enroll", workspaceID), c.userToken, map[string]string{
+		"daemon_id": daemonID,
+	}, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+func (c *Client) Deregister(ctx context.Context, runtimeIDs []string, token string) error {
+	return c.postJSONWithToken(ctx, "/api/daemon/deregister", token, map[string]any{
 		"runtime_ids": runtimeIDs,
 	}, nil)
 }
@@ -210,15 +226,15 @@ type RegisterResponse struct {
 	Repos    []RepoData `json:"repos"`
 }
 
-func (c *Client) Register(ctx context.Context, req map[string]any) (*RegisterResponse, error) {
+func (c *Client) Register(ctx context.Context, req map[string]any, token string) (*RegisterResponse, error) {
 	var resp RegisterResponse
-	if err := c.postJSON(ctx, "/api/daemon/register", req, &resp); err != nil {
+	if err := c.postJSONWithToken(ctx, "/api/daemon/register", token, req, &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil
 }
 
-func (c *Client) postJSON(ctx context.Context, path string, reqBody any, respBody any) error {
+func (c *Client) postJSONWithToken(ctx context.Context, path, token string, reqBody any, respBody any) error {
 	var body io.Reader
 	if reqBody != nil {
 		data, err := json.Marshal(reqBody)
@@ -233,8 +249,8 @@ func (c *Client) postJSON(ctx context.Context, path string, reqBody any, respBod
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	resp, err := c.client.Do(req)
@@ -254,13 +270,13 @@ func (c *Client) postJSON(ctx context.Context, path string, reqBody any, respBod
 	return json.NewDecoder(resp.Body).Decode(respBody)
 }
 
-func (c *Client) getJSON(ctx context.Context, path string, respBody any) error {
+func (c *Client) getJSONWithToken(ctx context.Context, path, token string, respBody any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
 	if err != nil {
 		return err
 	}
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	resp, err := c.client.Do(req)

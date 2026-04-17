@@ -126,6 +126,38 @@ func (q *Queries) GetAgentRuntimeForWorkspace(ctx context.Context, arg GetAgentR
 	return i, err
 }
 
+const getAgentRuntimeForDaemonScope = `-- name: GetAgentRuntimeForDaemonScope :one
+SELECT id, workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, created_at, updated_at, owner_id FROM agent_runtime
+WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3
+`
+
+type GetAgentRuntimeForDaemonScopeParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	DaemonID    pgtype.Text `json:"daemon_id"`
+}
+
+func (q *Queries) GetAgentRuntimeForDaemonScope(ctx context.Context, arg GetAgentRuntimeForDaemonScopeParams) (AgentRuntime, error) {
+	row := q.db.QueryRow(ctx, getAgentRuntimeForDaemonScope, arg.ID, arg.WorkspaceID, arg.DaemonID)
+	var i AgentRuntime
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.DaemonID,
+		&i.Name,
+		&i.RuntimeMode,
+		&i.Provider,
+		&i.Status,
+		&i.DeviceInfo,
+		&i.Metadata,
+		&i.LastSeenAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OwnerID,
+	)
+	return i, err
+}
+
 const listAgentRuntimes = `-- name: ListAgentRuntimes :many
 SELECT id, workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, created_at, updated_at, owner_id FROM agent_runtime
 WHERE workspace_id = $1
@@ -255,6 +287,23 @@ func (q *Queries) SetAgentRuntimeOffline(ctx context.Context, id pgtype.UUID) er
 	return err
 }
 
+const setAgentRuntimeOfflineForDaemonScope = `-- name: SetAgentRuntimeOfflineForDaemonScope :exec
+UPDATE agent_runtime
+SET status = 'offline', updated_at = now()
+WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3
+`
+
+type SetAgentRuntimeOfflineForDaemonScopeParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	DaemonID    pgtype.Text `json:"daemon_id"`
+}
+
+func (q *Queries) SetAgentRuntimeOfflineForDaemonScope(ctx context.Context, arg SetAgentRuntimeOfflineForDaemonScopeParams) error {
+	_, err := q.db.Exec(ctx, setAgentRuntimeOfflineForDaemonScope, arg.ID, arg.WorkspaceID, arg.DaemonID)
+	return err
+}
+
 const updateAgentRuntimeHeartbeat = `-- name: UpdateAgentRuntimeHeartbeat :one
 UPDATE agent_runtime
 SET status = 'online', last_seen_at = now(), updated_at = now()
@@ -264,6 +313,40 @@ RETURNING id, workspace_id, daemon_id, name, runtime_mode, provider, status, dev
 
 func (q *Queries) UpdateAgentRuntimeHeartbeat(ctx context.Context, id pgtype.UUID) (AgentRuntime, error) {
 	row := q.db.QueryRow(ctx, updateAgentRuntimeHeartbeat, id)
+	var i AgentRuntime
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.DaemonID,
+		&i.Name,
+		&i.RuntimeMode,
+		&i.Provider,
+		&i.Status,
+		&i.DeviceInfo,
+		&i.Metadata,
+		&i.LastSeenAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OwnerID,
+	)
+	return i, err
+}
+
+const updateAgentRuntimeHeartbeatForDaemonScope = `-- name: UpdateAgentRuntimeHeartbeatForDaemonScope :one
+UPDATE agent_runtime
+SET status = 'online', last_seen_at = now(), updated_at = now()
+WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3
+RETURNING id, workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, created_at, updated_at, owner_id
+`
+
+type UpdateAgentRuntimeHeartbeatForDaemonScopeParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	DaemonID    pgtype.Text `json:"daemon_id"`
+}
+
+func (q *Queries) UpdateAgentRuntimeHeartbeatForDaemonScope(ctx context.Context, arg UpdateAgentRuntimeHeartbeatForDaemonScopeParams) (AgentRuntime, error) {
+	row := q.db.QueryRow(ctx, updateAgentRuntimeHeartbeatForDaemonScope, arg.ID, arg.WorkspaceID, arg.DaemonID)
 	var i AgentRuntime
 	err := row.Scan(
 		&i.ID,

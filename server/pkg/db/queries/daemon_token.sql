@@ -1,6 +1,6 @@
 -- name: CreateDaemonToken :one
-INSERT INTO daemon_token (token_hash, workspace_id, daemon_id, expires_at)
-VALUES ($1, $2, $3, $4)
+INSERT INTO daemon_token (token_hash, workspace_id, daemon_id, user_id, expires_at)
+VALUES ($1, $2, $3, $4, $5)
 RETURNING *;
 
 -- name: GetDaemonTokenByHash :one

@@ -91,6 +91,7 @@ func ensureOrchestratorAgent(ctx context.Context, q *db.Queries, workspaceID, ru
 		Name:        orchestratorName,
 	})
 	if err == nil {
+		syncOrchestratorOwnerIfNeeded(ctx, q, existing, ownerID)
 		rebindOrchestratorRuntimeIfNeeded(ctx, q, existing, runtimeID)
 		return
 	}
@@ -111,6 +112,7 @@ func ensureOrchestratorAgent(ctx context.Context, q *db.Queries, workspaceID, ru
 	if err != nil {
 		if isUniqueViolation(err) {
 			if existing, getErr := q.GetAgentByName(ctx, db.GetAgentByNameParams{WorkspaceID: workspaceID, Name: orchestratorName}); getErr == nil {
+				syncOrchestratorOwnerIfNeeded(ctx, q, existing, ownerID)
 				rebindOrchestratorRuntimeIfNeeded(ctx, q, existing, runtimeID)
 				return
 			}
@@ -124,6 +126,30 @@ func ensureOrchestratorAgent(ctx context.Context, q *db.Queries, workspaceID, ru
 	slog.Info("orchestrator agent created",
 		"agent_id", uuidToString(agent.ID),
 		"workspace_id", uuidToString(workspaceID),
+	)
+}
+
+func syncOrchestratorOwnerIfNeeded(ctx context.Context, q *db.Queries, existing db.Agent, ownerID pgtype.UUID) {
+	if existing.OwnerID.Valid && existing.OwnerID == ownerID {
+		return
+	}
+
+	updated, err := q.UpdateAgentOwner(ctx, db.UpdateAgentOwnerParams{
+		ID:      existing.ID,
+		OwnerID: ownerID,
+	})
+	if err != nil {
+		slog.Warn("failed to update orchestrator owner",
+			"agent_id", uuidToString(existing.ID),
+			"new_owner_id", uuidToString(ownerID),
+			"error", err,
+		)
+		return
+	}
+	existing.OwnerID = updated.OwnerID
+	slog.Info("orchestrator owner updated",
+		"agent_id", uuidToString(existing.ID),
+		"new_owner_id", uuidToString(updated.OwnerID),
 	)
 }
 

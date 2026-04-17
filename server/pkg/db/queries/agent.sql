@@ -44,6 +44,13 @@ UPDATE agent SET
 WHERE id = $1
 RETURNING *;
 
+-- name: UpdateAgentOwner :one
+UPDATE agent SET
+    owner_id = $2,
+    updated_at = now()
+WHERE id = $1
+RETURNING *;
+
 -- name: ArchiveAgent :one
 UPDATE agent SET archived_at = now(), archived_by = $2, updated_at = now()
 WHERE id = $1
@@ -77,6 +84,11 @@ WHERE agent_id = $1 AND status IN ('queued', 'dispatched', 'running');
 -- name: GetAgentTask :one
 SELECT * FROM agent_task_queue
 WHERE id = $1;
+
+-- name: GetAgentTaskForDaemonScope :one
+SELECT atq.* FROM agent_task_queue atq
+JOIN agent_runtime ar ON ar.id = atq.runtime_id
+WHERE atq.id = $1 AND ar.workspace_id = $2 AND ar.daemon_id = $3;
 
 -- name: ClaimAgentTask :one
 -- Claims the next queued task for an agent, enforcing per-(issue, agent) serialization:
@@ -174,6 +186,13 @@ WHERE agent_id = $1 AND status IN ('queued', 'dispatched');
 SELECT * FROM agent_task_queue
 WHERE runtime_id = $1 AND status IN ('queued', 'dispatched')
 ORDER BY priority DESC, created_at ASC;
+
+-- name: ListPendingTasksByRuntimeForDaemonScope :many
+SELECT atq.* FROM agent_task_queue atq
+JOIN agent_runtime ar ON ar.id = atq.runtime_id
+WHERE atq.runtime_id = $1 AND atq.status IN ('queued', 'dispatched')
+  AND ar.workspace_id = $2 AND ar.daemon_id = $3
+ORDER BY atq.priority DESC, atq.created_at ASC;
 
 -- name: ListActiveTasksByIssue :many
 SELECT * FROM agent_task_queue

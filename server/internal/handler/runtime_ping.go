@@ -179,6 +179,15 @@ func (h *Handler) GetPing(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ReportPingResult(w http.ResponseWriter, r *http.Request) {
 	pingID := chi.URLParam(r, "pingId")
 
+	ping := h.PingStore.Get(pingID)
+	if ping == nil {
+		writeError(w, http.StatusNotFound, "ping not found")
+		return
+	}
+	if _, ok := h.requireDaemonRuntimeScope(w, r, ping.RuntimeID); !ok {
+		return
+	}
+
 	var req struct {
 		Status     string `json:"status"` // "completed" or "failed"
 		Output     string `json:"output"`

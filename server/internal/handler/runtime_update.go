@@ -193,6 +193,15 @@ func (h *Handler) GetUpdate(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ReportUpdateResult(w http.ResponseWriter, r *http.Request) {
 	updateID := chi.URLParam(r, "updateId")
 
+	update := h.UpdateStore.Get(updateID)
+	if update == nil {
+		writeError(w, http.StatusNotFound, "update not found")
+		return
+	}
+	if _, ok := h.requireDaemonRuntimeScope(w, r, update.RuntimeID); !ok {
+		return
+	}
+
 	var req struct {
 		Status string `json:"status"` // "running", "completed", or "failed"
 		Output string `json:"output"`

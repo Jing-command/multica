@@ -7,9 +7,12 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/auth"
+	"github.com/multica-ai/multica/server/internal/middleware"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 	"github.com/multica-ai/multica/server/pkg/redact"
@@ -18,6 +21,14 @@ import (
 // ---------------------------------------------------------------------------
 // Daemon Registration & Heartbeat
 // ---------------------------------------------------------------------------
+
+type DaemonEnrollRequest struct {
+	DaemonID string `json:"daemon_id"`
+}
+
+type DaemonEnrollResponse struct {
+	Token string `json:"token"`
+}
 
 type DaemonRegisterRequest struct {
 	WorkspaceID string `json:"workspace_id"`
@@ -32,6 +43,52 @@ type DaemonRegisterRequest struct {
 	} `json:"runtimes"`
 }
 
+func (h *Handler) DaemonEnroll(w http.ResponseWriter, r *http.Request) {
+	workspaceID := chi.URLParam(r, "workspaceId")
+	member, ok := h.requireWorkspaceMember(w, r, workspaceID, "workspace not found")
+	if !ok {
+		return
+	}
+
+	var req DaemonEnrollRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.DaemonID = strings.TrimSpace(req.DaemonID)
+	if req.DaemonID == "" {
+		writeError(w, http.StatusBadRequest, "daemon_id is required")
+		return
+	}
+
+	rawToken, err := auth.GenerateDaemonToken()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to generate daemon token")
+		return
+	}
+	if err := h.Queries.DeleteDaemonTokensByWorkspaceAndDaemon(r.Context(), db.DeleteDaemonTokensByWorkspaceAndDaemonParams{
+		WorkspaceID: parseUUID(workspaceID),
+		DaemonID:    req.DaemonID,
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to rotate daemon token")
+		return
+	}
+	createdToken, err := h.Queries.CreateDaemonToken(r.Context(), db.CreateDaemonTokenParams{
+		TokenHash:   auth.HashToken(rawToken),
+		WorkspaceID: parseUUID(workspaceID),
+		DaemonID:    req.DaemonID,
+		UserID:      member.UserID,
+		ExpiresAt:   pgtype.Timestamptz{Time: time.Now().Add(30 * 24 * time.Hour), Valid: true},
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to persist daemon token")
+		return
+	}
+
+	slog.Info("daemon enrolled", "workspace_id", workspaceID, "daemon_id", req.DaemonID, "user_id", uuidToString(createdToken.UserID))
+	writeJSON(w, http.StatusOK, DaemonEnrollResponse{Token: rawToken})
+}
+
 func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 	var req DaemonRegisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -39,16 +96,21 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req.WorkspaceID = strings.TrimSpace(req.WorkspaceID)
-	req.DaemonID = strings.TrimSpace(req.DaemonID)
+	authWorkspaceID := middleware.DaemonWorkspaceIDFromContext(r.Context())
+	authDaemonID := strings.TrimSpace(middleware.DaemonIDFromContext(r.Context()))
+	authUserID := strings.TrimSpace(middleware.DaemonUserIDFromContext(r.Context()))
 	req.DeviceName = strings.TrimSpace(req.DeviceName)
 
-	if req.DaemonID == "" {
-		writeError(w, http.StatusBadRequest, "daemon_id is required")
+	if authDaemonID == "" {
+		writeError(w, http.StatusUnauthorized, "invalid daemon token")
 		return
 	}
-	if req.WorkspaceID == "" {
-		writeError(w, http.StatusBadRequest, "workspace_id is required")
+	if authWorkspaceID == "" {
+		writeError(w, http.StatusUnauthorized, "invalid daemon token")
+		return
+	}
+	if authUserID == "" {
+		writeError(w, http.StatusUnauthorized, "invalid daemon token")
 		return
 	}
 	if len(req.Runtimes) == 0 {
@@ -56,13 +118,9 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify the caller is a member of the target workspace.
-	member, ok := h.requireWorkspaceMember(w, r, req.WorkspaceID, "workspace not found")
-	if !ok {
-		return
-	}
+	ownerID := parseUUID(authUserID)
 
-	ws, err := h.Queries.GetWorkspace(r.Context(), parseUUID(req.WorkspaceID))
+	ws, err := h.Queries.GetWorkspace(r.Context(), parseUUID(authWorkspaceID))
 	if err != nil {
 		writeError(w, http.StatusNotFound, "workspace not found")
 		return
@@ -97,15 +155,15 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 		})
 
 		registered, err := h.Queries.UpsertAgentRuntime(r.Context(), db.UpsertAgentRuntimeParams{
-			WorkspaceID: parseUUID(req.WorkspaceID),
-			DaemonID:    strToText(req.DaemonID),
+			WorkspaceID: parseUUID(authWorkspaceID),
+			DaemonID:    strToText(authDaemonID),
 			Name:        name,
 			RuntimeMode: "local",
 			Provider:    provider,
 			Status:      status,
 			DeviceInfo:  deviceInfo,
 			Metadata:    metadata,
-			OwnerID:     member.UserID,
+			OwnerID:     ownerID,
 		})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to register runtime: "+err.Error())
@@ -114,15 +172,15 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 		resp = append(resp, runtimeToResponse(registered))
 	}
 
-	slog.Info("daemon registered", "workspace_id", req.WorkspaceID, "daemon_id", req.DaemonID, "runtimes_count", len(resp))
+	slog.Info("daemon registered", "workspace_id", authWorkspaceID, "daemon_id", authDaemonID, "runtimes_count", len(resp))
 
 	// Ensure the built-in Orchestrator agent exists for this workspace.
 	if len(resp) > 0 {
 		preferredRuntime := selectPreferredOrchestratorRuntimeResponses(resp)
-		ensureOrchestratorAgent(r.Context(), h.Queries, parseUUID(req.WorkspaceID), parseUUID(preferredRuntime.ID), member.UserID)
+		ensureOrchestratorAgent(r.Context(), h.Queries, parseUUID(authWorkspaceID), parseUUID(preferredRuntime.ID), ownerID)
 	}
 
-	h.publish(protocol.EventDaemonRegister, req.WorkspaceID, "system", "", map[string]any{
+	h.publish(protocol.EventDaemonRegister, authWorkspaceID, "system", "", map[string]any{
 		"runtimes": resp,
 	})
 
@@ -153,22 +211,21 @@ func (h *Handler) DaemonDeregister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Track affected workspaces for WS notifications.
 	affectedWorkspaces := make(map[string]bool)
 
 	for _, rid := range req.RuntimeIDs {
-		// Look up the runtime to find its workspace.
-		rt, err := h.Queries.GetAgentRuntime(r.Context(), parseUUID(rid))
-		if err != nil {
-			slog.Warn("deregister: runtime not found", "runtime_id", rid, "error", err)
-			continue
+		rt, ok := h.requireDaemonRuntimeScope(w, r, rid)
+		if !ok {
+			return
 		}
-
-		if err := h.Queries.SetAgentRuntimeOffline(r.Context(), parseUUID(rid)); err != nil {
+		if err := h.Queries.SetAgentRuntimeOfflineForDaemonScope(r.Context(), db.SetAgentRuntimeOfflineForDaemonScopeParams{
+			ID:          parseUUID(rid),
+			WorkspaceID: rt.WorkspaceID,
+			DaemonID:    rt.DaemonID,
+		}); err != nil {
 			slog.Warn("deregister: failed to set offline", "runtime_id", rid, "error", err)
 			continue
 		}
-
 		affectedWorkspaces[uuidToString(rt.WorkspaceID)] = true
 	}
 
@@ -199,7 +256,16 @@ func (h *Handler) DaemonHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := h.Queries.UpdateAgentRuntimeHeartbeat(r.Context(), parseUUID(req.RuntimeID))
+	rt, ok := h.requireDaemonRuntimeScope(w, r, req.RuntimeID)
+	if !ok {
+		return
+	}
+
+	_, err := h.Queries.UpdateAgentRuntimeHeartbeatForDaemonScope(r.Context(), db.UpdateAgentRuntimeHeartbeatForDaemonScopeParams{
+		ID:          parseUUID(req.RuntimeID),
+		WorkspaceID: rt.WorkspaceID,
+		DaemonID:    rt.DaemonID,
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "heartbeat failed")
 		return
@@ -229,6 +295,9 @@ func (h *Handler) DaemonHeartbeat(w http.ResponseWriter, r *http.Request) {
 // The response includes the agent's name and skills, fetched fresh from the DB.
 func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 	runtimeID := chi.URLParam(r, "runtimeId")
+	if _, ok := h.requireDaemonRuntimeScope(w, r, runtimeID); !ok {
+		return
+	}
 
 	task, err := h.TaskService.ClaimTaskForRuntime(r.Context(), parseUUID(runtimeID))
 	if err != nil {
@@ -284,8 +353,20 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 // ListPendingTasksByRuntime returns queued/dispatched tasks for a runtime.
 func (h *Handler) ListPendingTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 	runtimeID := chi.URLParam(r, "runtimeId")
+	workspaceID, daemonID, ok := daemonScopeFromRequest(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "invalid daemon token")
+		return
+	}
+	if _, ok := h.requireDaemonRuntimeScope(w, r, runtimeID); !ok {
+		return
+	}
 
-	tasks, err := h.Queries.ListPendingTasksByRuntime(r.Context(), parseUUID(runtimeID))
+	tasks, err := h.Queries.ListPendingTasksByRuntimeForDaemonScope(r.Context(), db.ListPendingTasksByRuntimeForDaemonScopeParams{
+		RuntimeID:    parseUUID(runtimeID),
+		WorkspaceID: parseUUID(workspaceID),
+		DaemonID:    strToText(daemonID),
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list pending tasks")
 		return
@@ -306,6 +387,9 @@ func (h *Handler) ListPendingTasksByRuntime(w http.ResponseWriter, r *http.Reque
 // StartTask marks a dispatched task as running.
 func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
+	if _, ok := h.requireDaemonTaskScope(w, r, taskID); !ok {
+		return
+	}
 
 	task, err := h.TaskService.StartTask(r.Context(), parseUUID(taskID))
 	if err != nil {
@@ -328,19 +412,20 @@ type TaskProgressRequest struct {
 func (h *Handler) ReportTaskProgress(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
 
+	task, ok := h.requireDaemonTaskScope(w, r, taskID)
+	if !ok {
+		return
+	}
+
 	var req TaskProgressRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	// Look up task to get workspace ID via the associated issue.
 	workspaceID := ""
-	task, err := h.Queries.GetAgentTask(r.Context(), parseUUID(taskID))
-	if err == nil {
-		if issue, err := h.Queries.GetIssue(r.Context(), task.IssueID); err == nil {
-			workspaceID = uuidToString(issue.WorkspaceID)
-		}
+	if issue, err := h.Queries.GetIssue(r.Context(), task.IssueID); err == nil {
+		workspaceID = uuidToString(issue.WorkspaceID)
 	}
 
 	h.TaskService.ReportProgress(r.Context(), taskID, workspaceID, req.Summary, req.Step, req.Total)
@@ -357,6 +442,9 @@ type TaskCompleteRequest struct {
 
 func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
+	if _, ok := h.requireDaemonTaskScope(w, r, taskID); !ok {
+		return
+	}
 
 	var req TaskCompleteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -389,6 +477,9 @@ type TaskUsagePayload struct {
 
 func (h *Handler) ReportTaskUsage(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
+	if _, ok := h.requireDaemonTaskScope(w, r, taskID); !ok {
+		return
+	}
 
 	var req struct {
 		Usage []TaskUsagePayload `json:"usage"`
@@ -419,9 +510,8 @@ func (h *Handler) ReportTaskUsage(w http.ResponseWriter, r *http.Request) {
 // Used by the daemon to check whether a task was cancelled mid-execution.
 func (h *Handler) GetTaskStatus(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
-	task, err := h.Queries.GetAgentTask(r.Context(), parseUUID(taskID))
-	if err != nil {
-		writeError(w, http.StatusNotFound, "task not found")
+	task, ok := h.requireDaemonTaskScope(w, r, taskID)
+	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": task.Status})
@@ -434,6 +524,9 @@ type TaskFailRequest struct {
 
 func (h *Handler) FailTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
+	if _, ok := h.requireDaemonTaskScope(w, r, taskID); !ok {
+		return
+	}
 
 	var req TaskFailRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -473,6 +566,11 @@ type TaskMessageBatchRequest struct {
 func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
 
+	task, ok := h.requireDaemonTaskScope(w, r, taskID)
+	if !ok {
+		return
+	}
+
 	var req TaskMessageBatchRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -480,12 +578,6 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Messages) == 0 {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-		return
-	}
-
-	task, err := h.Queries.GetAgentTask(r.Context(), parseUUID(taskID))
-	if err != nil {
-		writeError(w, http.StatusNotFound, "task not found")
 		return
 	}
 
@@ -534,26 +626,39 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 // ListTaskMessages returns the persisted messages for a task (for catch-up after reconnect).
 func (h *Handler) ListTaskMessages(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
-
-	task, err := h.Queries.GetAgentTask(r.Context(), parseUUID(taskID))
-	if err != nil {
-		writeError(w, http.StatusNotFound, "task not found")
+	workspaceID, daemonID, ok := daemonScopeFromRequest(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "invalid daemon token")
 		return
 	}
 
-	var messages []db.TaskMessage
+	task, ok := h.requireDaemonTaskScope(w, r, taskID)
+	if !ok {
+		return
+	}
+
+	var (
+		messages []db.TaskMessage
+		err      error
+	)
 	if sinceStr := r.URL.Query().Get("since"); sinceStr != "" {
 		sinceSeq, parseErr := strconv.Atoi(sinceStr)
 		if parseErr != nil {
 			writeError(w, http.StatusBadRequest, "invalid since parameter")
 			return
 		}
-		messages, err = h.Queries.ListTaskMessagesSince(r.Context(), db.ListTaskMessagesSinceParams{
-			TaskID: parseUUID(taskID),
-			Seq:    int32(sinceSeq),
+		messages, err = h.Queries.ListTaskMessagesSinceForDaemonScope(r.Context(), db.ListTaskMessagesSinceForDaemonScopeParams{
+			TaskID:      parseUUID(taskID),
+			Seq:         int32(sinceSeq),
+			WorkspaceID: parseUUID(workspaceID),
+			DaemonID:    strToText(daemonID),
 		})
 	} else {
-		messages, err = h.Queries.ListTaskMessages(r.Context(), parseUUID(taskID))
+		messages, err = h.Queries.ListTaskMessagesForDaemonScope(r.Context(), db.ListTaskMessagesForDaemonScopeParams{
+			TaskID:      parseUUID(taskID),
+			WorkspaceID: parseUUID(workspaceID),
+			DaemonID:    strToText(daemonID),
+		})
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list task messages")

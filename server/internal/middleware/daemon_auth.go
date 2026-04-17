@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/multica-ai/multica/server/internal/auth"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -17,6 +16,7 @@ type daemonContextKey int
 const (
 	ctxKeyDaemonWorkspaceID daemonContextKey = iota
 	ctxKeyDaemonID
+	ctxKeyDaemonUserID
 )
 
 // DaemonWorkspaceIDFromContext returns the workspace ID set by DaemonAuth middleware.
@@ -31,9 +31,13 @@ func DaemonIDFromContext(ctx context.Context) string {
 	return id
 }
 
-// DaemonAuth validates daemon auth tokens (mdt_ prefix) or falls back to
-// JWT/PAT validation for backward compatibility with daemons that
-// authenticate via user tokens.
+// DaemonUserIDFromContext returns the enroll user ID set by DaemonAuth middleware.
+func DaemonUserIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(ctxKeyDaemonUserID).(string)
+	return id
+}
+
+// DaemonAuth validates only daemon auth tokens with the mdt_ prefix.
 func DaemonAuth(queries *db.Queries) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -50,63 +54,27 @@ func DaemonAuth(queries *db.Queries) func(http.Handler) http.Handler {
 				writeError(w, http.StatusUnauthorized, "invalid authorization format")
 				return
 			}
-
-			// Daemon token: "mdt_" prefix.
-			if strings.HasPrefix(tokenString, "mdt_") {
-				hash := auth.HashToken(tokenString)
-				dt, err := queries.GetDaemonTokenByHash(r.Context(), hash)
-				if err != nil {
-					slog.Warn("daemon_auth: invalid daemon token", "path", r.URL.Path, "error", err)
-					writeError(w, http.StatusUnauthorized, "invalid daemon token")
-					return
-				}
-
-				ctx := context.WithValue(r.Context(), ctxKeyDaemonWorkspaceID, uuidToString(dt.WorkspaceID))
-				ctx = context.WithValue(ctx, ctxKeyDaemonID, dt.DaemonID)
-				next.ServeHTTP(w, r.WithContext(ctx))
+			if !strings.HasPrefix(tokenString, "mdt_") {
+				writeError(w, http.StatusUnauthorized, "invalid daemon token")
+				return
+			}
+			if queries == nil {
+				writeError(w, http.StatusUnauthorized, "invalid daemon token")
 				return
 			}
 
-			// Fallback: PAT tokens ("mul_" prefix).
-			if strings.HasPrefix(tokenString, "mul_") {
-				hash := auth.HashToken(tokenString)
-				pat, err := queries.GetPersonalAccessTokenByHash(r.Context(), hash)
-				if err != nil {
-					slog.Warn("daemon_auth: invalid PAT", "path", r.URL.Path, "error", err)
-					writeError(w, http.StatusUnauthorized, "invalid token")
-					return
-				}
-				r.Header.Set("X-User-ID", uuidToString(pat.UserID))
-				go queries.UpdatePersonalAccessTokenLastUsed(context.Background(), pat.ID)
-				next.ServeHTTP(w, r)
+			hash := auth.HashToken(tokenString)
+			dt, err := queries.GetDaemonTokenByHash(r.Context(), hash)
+			if err != nil {
+				slog.Warn("daemon_auth: invalid daemon token", "path", r.URL.Path, "error", err)
+				writeError(w, http.StatusUnauthorized, "invalid daemon token")
 				return
 			}
 
-			// Fallback: JWT tokens.
-			token, err := jwt.Parse(tokenString, func(token *jwt.Token) (any, error) {
-				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-					return nil, jwt.ErrSignatureInvalid
-				}
-				return auth.JWTSecret(), nil
-			})
-			if err != nil || !token.Valid {
-				slog.Warn("daemon_auth: invalid token", "path", r.URL.Path, "error", err)
-				writeError(w, http.StatusUnauthorized, "invalid token")
-				return
-			}
-
-			claims, ok := token.Claims.(jwt.MapClaims)
-			if !ok {
-				writeError(w, http.StatusUnauthorized, "invalid claims")
-				return
-			}
-			sub, ok := claims["sub"].(string)
-			if !ok || strings.TrimSpace(sub) == "" {
-				writeError(w, http.StatusUnauthorized, "invalid claims")
-				return
-			}
-			r.Header.Set("X-User-ID", sub)
-			next.ServeHTTP(w, r)
+			ctx := context.WithValue(r.Context(), ctxKeyDaemonWorkspaceID, uuidToString(dt.WorkspaceID))
+			ctx = context.WithValue(ctx, ctxKeyDaemonID, dt.DaemonID)
+			ctx = context.WithValue(ctx, ctxKeyDaemonUserID, uuidToString(dt.UserID))
+			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
@@ -108,6 +109,61 @@ func isUniqueViolation(err error) bool {
 
 func requestUserID(r *http.Request) string {
 	return r.Header.Get("X-User-ID")
+}
+
+func daemonScopeFromRequest(r *http.Request) (string, string, bool) {
+	workspaceID := strings.TrimSpace(middleware.DaemonWorkspaceIDFromContext(r.Context()))
+	daemonID := strings.TrimSpace(middleware.DaemonIDFromContext(r.Context()))
+	if workspaceID == "" || daemonID == "" {
+		return "", "", false
+	}
+	return workspaceID, daemonID, true
+}
+
+func (h *Handler) requireDaemonRuntimeScope(w http.ResponseWriter, r *http.Request, runtimeID string) (*db.AgentRuntime, bool) {
+	workspaceID, daemonID, ok := daemonScopeFromRequest(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "invalid daemon token")
+		return nil, false
+	}
+	runtime, err := h.Queries.GetAgentRuntimeForDaemonScope(r.Context(), db.GetAgentRuntimeForDaemonScopeParams{
+		ID:          parseUUID(runtimeID),
+		WorkspaceID: parseUUID(workspaceID),
+		DaemonID:    strToText(daemonID),
+	})
+	if err == nil {
+		return &runtime, true
+	}
+	if isNotFound(err) {
+		writeError(w, http.StatusForbidden, "runtime not owned by daemon")
+		return nil, false
+	}
+	slog.Error("failed to validate runtime scope", "runtime_id", runtimeID, "workspace_id", workspaceID, "daemon_id", daemonID, "error", err)
+	writeError(w, http.StatusInternalServerError, "failed to validate runtime scope")
+	return nil, false
+}
+
+func (h *Handler) requireDaemonTaskScope(w http.ResponseWriter, r *http.Request, taskID string) (*db.AgentTaskQueue, bool) {
+	workspaceID, daemonID, ok := daemonScopeFromRequest(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "invalid daemon token")
+		return nil, false
+	}
+	task, err := h.Queries.GetAgentTaskForDaemonScope(r.Context(), db.GetAgentTaskForDaemonScopeParams{
+		ID:          parseUUID(taskID),
+		WorkspaceID: parseUUID(workspaceID),
+		DaemonID:    strToText(daemonID),
+	})
+	if err == nil {
+		return &task, true
+	}
+	if isNotFound(err) {
+		writeError(w, http.StatusForbidden, "task not owned by daemon")
+		return nil, false
+	}
+	slog.Error("failed to validate task scope", "task_id", taskID, "workspace_id", workspaceID, "daemon_id", daemonID, "error", err)
+	writeError(w, http.StatusInternalServerError, "failed to validate task scope")
+	return nil, false
 }
 
 // resolveActor determines whether the request is from an agent or a human member.

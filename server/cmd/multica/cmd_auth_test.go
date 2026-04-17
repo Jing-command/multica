@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+
+	"github.com/multica-ai/multica/server/internal/cli"
 )
 
 // testCmd returns a minimal cobra.Command with the --profile persistent flag
@@ -64,4 +66,99 @@ func TestNormalizeAPIBaseURL(t *testing.T) {
 			t.Fatalf("normalizeAPIBaseURL() = %q, want %q", got, "://bad-url")
 		}
 	})
+}
+
+func TestRunAuthLogoutClearsDaemonAuthWithoutUserToken(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cmd := testCmd()
+
+	cfg := cli.CLIConfig{
+		DaemonAuth: map[string]cli.DaemonAuthConfig{
+			"ws-1": {
+				DaemonID:  "daemon-1",
+				Token:     "mdt_token_1",
+				ExpiresAt: "2026-05-01T00:00:00Z",
+			},
+		},
+	}
+	if err := cli.SaveCLIConfig(cfg); err != nil {
+		t.Fatalf("SaveCLIConfig() error = %v", err)
+	}
+
+	if err := runAuthLogout(cmd, nil); err != nil {
+		t.Fatalf("runAuthLogout() error = %v", err)
+	}
+
+	stored, err := cli.LoadCLIConfig()
+	if err != nil {
+		t.Fatalf("LoadCLIConfig() error = %v", err)
+	}
+	if stored.UserToken != "" {
+		t.Fatalf("UserToken = %q, want empty", stored.UserToken)
+	}
+	if len(stored.DaemonAuth) != 0 {
+		t.Fatalf("DaemonAuth = %+v, want empty", stored.DaemonAuth)
+	}
+}
+
+func TestPersistLoginClearsWorkspaceState(t *testing.T) {
+	cfg := cli.CLIConfig{
+		WorkspaceID:       "ws-1",
+		WatchedWorkspaces: []cli.WatchedWorkspace{{ID: "ws-1", Name: "Workspace 1"}},
+		DaemonAuth: map[string]cli.DaemonAuthConfig{
+			"ws-1": {DaemonID: "daemon-1", Token: "mdt_token_1", ExpiresAt: "2026-05-01T00:00:00Z"},
+		},
+	}
+
+	persistLogin(&cfg, "mul_user_token", "http://localhost:8080", "http://localhost:3000")
+
+	if cfg.UserToken != "mul_user_token" {
+		t.Fatalf("UserToken = %q, want %q", cfg.UserToken, "mul_user_token")
+	}
+	if cfg.WorkspaceID != "" {
+		t.Fatalf("WorkspaceID = %q, want empty", cfg.WorkspaceID)
+	}
+	if len(cfg.WatchedWorkspaces) != 0 {
+		t.Fatalf("WatchedWorkspaces = %+v, want empty", cfg.WatchedWorkspaces)
+	}
+	if len(cfg.DaemonAuth) != 0 {
+		t.Fatalf("DaemonAuth = %+v, want empty", cfg.DaemonAuth)
+	}
+}
+
+func TestUpdateCLIConfigForProfileWithPersistLoginClearsWorkspaceState(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := cli.SaveCLIConfig(cli.CLIConfig{
+		WorkspaceID:       "ws-1",
+		WatchedWorkspaces: []cli.WatchedWorkspace{{ID: "ws-1", Name: "Workspace 1"}},
+		DaemonAuth: map[string]cli.DaemonAuthConfig{
+			"ws-1": {DaemonID: "daemon-1", Token: "mdt_token_1", ExpiresAt: "2026-05-01T00:00:00Z"},
+		},
+	}); err != nil {
+		t.Fatalf("SaveCLIConfig() error = %v", err)
+	}
+
+	if err := cli.UpdateCLIConfigForProfile("", func(cfg *cli.CLIConfig) error {
+		persistLogin(cfg, "mul_user_token", "http://localhost:8080", "http://localhost:3000")
+		return nil
+	}); err != nil {
+		t.Fatalf("UpdateCLIConfigForProfile() error = %v", err)
+	}
+
+	stored, err := cli.LoadCLIConfig()
+	if err != nil {
+		t.Fatalf("LoadCLIConfig() error = %v", err)
+	}
+	if stored.UserToken != "mul_user_token" {
+		t.Fatalf("UserToken = %q, want %q", stored.UserToken, "mul_user_token")
+	}
+	if stored.WorkspaceID != "" {
+		t.Fatalf("WorkspaceID = %q, want empty", stored.WorkspaceID)
+	}
+	if len(stored.WatchedWorkspaces) != 0 {
+		t.Fatalf("WatchedWorkspaces = %+v, want empty", stored.WatchedWorkspaces)
+	}
+	if len(stored.DaemonAuth) != 0 {
+		t.Fatalf("DaemonAuth = %+v, want empty", stored.DaemonAuth)
+	}
 }
