@@ -74,9 +74,10 @@ func claudeLogRoots() []string {
 
 // claudeLine represents the subset of a Claude JSONL line we care about.
 type claudeLine struct {
-	Type      string    `json:"type"`
-	Timestamp string    `json:"timestamp"`
-	RequestID string    `json:"requestId"`
+	Type      string `json:"type"`
+	Timestamp string `json:"timestamp"`
+	RequestID string `json:"requestId"`
+	Cwd       string `json:"cwd"`
 	Message   *struct {
 		ID    string `json:"id"`
 		Model string `json:"model"`
@@ -143,8 +144,14 @@ func (s *Scanner) parseClaudeFile(path string, seen map[string]bool) []Record {
 			model = "unknown"
 		}
 
+		workspaceID := workspaceIDFromPath(entry.Cwd)
+		if workspaceID == "" {
+			continue
+		}
+
 		records = append(records, Record{
 			Date:             ts.Local().Format("2006-01-02"),
+			WorkspaceID:      workspaceID,
 			Provider:         "claude",
 			Model:            normalizeClaudeModel(model),
 			InputTokens:      entry.Message.Usage.InputTokens,

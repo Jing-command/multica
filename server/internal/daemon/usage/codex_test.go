@@ -16,7 +16,7 @@ func TestParseCodexFile(t *testing.T) {
 	}
 
 	// Real Codex JSONL format with turn_context and token_count events
-	content := `{"timestamp":"2026-01-13T17:41:31.666Z","type":"turn_context","payload":{"cwd":"/tmp","model":"gpt-5.2-codex","effort":"high"}}
+	content := `{"timestamp":"2026-01-13T17:41:31.666Z","type":"turn_context","payload":{"cwd":"/tmp/123e4567-e89b-12d3-a456-426614174000/workdir","model":"gpt-5.2-codex","effort":"high"}}
 {"timestamp":"2026-01-13T17:41:32.916Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":24.0}}}}
 {"timestamp":"2026-01-13T17:44:06.217Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":328894,"cached_input_tokens":287872,"output_tokens":3071,"reasoning_output_tokens":960,"total_tokens":331965},"last_token_usage":{"input_tokens":24525,"cached_input_tokens":3200,"output_tokens":1815,"reasoning_output_tokens":960,"total_tokens":26340},"model_context_window":258400},"rate_limits":{"primary":{"used_percent":26.0}}}}
 `
@@ -38,6 +38,9 @@ func TestParseCodexFile(t *testing.T) {
 	}
 	if record.Provider != "codex" {
 		t.Errorf("provider = %q, want %q", record.Provider, "codex")
+	}
+	if record.WorkspaceID != "123e4567-e89b-12d3-a456-426614174000" {
+		t.Errorf("workspace_id = %q, want %q", record.WorkspaceID, "123e4567-e89b-12d3-a456-426614174000")
 	}
 	if record.Model != "gpt-5.2-codex" {
 		t.Errorf("model = %q, want %q", record.Model, "gpt-5.2-codex")
@@ -85,7 +88,7 @@ func TestParseCodexFile_LastTokenUsageFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	content := `{"timestamp":"2026-03-27T10:00:00Z","type":"turn_context","payload":{"model":"gpt-5"}}
+	content := `{"timestamp":"2026-03-27T10:00:00Z","type":"turn_context","payload":{"cwd":"/tmp/123e4567-e89b-12d3-a456-426614174001/workdir","model":"gpt-5"}}
 {"timestamp":"2026-03-27T10:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":500}}}}
 `
 	filePath := filepath.Join(sessionsDir, "rollout-test.jsonl")
@@ -118,7 +121,8 @@ func TestParseCodexFile_CacheReadInputTokens(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	content := `{"timestamp":"2026-03-27T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":5000,"cache_read_input_tokens":3000,"output_tokens":800},"model":"gpt-5.2-codex"}}}
+	content := `{"timestamp":"2026-03-27T10:00:00Z","type":"turn_context","payload":{"cwd":"/tmp/123e4567-e89b-12d3-a456-426614174002/workdir","model":"gpt-5.2-codex"}}
+{"timestamp":"2026-03-27T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":5000,"cache_read_input_tokens":3000,"output_tokens":800},"model":"gpt-5.2-codex"}}}
 `
 	filePath := filepath.Join(sessionsDir, "rollout-test.jsonl")
 	if err := os.WriteFile(filePath, []byte(content), 0o644); err != nil {

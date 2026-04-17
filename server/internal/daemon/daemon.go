@@ -242,13 +242,18 @@ func (d *Daemon) findRuntime(id string) *Runtime {
 	return nil
 }
 
-// providerToRuntimeIDs returns a mapping from provider name to runtime IDs.
-func (d *Daemon) providerToRuntimeIDs() map[string][]string {
+// workspaceProviderToRuntimeIDs returns a mapping from workspace+provider to runtime IDs.
+func (d *Daemon) workspaceProviderToRuntimeIDs() map[string][]string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	m := make(map[string][]string)
 	for id, rt := range d.runtimeIndex {
-		m[rt.Provider] = append(m[rt.Provider], id)
+		workspaceID, ok := d.runtimeWorkspace[id]
+		if !ok {
+			continue
+		}
+		key := workspaceID + ":" + rt.Provider
+		m[key] = append(m[key], id)
 	}
 	return m
 }
@@ -996,10 +1001,15 @@ func (d *Daemon) reportUsageRecords(ctx context.Context, records []usage.Record)
 		return
 	}
 
-	providerToRuntime := d.providerToRuntimeIDs()
-	byProvider := make(map[string][]map[string]any)
+	workspaceProviderToRuntime := d.workspaceProviderToRuntimeIDs()
+	byWorkspaceProvider := make(map[string][]map[string]any)
 	for _, r := range records {
-		byProvider[r.Provider] = append(byProvider[r.Provider], map[string]any{
+		if strings.TrimSpace(r.WorkspaceID) == "" {
+			d.logger.Warn("usage record missing workspace routing, skipping", "provider", r.Provider, "model", r.Model)
+			continue
+		}
+		key := r.WorkspaceID + ":" + r.Provider
+		byWorkspaceProvider[key] = append(byWorkspaceProvider[key], map[string]any{
 			"date":               r.Date,
 			"provider":           r.Provider,
 			"model":              r.Model,
@@ -1010,23 +1020,23 @@ func (d *Daemon) reportUsageRecords(ctx context.Context, records []usage.Record)
 		})
 	}
 
-	for provider, entries := range byProvider {
-		runtimeIDs, ok := providerToRuntime[provider]
+	for workspaceProvider, entries := range byWorkspaceProvider {
+		runtimeIDs, ok := workspaceProviderToRuntime[workspaceProvider]
 		if !ok || len(runtimeIDs) == 0 {
-			d.logger.Debug("no runtime for provider, skipping usage report", "provider", provider)
+			d.logger.Debug("no runtime for workspace/provider, skipping usage report", "workspace_provider", workspaceProvider)
 			continue
 		}
 		if len(runtimeIDs) > 1 {
-			d.logger.Warn("usage report skipped due to ambiguous provider routing", "provider", provider, "runtime_ids", runtimeIDs)
+			d.logger.Warn("usage report skipped due to ambiguous workspace/provider routing", "workspace_provider", workspaceProvider, "runtime_ids", runtimeIDs)
 			continue
 		}
 		runtimeID := runtimeIDs[0]
 		if err := d.withRuntimeAuth(ctx, runtimeID, true, func(token string) error {
 			return d.client.ReportUsage(ctx, runtimeID, token, entries)
 		}); err != nil {
-			d.logger.Warn("usage report failed", "provider", provider, "runtime_id", runtimeID, "error", err)
+			d.logger.Warn("usage report failed", "workspace_provider", workspaceProvider, "runtime_id", runtimeID, "error", err)
 		} else {
-			d.logger.Info("usage reported", "provider", provider, "runtime_id", runtimeID, "entries", len(entries))
+			d.logger.Info("usage reported", "workspace_provider", workspaceProvider, "runtime_id", runtimeID, "entries", len(entries))
 		}
 	}
 }
