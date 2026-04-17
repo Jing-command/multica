@@ -98,6 +98,50 @@ func (q *Queries) ListTaskMessages(ctx context.Context, taskID pgtype.UUID) ([]T
 	return items, nil
 }
 
+const listTaskMessagesForDaemonScope = `-- name: ListTaskMessagesForDaemonScope :many
+SELECT tm.id, tm.task_id, tm.seq, tm.type, tm.tool, tm.content, tm.input, tm.output, tm.created_at FROM task_message tm
+JOIN agent_task_queue atq ON atq.id = tm.task_id
+JOIN agent_runtime ar ON ar.id = atq.runtime_id
+WHERE tm.task_id = $1 AND ar.workspace_id = $2 AND ar.daemon_id = $3
+ORDER BY tm.seq ASC
+`
+
+type ListTaskMessagesForDaemonScopeParams struct {
+	TaskID      pgtype.UUID `json:"task_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	DaemonID    pgtype.Text `json:"daemon_id"`
+}
+
+func (q *Queries) ListTaskMessagesForDaemonScope(ctx context.Context, arg ListTaskMessagesForDaemonScopeParams) ([]TaskMessage, error) {
+	rows, err := q.db.Query(ctx, listTaskMessagesForDaemonScope, arg.TaskID, arg.WorkspaceID, arg.DaemonID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []TaskMessage{}
+	for rows.Next() {
+		var i TaskMessage
+		if err := rows.Scan(
+			&i.ID,
+			&i.TaskID,
+			&i.Seq,
+			&i.Type,
+			&i.Tool,
+			&i.Content,
+			&i.Input,
+			&i.Output,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listTaskMessagesSince = `-- name: ListTaskMessagesSince :many
 SELECT id, task_id, seq, type, tool, content, input, output, created_at FROM task_message
 WHERE task_id = $1 AND seq > $2
@@ -111,6 +155,51 @@ type ListTaskMessagesSinceParams struct {
 
 func (q *Queries) ListTaskMessagesSince(ctx context.Context, arg ListTaskMessagesSinceParams) ([]TaskMessage, error) {
 	rows, err := q.db.Query(ctx, listTaskMessagesSince, arg.TaskID, arg.Seq)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []TaskMessage{}
+	for rows.Next() {
+		var i TaskMessage
+		if err := rows.Scan(
+			&i.ID,
+			&i.TaskID,
+			&i.Seq,
+			&i.Type,
+			&i.Tool,
+			&i.Content,
+			&i.Input,
+			&i.Output,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTaskMessagesSinceForDaemonScope = `-- name: ListTaskMessagesSinceForDaemonScope :many
+SELECT tm.id, tm.task_id, tm.seq, tm.type, tm.tool, tm.content, tm.input, tm.output, tm.created_at FROM task_message tm
+JOIN agent_task_queue atq ON atq.id = tm.task_id
+JOIN agent_runtime ar ON ar.id = atq.runtime_id
+WHERE tm.task_id = $1 AND tm.seq > $2 AND ar.workspace_id = $3 AND ar.daemon_id = $4
+ORDER BY tm.seq ASC
+`
+
+type ListTaskMessagesSinceForDaemonScopeParams struct {
+	TaskID      pgtype.UUID `json:"task_id"`
+	Seq         int32       `json:"seq"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	DaemonID    pgtype.Text `json:"daemon_id"`
+}
+
+func (q *Queries) ListTaskMessagesSinceForDaemonScope(ctx context.Context, arg ListTaskMessagesSinceForDaemonScopeParams) ([]TaskMessage, error) {
+	rows, err := q.db.Query(ctx, listTaskMessagesSinceForDaemonScope, arg.TaskID, arg.Seq, arg.WorkspaceID, arg.DaemonID)
 	if err != nil {
 		return nil, err
 	}

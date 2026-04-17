@@ -220,44 +220,59 @@ func runWatch(cmd *cobra.Command, args []string) error {
 	}
 
 	profile := resolveProfile(cmd)
-	cfg, err := cli.LoadCLIConfigForProfile(profile)
-	if err != nil {
+	added := false
+	setDefault := false
+	if err := cli.UpdateCLIConfigForProfile(profile, func(cfg *cli.CLIConfig) error {
+		added = applyWatchedWorkspace(cfg, cli.WatchedWorkspace{ID: ws.ID, Name: ws.Name})
+		if !added {
+			return nil
+		}
+		setDefault = cfg.WorkspaceID == ws.ID
+		return nil
+	}); err != nil {
 		return err
 	}
-
-	if !cfg.AddWatchedWorkspace(ws.ID, ws.Name) {
+	if !added {
 		fmt.Fprintf(os.Stderr, "Already watching workspace %s (%s)\n", ws.ID, ws.Name)
 		return nil
 	}
-
-	if cfg.WorkspaceID == "" {
-		cfg.WorkspaceID = ws.ID
+	if setDefault {
 		fmt.Fprintf(os.Stderr, "Set default workspace to %s (%s)\n", ws.ID, ws.Name)
-	}
-
-	if err := cli.SaveCLIConfigForProfile(cfg, profile); err != nil {
-		return err
 	}
 
 	fmt.Fprintf(os.Stderr, "Watching workspace %s (%s)\n", ws.ID, ws.Name)
 	return nil
 }
 
+func applyWatchedWorkspace(cfg *cli.CLIConfig, workspace cli.WatchedWorkspace) bool {
+	if !cfg.AddWatchedWorkspace(workspace.ID, workspace.Name) {
+		return false
+	}
+	if cfg.WorkspaceID == "" {
+		cfg.WorkspaceID = workspace.ID
+	}
+	return true
+}
+
 func runUnwatch(cmd *cobra.Command, args []string) error {
 	workspaceID := args[0]
 
 	profile := resolveProfile(cmd)
-	cfg, err := cli.LoadCLIConfigForProfile(profile)
-	if err != nil {
+	removed := false
+	if err := cli.UpdateCLIConfigForProfile(profile, func(cfg *cli.CLIConfig) error {
+		if !cfg.RemoveWatchedWorkspace(workspaceID) {
+			return nil
+		}
+		removed = true
+		if cfg.WorkspaceID == workspaceID {
+			cfg.WorkspaceID = ""
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
-
-	if !cfg.RemoveWatchedWorkspace(workspaceID) {
+	if !removed {
 		return fmt.Errorf("workspace %s is not being watched", workspaceID)
-	}
-
-	if err := cli.SaveCLIConfigForProfile(cfg, profile); err != nil {
-		return err
 	}
 
 	fmt.Fprintf(os.Stderr, "Stopped watching workspace %s\n", workspaceID)

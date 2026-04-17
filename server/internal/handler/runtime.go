@@ -87,8 +87,7 @@ func (h *Handler) ReportRuntimeUsage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "runtimeId is required")
 		return
 	}
-	if _, ok := h.loadDaemonRuntime(r, runtimeID); !ok {
-		writeError(w, http.StatusNotFound, "runtime not found")
+	if _, ok := h.requireDaemonRuntimeScope(w, r, runtimeID); !ok {
 		return
 	}
 

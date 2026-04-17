@@ -6,9 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"syscall"
 )
 
 const defaultCLIConfigPath = ".multica/config.json"
+
+var cliConfigMu sync.Mutex
 
 // WatchedWorkspace represents a workspace the daemon should monitor for tasks.
 type WatchedWorkspace struct {
@@ -16,13 +20,21 @@ type WatchedWorkspace struct {
 	Name string `json:"name,omitempty"`
 }
 
+// DaemonAuthConfig holds workspace-scoped daemon authentication state.
+type DaemonAuthConfig struct {
+	DaemonID  string `json:"daemon_id,omitempty"`
+	Token     string `json:"token,omitempty"`
+	ExpiresAt string `json:"expires_at,omitempty"`
+}
+
 // CLIConfig holds persistent CLI settings.
 type CLIConfig struct {
-	ServerURL          string             `json:"server_url,omitempty"`
-	AppURL             string             `json:"app_url,omitempty"`
-	WorkspaceID        string             `json:"workspace_id,omitempty"`
-	Token              string             `json:"token,omitempty"`
-	WatchedWorkspaces  []WatchedWorkspace `json:"watched_workspaces,omitempty"`
+	ServerURL         string                      `json:"server_url,omitempty"`
+	AppURL            string                      `json:"app_url,omitempty"`
+	WorkspaceID       string                      `json:"workspace_id,omitempty"`
+	UserToken         string                      `json:"user_token,omitempty"`
+	WatchedWorkspaces []WatchedWorkspace          `json:"watched_workspaces,omitempty"`
+	DaemonAuth        map[string]DaemonAuthConfig `json:"daemon_auth,omitempty"`
 }
 
 // AddWatchedWorkspace adds a workspace to the watch list. Returns true if added.
@@ -41,6 +53,9 @@ func (c *CLIConfig) RemoveWatchedWorkspace(id string) bool {
 	for i, w := range c.WatchedWorkspaces {
 		if w.ID == id {
 			c.WatchedWorkspaces = append(c.WatchedWorkspaces[:i], c.WatchedWorkspaces[i+1:]...)
+			if c.DaemonAuth != nil {
+				delete(c.DaemonAuth, id)
+			}
 			return true
 		}
 	}
@@ -107,6 +122,39 @@ func LoadCLIConfigForProfile(profile string) (CLIConfig, error) {
 // SaveCLIConfig writes the CLI config to disk atomically (default profile).
 func SaveCLIConfig(cfg CLIConfig) error {
 	return SaveCLIConfigForProfile(cfg, "")
+}
+
+// UpdateCLIConfigForProfile serializes config read-modify-write operations for a profile.
+func UpdateCLIConfigForProfile(profile string, mutate func(*CLIConfig) error) error {
+	cliConfigMu.Lock()
+	defer cliConfigMu.Unlock()
+
+	configPath, err := CLIConfigPathForProfile(profile)
+	if err != nil {
+		return err
+	}
+	lockPath := filepath.Join(filepath.Dir(configPath), ".config.lock")
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		return fmt.Errorf("create CLI lock directory: %w", err)
+	}
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("open CLI lock file: %w", err)
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("lock CLI config: %w", err)
+	}
+	defer func() { _ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN) }()
+
+	cfg, err := LoadCLIConfigForProfile(profile)
+	if err != nil {
+		return err
+	}
+	if err := mutate(&cfg); err != nil {
+		return err
+	}
+	return SaveCLIConfigForProfile(cfg, profile)
 }
 
 // SaveCLIConfigForProfile writes the CLI config for the given profile.

@@ -8,7 +8,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/auth"
+	"github.com/multica-ai/multica/server/internal/middleware"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -697,10 +701,28 @@ func TestDaemonRegister_CreatesOrchestratorOnPreferredClaudeRuntime(t *testing.T
 		testPool.Exec(ctx, `DELETE FROM workspace WHERE id = $1`, workspaceID)
 	})
 
+	rawToken, err := auth.GenerateDaemonToken()
+	if err != nil {
+		t.Fatalf("GenerateDaemonToken: %v", err)
+	}
+	if _, err := testHandler.Queries.CreateDaemonToken(ctx, db.CreateDaemonTokenParams{
+		TokenHash:   auth.HashToken(rawToken),
+		WorkspaceID: parseUUID(workspaceID),
+		DaemonID:    "daemon-preferred-runtime",
+		UserID:      parseUUID(testUserID),
+		ExpiresAt:   pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+	}); err != nil {
+		t.Fatalf("CreateDaemonToken: %v", err)
+	}
+	defer testPool.Exec(ctx, `DELETE FROM daemon_token WHERE daemon_id = $1`, "daemon-preferred-runtime")
+	defer testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE daemon_id = $1`, "daemon-preferred-runtime")
+
+	handler := middleware.DaemonAuth(testHandler.Queries)(http.HandlerFunc(testHandler.DaemonRegister))
+
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/daemon/register", strings.NewReader(fmt.Sprintf(`{
 		"workspace_id":%q,
-		"daemon_id":"daemon-preferred-runtime",
+		"daemon_id":"payload-daemon",
 		"device_name":"test-machine",
 		"runtimes":[
 			{"name":"Local Codex","type":"codex","version":"1.0.0","status":"online"},
@@ -708,9 +730,9 @@ func TestDaemonRegister_CreatesOrchestratorOnPreferredClaudeRuntime(t *testing.T
 		]
 	}`, workspaceID)))
 	req.Header.Set("Content-Type", "application/json")
-	req = withDaemonIdentity(req, workspaceID, "daemon-preferred-runtime")
+	req.Header.Set("Authorization", "Bearer "+rawToken)
 
-	testHandler.DaemonRegister(w, req)
+	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("DaemonRegister: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -726,6 +748,67 @@ func TestDaemonRegister_CreatesOrchestratorOnPreferredClaudeRuntime(t *testing.T
 	}
 	if provider != "claude" {
 		t.Fatalf("expected orchestrator to prefer claude runtime, got %s", provider)
+	}
+}
+
+func TestEnsureOrchestratorAgent_UpdatesOwnerForExistingActiveAgent(t *testing.T) {
+	ctx := context.Background()
+	queries := db.New(testPool)
+
+	var oldOwnerID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO "user" (name, email)
+		VALUES ('Old Orchestrator Owner', 'old-orchestrator-owner@multica.ai')
+		RETURNING id
+	`).Scan(&oldOwnerID); err != nil {
+		t.Fatalf("insert old owner: %v", err)
+	}
+	defer testPool.Exec(ctx, `DELETE FROM "user" WHERE id = $1`, oldOwnerID)
+
+	var runtimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (
+			workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, owner_id
+		)
+		VALUES ($1, NULL, 'Existing Owner Runtime', 'local', 'claude', 'online', 'test', '{}'::jsonb, now(), $2)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&runtimeID); err != nil {
+		t.Fatalf("insert runtime: %v", err)
+	}
+	defer testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE id = $1`, runtimeID)
+
+	if _, err := testPool.Exec(ctx, `DELETE FROM agent WHERE workspace_id = $1 AND name = $2`, testWorkspaceID, orchestratorName); err != nil {
+		t.Fatalf("delete existing orchestrator: %v", err)
+	}
+	defer testPool.Exec(ctx, `DELETE FROM agent WHERE workspace_id = $1 AND name = $2`, testWorkspaceID, orchestratorName)
+
+	if _, err := queries.CreateAgent(ctx, db.CreateAgentParams{
+		WorkspaceID:        parseUUID(testWorkspaceID),
+		Name:               orchestratorName,
+		Description:        "existing orchestrator",
+		AvatarUrl:          pgtype.Text{},
+		RuntimeMode:        "local",
+		RuntimeConfig:      []byte("{}"),
+		RuntimeID:          parseUUID(runtimeID),
+		Visibility:         "workspace",
+		MaxConcurrentTasks: 10,
+		OwnerID:            parseUUID(oldOwnerID),
+		Instructions:       orchestratorInstructions,
+	}); err != nil {
+		t.Fatalf("create orchestrator: %v", err)
+	}
+
+	ensureOrchestratorAgent(ctx, queries, parseUUID(testWorkspaceID), parseUUID(runtimeID), parseUUID(testUserID))
+
+	var ownerID string
+	if err := testPool.QueryRow(ctx, `
+		SELECT owner_id::text FROM agent
+		WHERE workspace_id = $1 AND name = $2 AND archived_at IS NULL
+	`, testWorkspaceID, orchestratorName).Scan(&ownerID); err != nil {
+		t.Fatalf("load orchestrator owner: %v", err)
+	}
+	if ownerID != testUserID {
+		t.Fatalf("owner_id = %q, want %q", ownerID, testUserID)
 	}
 }
 

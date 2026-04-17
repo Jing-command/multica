@@ -90,7 +90,8 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus) chi.Route
 		r.Post("/auth/logout", h.Logout)
 	})
 
-	// Daemon API routes (all require daemon machine auth)
+	// Daemon API routes
+	r.With(middleware.Auth(queries), middleware.RequireWorkspaceMemberFromURL(queries, "workspaceId")).Post("/api/daemon/workspaces/{workspaceId}/enroll", h.DaemonEnroll)
 	r.Route("/api/daemon", func(r chi.Router) {
 		r.Use(middleware.DaemonAuth(queries))
 

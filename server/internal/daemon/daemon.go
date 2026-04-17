@@ -3,8 +3,10 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,6 +27,10 @@ type workspaceState struct {
 	runtimeIDs  []string
 }
 
+var persistWorkspaceDaemonAuthBeforeMemoryUpdateHook func()
+
+var errWorkspaceNoLongerWatched = errors.New("workspace no longer watched")
+
 // Daemon is the local agent runtime that polls for and executes tasks.
 type Daemon struct {
 	cfg       Config
@@ -32,10 +38,15 @@ type Daemon struct {
 	repoCache *repocache.Cache
 	logger    *slog.Logger
 
-	mu           sync.Mutex
-	workspaces   map[string]*workspaceState
-	runtimeIndex map[string]Runtime // runtimeID -> Runtime for provider lookups
-	reloading    sync.Mutex         // prevents concurrent reloadWorkspaces
+	mu                   sync.Mutex
+	workspaces           map[string]*workspaceState
+	runtimeIndex         map[string]Runtime // runtimeID -> Runtime for provider lookups
+	runtimeWorkspace     map[string]string  // runtimeID -> workspaceID for auth routing
+	workspaceAuth        map[string]cli.DaemonAuthConfig
+	workspaceRefreshMu   sync.Mutex
+	workspaceRefreshLock map[string]*sync.Mutex
+	userToken            string
+	reloading            sync.Mutex // prevents concurrent reloadWorkspaces
 
 	cancelFunc    context.CancelFunc // set by Run(); called by triggerRestart
 	restartBinary string             // non-empty after a successful update; path to the new binary
@@ -46,12 +57,15 @@ type Daemon struct {
 func New(cfg Config, logger *slog.Logger) *Daemon {
 	cacheRoot := filepath.Join(cfg.WorkspacesRoot, ".repos")
 	return &Daemon{
-		cfg:          cfg,
-		client:       NewClient(cfg.ServerBaseURL),
-		repoCache:    repocache.New(cacheRoot, logger),
-		logger:       logger,
-		workspaces:   make(map[string]*workspaceState),
-		runtimeIndex: make(map[string]Runtime),
+		cfg:                  cfg,
+		client:               NewClient(cfg.ServerBaseURL),
+		repoCache:            repocache.New(cacheRoot, logger),
+		logger:               logger,
+		workspaces:           make(map[string]*workspaceState),
+		runtimeIndex:         make(map[string]Runtime),
+		runtimeWorkspace:     make(map[string]string),
+		workspaceAuth:        make(map[string]cli.DaemonAuthConfig),
+		workspaceRefreshLock: make(map[string]*sync.Mutex),
 	}
 }
 
@@ -123,10 +137,14 @@ func (d *Daemon) deregisterRuntimes() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := d.client.Deregister(ctx, runtimeIDs); err != nil {
-		d.logger.Warn("failed to deregister runtimes on shutdown", "error", err)
-	} else {
-		d.logger.Info("deregistered runtimes", "count", len(runtimeIDs))
+	for _, runtimeID := range runtimeIDs {
+		if err := d.withRuntimeAuth(ctx, runtimeID, true, func(token string) error {
+			return d.client.Deregister(ctx, []string{runtimeID}, token)
+		}); err != nil {
+			d.logger.Warn("failed to deregister runtime on shutdown", "runtime_id", runtimeID, "error", err)
+		} else {
+			d.logger.Info("deregistered runtime", "runtime_id", runtimeID)
+		}
 	}
 }
 
@@ -136,7 +154,7 @@ func (d *Daemon) resolveAuth() error {
 	if err != nil {
 		return fmt.Errorf("load CLI config: %w", err)
 	}
-	if cfg.Token == "" {
+	if cfg.UserToken == "" {
 		loginHint := "'multica login'"
 		if d.cfg.Profile != "" {
 			loginHint = fmt.Sprintf("'multica login --profile %s'", d.cfg.Profile)
@@ -144,7 +162,14 @@ func (d *Daemon) resolveAuth() error {
 		d.logger.Warn("not authenticated — run " + loginHint + " to authenticate, then restart the daemon")
 		return fmt.Errorf("not authenticated: run %s first", loginHint)
 	}
-	d.client.SetToken(cfg.Token)
+	d.userToken = cfg.UserToken
+	d.client.SetUserToken(cfg.UserToken)
+	d.mu.Lock()
+	d.workspaceAuth = make(map[string]cli.DaemonAuthConfig, len(cfg.DaemonAuth))
+	for workspaceID, authCfg := range cfg.DaemonAuth {
+		d.workspaceAuth[workspaceID] = authCfg
+	}
+	d.mu.Unlock()
 	d.logger.Info("authenticated")
 	return nil
 }
@@ -176,6 +201,7 @@ func (d *Daemon) loadWatchedWorkspaces(ctx context.Context) error {
 		d.workspaces[ws.ID] = &workspaceState{workspaceID: ws.ID, runtimeIDs: runtimeIDs}
 		for _, rt := range resp.Runtimes {
 			d.runtimeIndex[rt.ID] = rt
+			d.runtimeWorkspace[rt.ID] = ws.ID
 		}
 		d.mu.Unlock()
 
@@ -217,13 +243,13 @@ func (d *Daemon) findRuntime(id string) *Runtime {
 	return nil
 }
 
-// providerToRuntimeMap returns a mapping from provider name to runtime ID.
-func (d *Daemon) providerToRuntimeMap() map[string]string {
+// providerToRuntimeIDs returns a mapping from provider name to runtime IDs.
+func (d *Daemon) providerToRuntimeIDs() map[string][]string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	m := make(map[string]string)
+	m := make(map[string][]string)
 	for id, rt := range d.runtimeIndex {
-		m[rt.Provider] = id
+		m[rt.Provider] = append(m[rt.Provider], id)
 	}
 	return m
 }
@@ -259,14 +285,247 @@ func (d *Daemon) registerRuntimesForWorkspace(ctx context.Context, workspaceID s
 		"runtimes":     runtimes,
 	}
 
-	resp, err := d.client.Register(ctx, req)
+	var resp *RegisterResponse
+	err := d.withWorkspaceDaemonAuth(ctx, workspaceID, true, func(token string) error {
+		registerResp, err := d.client.Register(ctx, req, token)
+		if err != nil {
+			return err
+		}
+		resp = registerResp
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("register runtimes: %w", err)
 	}
-	if len(resp.Runtimes) == 0 {
+	if resp == nil || len(resp.Runtimes) == 0 {
 		return nil, fmt.Errorf("register runtimes: empty response")
 	}
 	return resp, nil
+}
+
+func (d *Daemon) workspaceRefreshMutex(workspaceID string) *sync.Mutex {
+	d.workspaceRefreshMu.Lock()
+	defer d.workspaceRefreshMu.Unlock()
+	if lock, ok := d.workspaceRefreshLock[workspaceID]; ok {
+		return lock
+	}
+	lock := &sync.Mutex{}
+	d.workspaceRefreshLock[workspaceID] = lock
+	return lock
+}
+
+func (d *Daemon) ensureWorkspaceDaemonAuth(ctx context.Context, workspaceID string) (cli.DaemonAuthConfig, error) {
+	d.mu.Lock()
+	authCfg, ok := d.workspaceAuth[workspaceID]
+	d.mu.Unlock()
+	if ok && strings.TrimSpace(authCfg.Token) != "" && strings.TrimSpace(authCfg.DaemonID) != "" && authCfg.DaemonID == d.cfg.DaemonID {
+		expiresAt, err := time.Parse(time.RFC3339, strings.TrimSpace(authCfg.ExpiresAt))
+		if err != nil || time.Until(expiresAt) > 7*24*time.Hour {
+			return authCfg, nil
+		}
+	}
+
+	refreshLock := d.workspaceRefreshMutex(workspaceID)
+	refreshLock.Lock()
+	defer refreshLock.Unlock()
+
+	d.mu.Lock()
+	authCfg, ok = d.workspaceAuth[workspaceID]
+	d.mu.Unlock()
+	if ok && strings.TrimSpace(authCfg.Token) != "" && strings.TrimSpace(authCfg.DaemonID) != "" && authCfg.DaemonID == d.cfg.DaemonID {
+		expiresAt, err := time.Parse(time.RFC3339, strings.TrimSpace(authCfg.ExpiresAt))
+		if err != nil || time.Until(expiresAt) > 7*24*time.Hour {
+			return authCfg, nil
+		}
+	}
+
+	return d.reenrollWorkspaceDaemonAuth(ctx, workspaceID)
+}
+
+func (d *Daemon) reenrollWorkspaceDaemonAuth(ctx context.Context, workspaceID string) (cli.DaemonAuthConfig, error) {
+	resp, err := d.client.EnrollDaemonToken(ctx, workspaceID, d.cfg.DaemonID)
+	if err != nil {
+		if isWorkspaceNotFoundError(err) {
+			if cleanupErr := d.cleanupRemovedWorkspace(workspaceID); cleanupErr != nil {
+				return cli.DaemonAuthConfig{}, fmt.Errorf("cleanup removed workspace %s: %w", workspaceID, cleanupErr)
+			}
+		}
+		return cli.DaemonAuthConfig{}, fmt.Errorf("enroll daemon token for workspace %s: %w", workspaceID, err)
+	}
+	authCfg := cli.DaemonAuthConfig{
+		DaemonID:  d.cfg.DaemonID,
+		Token:     resp.Token,
+		ExpiresAt: strings.TrimSpace(resp.ExpiresAt),
+	}
+	if authCfg.ExpiresAt == "" {
+		authCfg.ExpiresAt = time.Now().Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	}
+	persisted, err := d.persistWorkspaceDaemonAuth(workspaceID, authCfg)
+	if err != nil {
+		return cli.DaemonAuthConfig{}, err
+	}
+	if !persisted {
+		return cli.DaemonAuthConfig{}, errWorkspaceNoLongerWatched
+	}
+	return authCfg, nil
+}
+
+func (d *Daemon) persistWorkspaceDaemonAuth(workspaceID string, authCfg cli.DaemonAuthConfig) (bool, error) {
+	persisted := false
+	if err := cli.UpdateCLIConfigForProfile(d.cfg.Profile, func(cfg *cli.CLIConfig) error {
+		watched := false
+		for _, ws := range cfg.WatchedWorkspaces {
+			if ws.ID == workspaceID {
+				watched = true
+				break
+			}
+		}
+		if !watched {
+			if cfg.DaemonAuth != nil {
+				delete(cfg.DaemonAuth, workspaceID)
+			}
+			d.mu.Lock()
+			delete(d.workspaceAuth, workspaceID)
+			d.mu.Unlock()
+			return nil
+		}
+		if cfg.DaemonAuth == nil {
+			cfg.DaemonAuth = make(map[string]cli.DaemonAuthConfig)
+		}
+		cfg.DaemonAuth[workspaceID] = authCfg
+		persisted = true
+		return nil
+	}); err != nil {
+		return false, fmt.Errorf("update CLI config: %w", err)
+	}
+	if persistWorkspaceDaemonAuthBeforeMemoryUpdateHook != nil {
+		persistWorkspaceDaemonAuthBeforeMemoryUpdateHook()
+	}
+	if !persisted {
+		return false, nil
+	}
+	stillValid := false
+	if err := cli.UpdateCLIConfigForProfile(d.cfg.Profile, func(cfg *cli.CLIConfig) error {
+		storedAuth, ok := cfg.DaemonAuth[workspaceID]
+		if ok && storedAuth.DaemonID == authCfg.DaemonID && storedAuth.Token == authCfg.Token && storedAuth.ExpiresAt == authCfg.ExpiresAt {
+			stillValid = true
+		}
+		return nil
+	}); err != nil {
+		return false, fmt.Errorf("recheck CLI config: %w", err)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !stillValid {
+		delete(d.workspaceAuth, workspaceID)
+		return false, nil
+	}
+	d.workspaceAuth[workspaceID] = authCfg
+	return true, nil
+}
+
+func (d *Daemon) workspaceIDForRuntime(runtimeID string) (string, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	workspaceID, ok := d.runtimeWorkspace[runtimeID]
+	if ok {
+		return workspaceID, true
+	}
+	for wsID, ws := range d.workspaces {
+		for _, rid := range ws.runtimeIDs {
+			if rid == runtimeID {
+				d.runtimeWorkspace[runtimeID] = wsID
+				return wsID, true
+			}
+		}
+	}
+	return "", false
+}
+
+func (d *Daemon) cleanupRemovedWorkspace(workspaceID string) error {
+	if err := cli.UpdateCLIConfigForProfile(d.cfg.Profile, func(cfg *cli.CLIConfig) error {
+		if cfg.RemoveWatchedWorkspace(workspaceID) && cfg.WorkspaceID == workspaceID {
+			cfg.WorkspaceID = ""
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("cleanup removed workspace config: %w", err)
+	}
+	if cfg, err := cli.LoadCLIConfigForProfile(d.cfg.Profile); err == nil && cfg.WorkspaceID == workspaceID {
+		_ = cli.UpdateCLIConfigForProfile(d.cfg.Profile, func(cfg *cli.CLIConfig) error {
+			if cfg.WorkspaceID == workspaceID {
+				cfg.WorkspaceID = ""
+			}
+			return nil
+		})
+	}
+	removedRuntimeIDs := []string{}
+	d.mu.Lock()
+	if ws, exists := d.workspaces[workspaceID]; exists {
+		removedRuntimeIDs = append(removedRuntimeIDs, ws.runtimeIDs...)
+	}
+	delete(d.workspaces, workspaceID)
+	for _, rid := range removedRuntimeIDs {
+		delete(d.runtimeIndex, rid)
+		delete(d.runtimeWorkspace, rid)
+	}
+	delete(d.workspaceAuth, workspaceID)
+	d.mu.Unlock()
+	return nil
+}
+
+func (d *Daemon) withRuntimeAuth(ctx context.Context, runtimeID string, allowRetry bool, fn func(token string) error) error {
+	workspaceID, ok := d.workspaceIDForRuntime(runtimeID)
+	if !ok {
+		d.mu.Lock()
+		workspaceCount := len(d.workspaces)
+		d.mu.Unlock()
+		return fmt.Errorf("runtime %s not registered to a workspace (workspaces=%d)", runtimeID, workspaceCount)
+	}
+	return d.withWorkspaceDaemonAuth(ctx, workspaceID, allowRetry, fn)
+}
+
+func (d *Daemon) withWorkspaceDaemonAuth(ctx context.Context, workspaceID string, allowRetry bool, fn func(token string) error) error {
+	authCfg, err := d.ensureWorkspaceDaemonAuth(ctx, workspaceID)
+	if err != nil {
+		return err
+	}
+	if err := fn(authCfg.Token); err != nil {
+		if isWorkspaceNotFoundError(err) {
+			_ = d.cleanupRemovedWorkspace(workspaceID)
+			return fmt.Errorf("workspace %s no longer exists", workspaceID)
+		}
+		if allowRetry && isUnauthorizedRequestError(err) {
+			refreshLock := d.workspaceRefreshMutex(workspaceID)
+			refreshLock.Lock()
+			d.mu.Lock()
+			currentAuth, ok := d.workspaceAuth[workspaceID]
+			d.mu.Unlock()
+			if ok && strings.TrimSpace(currentAuth.Token) != "" && currentAuth.Token != authCfg.Token && currentAuth.DaemonID == d.cfg.DaemonID {
+				callErr := fn(currentAuth.Token)
+				refreshLock.Unlock()
+				return callErr
+			}
+			rotatedAuth, reenrollErr := d.reenrollWorkspaceDaemonAuth(ctx, workspaceID)
+			if reenrollErr != nil {
+				refreshLock.Unlock()
+				if errors.Is(reenrollErr, errWorkspaceNoLongerWatched) {
+					return reenrollErr
+				}
+				return err
+			}
+			callErr := fn(rotatedAuth.Token)
+			refreshLock.Unlock()
+			return callErr
+		}
+		return err
+	}
+	return nil
+}
+
+func isUnauthorizedRequestError(err error) bool {
+	var reqErr *requestError
+	return errors.As(err, &reqErr) && reqErr.StatusCode == http.StatusUnauthorized
 }
 
 // configWatchLoop periodically checks for config file changes and reloads workspaces.
@@ -335,29 +594,56 @@ func (d *Daemon) syncWorkspacesFromAPI(ctx context.Context) {
 		return
 	}
 
-	cfg, err := cli.LoadCLIConfigForProfile(d.cfg.Profile)
-	if err != nil {
-		d.logger.Warn("workspace sync: failed to load config", "error", err)
-		return
-	}
-
-	var added int
+	existing := make(map[string]struct{}, len(workspaces))
 	for _, ws := range workspaces {
-		if cfg.AddWatchedWorkspace(ws.ID, ws.Name) {
-			added++
-			d.logger.Info("workspace sync: discovered new workspace", "workspace_id", ws.ID, "name", ws.Name)
+		existing[ws.ID] = struct{}{}
+	}
+
+	var added, removed int
+	var removedIDs []string
+	if err := cli.UpdateCLIConfigForProfile(d.cfg.Profile, func(cfg *cli.CLIConfig) error {
+		for _, ws := range workspaces {
+			if cfg.AddWatchedWorkspace(ws.ID, ws.Name) {
+				added++
+				d.logger.Info("workspace sync: discovered new workspace", "workspace_id", ws.ID, "name", ws.Name)
+			}
 		}
-	}
-
-	if added == 0 {
+		for _, ws := range append([]cli.WatchedWorkspace(nil), cfg.WatchedWorkspaces...) {
+			if _, ok := existing[ws.ID]; ok {
+				continue
+			}
+			if cfg.RemoveWatchedWorkspace(ws.ID) {
+				removed++
+				removedIDs = append(removedIDs, ws.ID)
+				d.logger.Info("workspace sync: removed missing workspace", "workspace_id", ws.ID, "name", ws.Name)
+				if cfg.WorkspaceID == ws.ID {
+					cfg.WorkspaceID = ""
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		d.logger.Warn("workspace sync: failed to update config", "error", err)
 		return
 	}
-
-	if err := cli.SaveCLIConfigForProfile(cfg, d.cfg.Profile); err != nil {
-		d.logger.Warn("workspace sync: failed to save config", "error", err)
+	if len(removedIDs) > 0 {
+		d.mu.Lock()
+		for _, id := range removedIDs {
+			if ws, exists := d.workspaces[id]; exists {
+				for _, rid := range ws.runtimeIDs {
+					delete(d.runtimeIndex, rid)
+					delete(d.runtimeWorkspace, rid)
+				}
+			}
+			delete(d.workspaces, id)
+			delete(d.workspaceAuth, id)
+		}
+		d.mu.Unlock()
+	}
+	if added == 0 && removed == 0 {
 		return
 	}
-	d.logger.Info("workspace sync: added new workspace(s) to config", "count", added)
+	d.logger.Info("workspace sync: updated watched workspaces in config", "added", added, "removed", removed)
 }
 
 // reloadWorkspaces reconciles the active workspace set with the config file.
@@ -379,6 +665,15 @@ func (d *Daemon) reloadWorkspaces(ctx context.Context) {
 	}
 
 	d.mu.Lock()
+	d.userToken = cfg.UserToken
+	d.client.SetUserToken(cfg.UserToken)
+	filteredAuth := make(map[string]cli.DaemonAuthConfig, len(cfg.DaemonAuth))
+	for workspaceID, authCfg := range cfg.DaemonAuth {
+		if _, ok := newIDs[workspaceID]; ok {
+			filteredAuth[workspaceID] = authCfg
+		}
+	}
+	d.workspaceAuth = filteredAuth
 	currentIDs := make(map[string]bool)
 	for id := range d.workspaces {
 		currentIDs[id] = true
@@ -401,6 +696,7 @@ func (d *Daemon) reloadWorkspaces(ctx context.Context) {
 			d.workspaces[id] = &workspaceState{workspaceID: id, runtimeIDs: runtimeIDs}
 			for _, rt := range resp.Runtimes {
 				d.runtimeIndex[rt.ID] = rt
+				d.runtimeWorkspace[rt.ID] = id
 			}
 			d.mu.Unlock()
 
@@ -424,9 +720,11 @@ func (d *Daemon) reloadWorkspaces(ctx context.Context) {
 			if ws, exists := d.workspaces[id]; exists {
 				for _, rid := range ws.runtimeIDs {
 					delete(d.runtimeIndex, rid)
+					delete(d.runtimeWorkspace, rid)
 				}
 			}
 			delete(d.workspaces, id)
+			delete(d.workspaceAuth, id)
 			d.mu.Unlock()
 			d.logger.Info("stopped watching workspace", "workspace_id", id)
 		}
@@ -443,13 +741,12 @@ func (d *Daemon) heartbeatLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			for _, rid := range d.allRuntimeIDs() {
-				resp, err := d.client.SendHeartbeat(ctx, rid)
+				resp, err := d.sendHeartbeatForRuntime(ctx, rid)
 				if err != nil {
 					d.logger.Warn("heartbeat failed", "runtime_id", rid, "error", err)
 					continue
 				}
 
-				// Handle pending ping requests.
 				if resp.PendingPing != nil {
 					rt := d.findRuntime(rid)
 					if rt != nil {
@@ -457,7 +754,6 @@ func (d *Daemon) heartbeatLoop(ctx context.Context) {
 					}
 				}
 
-				// Handle pending update requests.
 				if resp.PendingUpdate != nil {
 					go d.handleUpdate(ctx, rid, resp.PendingUpdate)
 				}
@@ -466,14 +762,53 @@ func (d *Daemon) heartbeatLoop(ctx context.Context) {
 	}
 }
 
+func (d *Daemon) sendHeartbeatForRuntime(ctx context.Context, runtimeID string) (*HeartbeatResponse, error) {
+	var resp *HeartbeatResponse
+	err := d.withRuntimeAuth(ctx, runtimeID, true, func(token string) error {
+		heartbeatResp, err := d.client.SendHeartbeat(ctx, runtimeID, token)
+		if err != nil {
+			return err
+		}
+		resp = heartbeatResp
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (d *Daemon) claimTaskForRuntime(ctx context.Context, runtimeID string) (*Task, error) {
+	var task *Task
+	err := d.withRuntimeAuth(ctx, runtimeID, true, func(token string) error {
+		claimedTask, err := d.client.ClaimTask(ctx, runtimeID, token)
+		if err != nil {
+			return err
+		}
+		task = claimedTask
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return task, nil
+}
+
 func (d *Daemon) handlePing(ctx context.Context, rt Runtime, pingID string) {
 	d.logger.Info("ping requested", "runtime_id", rt.ID, "ping_id", pingID, "provider", rt.Provider)
 
 	start := time.Now()
+	reportPing := func(result map[string]any) {
+		if err := d.withRuntimeAuth(ctx, rt.ID, true, func(token string) error {
+			return d.client.ReportPingResult(ctx, rt.ID, pingID, token, result)
+		}); err != nil {
+			d.logger.Warn("report ping result failed", "runtime_id", rt.ID, "ping_id", pingID, "error", err)
+		}
+	}
 
 	entry, ok := d.cfg.Agents[rt.Provider]
 	if !ok {
-		d.client.ReportPingResult(ctx, rt.ID, pingID, map[string]any{
+		reportPing(map[string]any{
 			"status":      "failed",
 			"error":       fmt.Sprintf("no agent configured for provider %q", rt.Provider),
 			"duration_ms": time.Since(start).Milliseconds(),
@@ -486,7 +821,7 @@ func (d *Daemon) handlePing(ctx context.Context, rt Runtime, pingID string) {
 		Logger:         d.logger,
 	})
 	if err != nil {
-		d.client.ReportPingResult(ctx, rt.ID, pingID, map[string]any{
+		reportPing(map[string]any{
 			"status":      "failed",
 			"error":       err.Error(),
 			"duration_ms": time.Since(start).Milliseconds(),
@@ -502,7 +837,7 @@ func (d *Daemon) handlePing(ctx context.Context, rt Runtime, pingID string) {
 		Timeout:  60 * time.Second,
 	})
 	if err != nil {
-		d.client.ReportPingResult(ctx, rt.ID, pingID, map[string]any{
+		reportPing(map[string]any{
 			"status":      "failed",
 			"error":       err.Error(),
 			"duration_ms": time.Since(start).Milliseconds(),
@@ -510,7 +845,6 @@ func (d *Daemon) handlePing(ctx context.Context, rt Runtime, pingID string) {
 		return
 	}
 
-	// Drain messages
 	go func() {
 		for range session.Messages {
 		}
@@ -521,23 +855,24 @@ func (d *Daemon) handlePing(ctx context.Context, rt Runtime, pingID string) {
 
 	if result.Status == "completed" {
 		d.logger.Info("ping completed", "runtime_id", rt.ID, "ping_id", pingID, "duration_ms", durationMs)
-		d.client.ReportPingResult(ctx, rt.ID, pingID, map[string]any{
+		reportPing(map[string]any{
 			"status":      "completed",
 			"output":      result.Output,
 			"duration_ms": durationMs,
 		})
-	} else {
-		errMsg := result.Error
-		if errMsg == "" {
-			errMsg = fmt.Sprintf("agent returned status: %s", result.Status)
-		}
-		d.logger.Warn("ping failed", "runtime_id", rt.ID, "ping_id", pingID, "error", errMsg)
-		d.client.ReportPingResult(ctx, rt.ID, pingID, map[string]any{
-			"status":      "failed",
-			"error":       errMsg,
-			"duration_ms": durationMs,
-		})
+		return
 	}
+
+	errMsg := result.Error
+	if errMsg == "" {
+		errMsg = fmt.Sprintf("agent returned status: %s", result.Status)
+	}
+	d.logger.Warn("ping failed", "runtime_id", rt.ID, "ping_id", pingID, "error", errMsg)
+	reportPing(map[string]any{
+		"status":      "failed",
+		"error":       errMsg,
+		"duration_ms": durationMs,
+	})
 }
 
 // handleUpdate performs the CLI update when triggered by the server via heartbeat.
@@ -552,9 +887,21 @@ func (d *Daemon) handleUpdate(ctx context.Context, runtimeID string, update *Pen
 	d.logger.Info("CLI update requested", "runtime_id", runtimeID, "update_id", update.ID, "target_version", update.TargetVersion)
 
 	// Report running status.
-	d.client.ReportUpdateResult(ctx, runtimeID, update.ID, map[string]any{
-		"status": "running",
-	})
+	if err := d.withRuntimeAuth(ctx, runtimeID, true, func(token string) error {
+		return d.client.ReportUpdateResult(ctx, runtimeID, update.ID, token, map[string]any{
+			"status": "running",
+		})
+	}); err != nil {
+		d.logger.Warn("report update running status failed", "runtime_id", runtimeID, "update_id", update.ID, "error", err)
+	}
+
+	reportUpdate := func(payload map[string]any) {
+		if err := d.withRuntimeAuth(ctx, runtimeID, true, func(token string) error {
+			return d.client.ReportUpdateResult(ctx, runtimeID, update.ID, token, payload)
+		}); err != nil {
+			d.logger.Warn("report update result failed", "runtime_id", runtimeID, "update_id", update.ID, "error", err)
+		}
+	}
 
 	// Try Homebrew first, fall back to direct download.
 	var output string
@@ -564,7 +911,7 @@ func (d *Daemon) handleUpdate(ctx context.Context, runtimeID string, update *Pen
 		output, err = cli.UpdateViaBrew()
 		if err != nil {
 			d.logger.Error("CLI update failed", "error", err, "output", output)
-			d.client.ReportUpdateResult(ctx, runtimeID, update.ID, map[string]any{
+			reportUpdate(map[string]any{
 				"status": "failed",
 				"error":  fmt.Sprintf("brew upgrade failed: %v", err),
 			})
@@ -576,7 +923,7 @@ func (d *Daemon) handleUpdate(ctx context.Context, runtimeID string, update *Pen
 		output, err = cli.UpdateViaDownload(update.TargetVersion)
 		if err != nil {
 			d.logger.Error("CLI update failed", "error", err)
-			d.client.ReportUpdateResult(ctx, runtimeID, update.ID, map[string]any{
+			reportUpdate(map[string]any{
 				"status": "failed",
 				"error":  fmt.Sprintf("download update failed: %v", err),
 			})
@@ -585,7 +932,7 @@ func (d *Daemon) handleUpdate(ctx context.Context, runtimeID string, update *Pen
 	}
 
 	d.logger.Info("CLI update completed successfully", "output", output)
-	d.client.ReportUpdateResult(ctx, runtimeID, update.ID, map[string]any{
+	reportUpdate(map[string]any{
 		"status": "completed",
 		"output": fmt.Sprintf("Updated to %s", update.TargetVersion),
 	})
@@ -626,40 +973,7 @@ func (d *Daemon) usageScanLoop(ctx context.Context) {
 	scanner := usage.NewScanner(d.logger)
 
 	report := func() {
-		records := scanner.Scan()
-		if len(records) == 0 {
-			return
-		}
-
-		// Build provider -> runtime ID mapping from current state.
-		providerToRuntime := d.providerToRuntimeMap()
-
-		// Group records by provider to send to the correct runtime.
-		byProvider := make(map[string][]map[string]any)
-		for _, r := range records {
-			byProvider[r.Provider] = append(byProvider[r.Provider], map[string]any{
-				"date":               r.Date,
-				"provider":           r.Provider,
-				"model":              r.Model,
-				"input_tokens":       r.InputTokens,
-				"output_tokens":      r.OutputTokens,
-				"cache_read_tokens":  r.CacheReadTokens,
-				"cache_write_tokens": r.CacheWriteTokens,
-			})
-		}
-
-		for provider, entries := range byProvider {
-			runtimeID, ok := providerToRuntime[provider]
-			if !ok {
-				d.logger.Debug("no runtime for provider, skipping usage report", "provider", provider)
-				continue
-			}
-			if err := d.client.ReportUsage(ctx, runtimeID, entries); err != nil {
-				d.logger.Warn("usage report failed", "provider", provider, "runtime_id", runtimeID, "error", err)
-			} else {
-				d.logger.Info("usage reported", "provider", provider, "runtime_id", runtimeID, "entries", len(entries))
-			}
-		}
+		d.reportUsageRecords(ctx, scanner.Scan())
 	}
 
 	// Initial scan on startup.
@@ -674,6 +988,46 @@ func (d *Daemon) usageScanLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			report()
+		}
+	}
+}
+
+func (d *Daemon) reportUsageRecords(ctx context.Context, records []usage.Record) {
+	if len(records) == 0 {
+		return
+	}
+
+	providerToRuntime := d.providerToRuntimeIDs()
+	byProvider := make(map[string][]map[string]any)
+	for _, r := range records {
+		byProvider[r.Provider] = append(byProvider[r.Provider], map[string]any{
+			"date":               r.Date,
+			"provider":           r.Provider,
+			"model":              r.Model,
+			"input_tokens":       r.InputTokens,
+			"output_tokens":      r.OutputTokens,
+			"cache_read_tokens":  r.CacheReadTokens,
+			"cache_write_tokens": r.CacheWriteTokens,
+		})
+	}
+
+	for provider, entries := range byProvider {
+		runtimeIDs, ok := providerToRuntime[provider]
+		if !ok || len(runtimeIDs) == 0 {
+			d.logger.Debug("no runtime for provider, skipping usage report", "provider", provider)
+			continue
+		}
+		if len(runtimeIDs) > 1 {
+			d.logger.Warn("usage report skipped due to ambiguous provider routing", "provider", provider, "runtime_ids", runtimeIDs)
+			continue
+		}
+		runtimeID := runtimeIDs[0]
+		if err := d.withRuntimeAuth(ctx, runtimeID, true, func(token string) error {
+			return d.client.ReportUsage(ctx, runtimeID, token, entries)
+		}); err != nil {
+			d.logger.Warn("usage report failed", "provider", provider, "runtime_id", runtimeID, "error", err)
+		} else {
+			d.logger.Info("usage reported", "provider", provider, "runtime_id", runtimeID, "entries", len(entries))
 		}
 	}
 }
@@ -722,7 +1076,7 @@ func (d *Daemon) pollLoop(ctx context.Context) error {
 			}
 
 			rid := runtimeIDs[(pollOffset+i)%n]
-			task, err := d.client.ClaimTask(ctx, rid)
+			task, err := d.claimTaskForRuntime(ctx, rid)
 			if err != nil {
 				<-sem // Release the slot.
 				d.logger.Warn("claim task failed", "runtime_id", rid, "error", err)
@@ -775,15 +1129,21 @@ func (d *Daemon) handleTask(ctx context.Context, task Task) {
 	}
 	taskLog.Info("picked task", "issue", task.IssueID, "agent", agentName, "provider", provider)
 
-	if err := d.client.StartTask(ctx, task.ID); err != nil {
+	if err := d.withWorkspaceDaemonAuth(ctx, task.WorkspaceID, true, func(token string) error {
+		return d.client.StartTask(ctx, task.ID, token)
+	}); err != nil {
 		taskLog.Error("start task failed", "error", err)
-		if failErr := d.client.FailTask(ctx, task.ID, fmt.Sprintf("start task failed: %s", err.Error())); failErr != nil {
+		if failErr := d.withWorkspaceDaemonAuth(ctx, task.WorkspaceID, true, func(token string) error {
+			return d.client.FailTask(ctx, task.ID, token, fmt.Sprintf("start task failed: %s", err.Error()))
+		}); failErr != nil {
 			taskLog.Error("fail task after start error", "error", failErr)
 		}
 		return
 	}
 
-	_ = d.client.ReportProgress(ctx, task.ID, fmt.Sprintf("Launching %s", provider), 1, 2)
+	_ = d.withWorkspaceDaemonAuth(ctx, task.WorkspaceID, true, func(token string) error {
+		return d.client.ReportProgress(ctx, task.ID, token, fmt.Sprintf("Launching %s", provider), 1, 2)
+	})
 
 	// Create a cancellable context so we can interrupt the running agent
 	// when the server-side task status changes to 'cancelled'.
@@ -800,7 +1160,16 @@ func (d *Daemon) handleTask(ctx context.Context, task Task) {
 			case <-runCtx.Done():
 				return
 			case <-ticker.C:
-				if status, err := d.client.GetTaskStatus(ctx, task.ID); err == nil && status == "cancelled" {
+				var status string
+				err := d.withWorkspaceDaemonAuth(ctx, task.WorkspaceID, true, func(token string) error {
+					currentStatus, statusErr := d.client.GetTaskStatus(ctx, task.ID, token)
+					if statusErr != nil {
+						return statusErr
+					}
+					status = currentStatus
+					return nil
+				})
+				if err == nil && status == "cancelled" {
 					taskLog.Info("task cancelled by server, interrupting agent")
 					runCancel()
 					close(cancelledByPoll)
@@ -822,43 +1191,82 @@ func (d *Daemon) handleTask(ctx context.Context, task Task) {
 
 	if err != nil {
 		taskLog.Error("task failed", "error", err)
-		if failErr := d.client.FailTask(ctx, task.ID, err.Error()); failErr != nil {
+		if failErr := d.withWorkspaceDaemonAuth(ctx, task.WorkspaceID, true, func(token string) error {
+			return d.client.FailTask(ctx, task.ID, token, err.Error())
+		}); failErr != nil {
 			taskLog.Error("fail task callback failed", "error", failErr)
 		}
 		return
 	}
 
-	_ = d.client.ReportProgress(ctx, task.ID, "Finishing task", 2, 2)
+	_ = d.withWorkspaceDaemonAuth(ctx, task.WorkspaceID, true, func(token string) error {
+		return d.client.ReportProgress(ctx, task.ID, token, "Finishing task", 2, 2)
+	})
 
 	// Check if the task was cancelled while it was running (e.g. issue
 	// was reassigned). If so, skip reporting results — the server already
 	// moved the task to 'cancelled' so complete/fail would fail anyway.
-	if status, err := d.client.GetTaskStatus(ctx, task.ID); err == nil && status == "cancelled" {
+	var finalStatus string
+	if err := d.withWorkspaceDaemonAuth(ctx, task.WorkspaceID, true, func(token string) error {
+		status, statusErr := d.client.GetTaskStatus(ctx, task.ID, token)
+		if statusErr != nil {
+			return statusErr
+		}
+		finalStatus = status
+		return nil
+	}); err == nil && finalStatus == "cancelled" {
 		taskLog.Info("task cancelled during execution, discarding result")
 		return
 	}
 
-	// Report usage independently so it's captured even for failed/blocked tasks.
 	if len(result.Usage) > 0 {
-		if err := d.client.ReportTaskUsage(ctx, task.ID, result.Usage); err != nil {
+		if err := d.withWorkspaceDaemonAuth(ctx, task.WorkspaceID, true, func(token string) error {
+			return d.client.ReportTaskUsage(ctx, task.ID, token, result.Usage)
+		}); err != nil {
 			taskLog.Warn("report task usage failed", "error", err)
 		}
 	}
 
 	switch result.Status {
 	case "blocked":
-		if err := d.client.FailTask(ctx, task.ID, result.Comment); err != nil {
+		if err := d.withWorkspaceDaemonAuth(ctx, task.WorkspaceID, true, func(token string) error {
+			return d.client.FailTask(ctx, task.ID, token, result.Comment)
+		}); err != nil {
 			taskLog.Error("report blocked task failed", "error", err)
 		}
 	default:
 		taskLog.Info("task completed", "status", result.Status)
-		if err := d.client.CompleteTask(ctx, task.ID, result.Comment, result.BranchName, result.SessionID, result.WorkDir); err != nil {
+		if err := d.withWorkspaceDaemonAuth(ctx, task.WorkspaceID, true, func(token string) error {
+			return d.client.CompleteTask(ctx, task.ID, token, result.Comment, result.BranchName, result.SessionID, result.WorkDir)
+		}); err != nil {
 			taskLog.Error("complete task failed, falling back to fail", "error", err)
-			if failErr := d.client.FailTask(ctx, task.ID, fmt.Sprintf("complete task failed: %s", err.Error())); failErr != nil {
+			if failErr := d.withWorkspaceDaemonAuth(ctx, task.WorkspaceID, true, func(token string) error {
+				return d.client.FailTask(ctx, task.ID, token, fmt.Sprintf("complete task failed: %s", err.Error()))
+			}); failErr != nil {
 				taskLog.Error("fail task fallback also failed", "error", failErr)
 			}
 		}
 	}
+}
+
+func (d *Daemon) buildAgentEnv(task Task, agentName string, env *execenv.Environment) map[string]string {
+	agentEnv := map[string]string{
+		"MULTICA_TOKEN":        d.userToken,
+		"MULTICA_SERVER_URL":   d.cfg.ServerBaseURL,
+		"MULTICA_DAEMON_PORT":  fmt.Sprintf("%d", d.cfg.HealthPort),
+		"MULTICA_WORKSPACE_ID": task.WorkspaceID,
+		"MULTICA_AGENT_NAME":   agentName,
+		"MULTICA_AGENT_ID":     task.AgentID,
+		"MULTICA_TASK_ID":      task.ID,
+	}
+	if selfBin, err := os.Executable(); err == nil {
+		binDir := filepath.Dir(selfBin)
+		agentEnv["PATH"] = binDir + string(os.PathListSeparator) + os.Getenv("PATH")
+	}
+	if env != nil && env.CodexHome != "" {
+		agentEnv["CODEX_HOME"] = env.CodexHome
+	}
+	return agentEnv
 }
 
 func (d *Daemon) runTask(ctx context.Context, task Task, provider string, taskLog *slog.Logger) (TaskResult, error) {
@@ -934,28 +1342,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, taskLo
 
 	// Pass the daemon's auth credentials and context so the spawned agent CLI
 	// can call the Multica API and the local daemon (e.g. `multica repo checkout`).
-	agentEnv := map[string]string{
-		"MULTICA_TOKEN":        d.client.Token(),
-		"MULTICA_SERVER_URL":   d.cfg.ServerBaseURL,
-		"MULTICA_DAEMON_PORT":  fmt.Sprintf("%d", d.cfg.HealthPort),
-		"MULTICA_WORKSPACE_ID": task.WorkspaceID,
-		"MULTICA_AGENT_NAME":   agentName,
-		"MULTICA_AGENT_ID":     task.AgentID,
-		"MULTICA_TASK_ID":      task.ID,
-	}
-	// Ensure the multica CLI is on PATH inside the agent's environment.
-	// Some runtimes (e.g. Codex) run in an isolated sandbox that may not
-	// inherit the daemon's PATH. Prepend the directory of the running
-	// multica binary so that `multica` commands in the agent always resolve.
-	if selfBin, err := os.Executable(); err == nil {
-		binDir := filepath.Dir(selfBin)
-		agentEnv["PATH"] = binDir + string(os.PathListSeparator) + os.Getenv("PATH")
-	}
-	// Point Codex to the per-task CODEX_HOME so it discovers skills natively
-	// without polluting the system ~/.codex/skills/.
-	if env.CodexHome != "" {
-		agentEnv["CODEX_HOME"] = env.CodexHome
-	}
+	agentEnv := d.buildAgentEnv(task, agentName, env)
 	backend, err := agent.New(provider, agent.Config{
 		ExecutablePath: entry.Path,
 		Env:            agentEnv,
@@ -1027,7 +1414,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, taskLo
 
 			if len(toSend) > 0 {
 				sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				if err := d.client.ReportTaskMessages(sendCtx, task.ID, toSend); err != nil {
+				if err := d.withWorkspaceDaemonAuth(sendCtx, task.WorkspaceID, true, func(token string) error {
+					return d.client.ReportTaskMessages(sendCtx, task.ID, token, toSend)
+				}); err != nil {
 					taskLog.Debug("failed to report task messages", "error", err)
 				}
 				cancel()

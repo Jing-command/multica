@@ -58,7 +58,7 @@ func resolveToken(cmd *cobra.Command) string {
 	}
 	profile := resolveProfile(cmd)
 	cfg, _ := cli.LoadCLIConfigForProfile(profile)
-	return cfg.Token
+	return cfg.UserToken
 }
 
 func resolveAppURL(cmd *cobra.Command) string {
@@ -208,13 +208,10 @@ func runAuthLoginBrowser(cmd *cobra.Command) error {
 	// Save to config. Reset workspace data on every login — the user or
 	// server may have changed, so stale workspaces must not persist.
 	profile := resolveProfile(cmd)
-	cfg, _ := cli.LoadCLIConfigForProfile(profile)
-	cfg.WorkspaceID = ""
-	cfg.WatchedWorkspaces = nil
-	cfg.Token = patResp.Token
-	cfg.ServerURL = serverURL
-	cfg.AppURL = appURL
-	if err := cli.SaveCLIConfigForProfile(cfg, profile); err != nil {
+	if err := cli.UpdateCLIConfigForProfile(profile, func(cfg *cli.CLIConfig) error {
+		persistLogin(cfg, patResp.Token, serverURL, appURL)
+		return nil
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
@@ -251,12 +248,10 @@ func runAuthLoginToken(cmd *cobra.Command) error {
 	}
 
 	profile := resolveProfile(cmd)
-	cfg, _ := cli.LoadCLIConfigForProfile(profile)
-	cfg.WorkspaceID = ""
-	cfg.WatchedWorkspaces = nil
-	cfg.Token = token
-	cfg.ServerURL = serverURL
-	if err := cli.SaveCLIConfigForProfile(cfg, profile); err != nil {
+	if err := cli.UpdateCLIConfigForProfile(profile, func(cfg *cli.CLIConfig) error {
+		persistLogin(cfg, token, serverURL, "")
+		return nil
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
@@ -335,17 +330,32 @@ const callbackSuccessHTML = `<!DOCTYPE html>
 </body>
 </html>`
 
+func persistLogin(cfg *cli.CLIConfig, userToken, serverURL, appURL string) {
+	cfg.WorkspaceID = ""
+	cfg.WatchedWorkspaces = nil
+	cfg.DaemonAuth = nil
+	cfg.UserToken = userToken
+	cfg.ServerURL = serverURL
+	if appURL != "" {
+		cfg.AppURL = appURL
+	}
+}
+
 func runAuthLogout(cmd *cobra.Command, _ []string) error {
 	profile := resolveProfile(cmd)
-	cfg, _ := cli.LoadCLIConfigForProfile(profile)
-	if cfg.Token == "" {
-		fmt.Fprintln(os.Stderr, "Not authenticated.")
+	hadAuth := false
+	if err := cli.UpdateCLIConfigForProfile(profile, func(cfg *cli.CLIConfig) error {
+		hadAuth = cfg.UserToken != "" || len(cfg.DaemonAuth) > 0
+		cfg.UserToken = ""
+		cfg.DaemonAuth = nil
 		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to save config: %w", err)
 	}
 
-	cfg.Token = ""
-	if err := cli.SaveCLIConfigForProfile(cfg, profile); err != nil {
-		return fmt.Errorf("failed to save config: %w", err)
+	if !hadAuth {
+		fmt.Fprintln(os.Stderr, "Not authenticated.")
+		return nil
 	}
 
 	fmt.Fprintln(os.Stderr, "Token removed. You are now logged out.")

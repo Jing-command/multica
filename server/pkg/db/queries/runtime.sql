@@ -11,6 +11,10 @@ WHERE id = $1;
 SELECT * FROM agent_runtime
 WHERE id = $1 AND workspace_id = $2;
 
+-- name: GetAgentRuntimeForDaemonScope :one
+SELECT * FROM agent_runtime
+WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3;
+
 -- name: UpsertAgentRuntime :one
 INSERT INTO agent_runtime (
     workspace_id,
@@ -42,10 +46,21 @@ SET status = 'online', last_seen_at = now(), updated_at = now()
 WHERE id = $1
 RETURNING *;
 
+-- name: UpdateAgentRuntimeHeartbeatForDaemonScope :one
+UPDATE agent_runtime
+SET status = 'online', last_seen_at = now(), updated_at = now()
+WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3
+RETURNING *;
+
 -- name: SetAgentRuntimeOffline :exec
 UPDATE agent_runtime
 SET status = 'offline', updated_at = now()
 WHERE id = $1;
+
+-- name: SetAgentRuntimeOfflineForDaemonScope :exec
+UPDATE agent_runtime
+SET status = 'offline', updated_at = now()
+WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3;
 
 -- name: MarkStaleRuntimesOffline :many
 UPDATE agent_runtime

@@ -16,6 +16,7 @@ type daemonContextKey int
 const (
 	ctxKeyDaemonWorkspaceID daemonContextKey = iota
 	ctxKeyDaemonID
+	ctxKeyDaemonUserID
 )
 
 // DaemonWorkspaceIDFromContext returns the workspace ID set by DaemonAuth middleware.
@@ -30,14 +31,19 @@ func DaemonIDFromContext(ctx context.Context) string {
 	return id
 }
 
+// DaemonUserIDFromContext returns the enroll user ID set by DaemonAuth middleware.
+func DaemonUserIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(ctxKeyDaemonUserID).(string)
+	return id
+}
+
 // DaemonContextWithIdentity sets daemon identity values on a context.
 func DaemonContextWithIdentity(ctx context.Context, workspaceID, daemonID string) context.Context {
 	ctx = context.WithValue(ctx, ctxKeyDaemonWorkspaceID, workspaceID)
 	return context.WithValue(ctx, ctxKeyDaemonID, daemonID)
 }
 
-// DaemonAuth validates daemon machine tokens and binds the authenticated
-// daemon workspace/daemon identity into request context.
+// DaemonAuth validates only daemon auth tokens with the mdt_ prefix.
 func DaemonAuth(queries *db.Queries) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -54,10 +60,13 @@ func DaemonAuth(queries *db.Queries) func(http.Handler) http.Handler {
 				writeError(w, http.StatusUnauthorized, "invalid authorization format")
 				return
 			}
-
 			if !strings.HasPrefix(tokenString, "mdt_") {
 				slog.Warn("daemon_auth: rejected non-daemon token", "path", r.URL.Path)
-				writeError(w, http.StatusUnauthorized, "daemon token required")
+				writeError(w, http.StatusUnauthorized, "invalid daemon token")
+				return
+			}
+			if queries == nil {
+				writeError(w, http.StatusUnauthorized, "invalid daemon token")
 				return
 			}
 
@@ -71,6 +80,7 @@ func DaemonAuth(queries *db.Queries) func(http.Handler) http.Handler {
 
 			ctx := context.WithValue(r.Context(), ctxKeyDaemonWorkspaceID, uuidToString(dt.WorkspaceID))
 			ctx = context.WithValue(ctx, ctxKeyDaemonID, dt.DaemonID)
+			ctx = context.WithValue(ctx, ctxKeyDaemonUserID, uuidToString(dt.UserID))
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

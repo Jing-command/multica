@@ -163,12 +163,24 @@ func (h *Handler) GetUpdate(w http.ResponseWriter, r *http.Request) {
 // ReportUpdateResult receives the update result from the daemon.
 func (h *Handler) ReportUpdateResult(w http.ResponseWriter, r *http.Request) {
 	runtimeID := chi.URLParam(r, "runtimeId")
-	if _, ok := h.loadDaemonRuntime(r, runtimeID); !ok {
-		writeError(w, http.StatusNotFound, "runtime not found")
+	if _, ok := h.requireDaemonRuntimeScope(w, r, runtimeID); !ok {
 		return
 	}
 
 	updateID := chi.URLParam(r, "updateId")
+
+	update, loadErr := h.getUpdateRequest(r.Context(), updateID)
+	if loadErr != nil {
+		if isNotFound(loadErr) {
+			writeError(w, http.StatusNotFound, "update not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load update")
+		return
+	}
+	if _, ok := h.requireDaemonRuntimeScope(w, r, update.RuntimeID); !ok {
+		return
+	}
 
 	var req struct {
 		Status string `json:"status"`

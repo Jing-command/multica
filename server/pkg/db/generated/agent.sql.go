@@ -513,6 +513,42 @@ func (q *Queries) GetAgentTask(ctx context.Context, id pgtype.UUID) (AgentTaskQu
 	return i, err
 }
 
+const getAgentTaskForDaemonScope = `-- name: GetAgentTaskForDaemonScope :one
+SELECT atq.id, atq.agent_id, atq.issue_id, atq.status, atq.priority, atq.dispatched_at, atq.started_at, atq.completed_at, atq.result, atq.error, atq.created_at, atq.context, atq.runtime_id, atq.session_id, atq.work_dir, atq.trigger_comment_id FROM agent_task_queue atq
+JOIN agent_runtime ar ON ar.id = atq.runtime_id
+WHERE atq.id = $1 AND ar.workspace_id = $2 AND ar.daemon_id = $3
+`
+
+type GetAgentTaskForDaemonScopeParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	DaemonID    pgtype.Text `json:"daemon_id"`
+}
+
+func (q *Queries) GetAgentTaskForDaemonScope(ctx context.Context, arg GetAgentTaskForDaemonScopeParams) (AgentTaskQueue, error) {
+	row := q.db.QueryRow(ctx, getAgentTaskForDaemonScope, arg.ID, arg.WorkspaceID, arg.DaemonID)
+	var i AgentTaskQueue
+	err := row.Scan(
+		&i.ID,
+		&i.AgentID,
+		&i.IssueID,
+		&i.Status,
+		&i.Priority,
+		&i.DispatchedAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.Result,
+		&i.Error,
+		&i.CreatedAt,
+		&i.Context,
+		&i.RuntimeID,
+		&i.SessionID,
+		&i.WorkDir,
+		&i.TriggerCommentID,
+	)
+	return i, err
+}
+
 const getLastTaskSession = `-- name: GetLastTaskSession :one
 SELECT session_id, work_dir FROM agent_task_queue
 WHERE agent_id = $1 AND issue_id = $2 AND status = 'completed' AND session_id IS NOT NULL
@@ -826,6 +862,57 @@ func (q *Queries) ListPendingTasksByRuntime(ctx context.Context, runtimeID pgtyp
 	return items, nil
 }
 
+const listPendingTasksByRuntimeForDaemonScope = `-- name: ListPendingTasksByRuntimeForDaemonScope :many
+SELECT atq.id, atq.agent_id, atq.issue_id, atq.status, atq.priority, atq.dispatched_at, atq.started_at, atq.completed_at, atq.result, atq.error, atq.created_at, atq.context, atq.runtime_id, atq.session_id, atq.work_dir, atq.trigger_comment_id FROM agent_task_queue atq
+JOIN agent_runtime ar ON ar.id = atq.runtime_id
+WHERE atq.runtime_id = $1 AND atq.status IN ('queued', 'dispatched')
+  AND ar.workspace_id = $2 AND ar.daemon_id = $3
+ORDER BY atq.priority DESC, atq.created_at ASC
+`
+
+type ListPendingTasksByRuntimeForDaemonScopeParams struct {
+	RuntimeID    pgtype.UUID `json:"runtime_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	DaemonID    pgtype.Text `json:"daemon_id"`
+}
+
+func (q *Queries) ListPendingTasksByRuntimeForDaemonScope(ctx context.Context, arg ListPendingTasksByRuntimeForDaemonScopeParams) ([]AgentTaskQueue, error) {
+	rows, err := q.db.Query(ctx, listPendingTasksByRuntimeForDaemonScope, arg.RuntimeID, arg.WorkspaceID, arg.DaemonID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AgentTaskQueue{}
+	for rows.Next() {
+		var i AgentTaskQueue
+		if err := rows.Scan(
+			&i.ID,
+			&i.AgentID,
+			&i.IssueID,
+			&i.Status,
+			&i.Priority,
+			&i.DispatchedAt,
+			&i.StartedAt,
+			&i.CompletedAt,
+			&i.Result,
+			&i.Error,
+			&i.CreatedAt,
+			&i.Context,
+			&i.RuntimeID,
+			&i.SessionID,
+			&i.WorkDir,
+			&i.TriggerCommentID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listTasksByIssue = `-- name: ListTasksByIssue :many
 SELECT id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id FROM agent_task_queue
 WHERE issue_id = $1
@@ -992,6 +1079,44 @@ func (q *Queries) UpdateAgent(ctx context.Context, arg UpdateAgentParams) (Agent
 		arg.MaxConcurrentTasks,
 		arg.Instructions,
 	)
+	var i Agent
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Name,
+		&i.AvatarUrl,
+		&i.RuntimeMode,
+		&i.RuntimeConfig,
+		&i.Visibility,
+		&i.Status,
+		&i.MaxConcurrentTasks,
+		&i.OwnerID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Description,
+		&i.RuntimeID,
+		&i.Instructions,
+		&i.ArchivedAt,
+		&i.ArchivedBy,
+	)
+	return i, err
+}
+
+const updateAgentOwner = `-- name: UpdateAgentOwner :one
+UPDATE agent SET
+    owner_id = $2,
+    updated_at = now()
+WHERE id = $1
+RETURNING id, workspace_id, name, avatar_url, runtime_mode, runtime_config, visibility, status, max_concurrent_tasks, owner_id, created_at, updated_at, description, runtime_id, instructions, archived_at, archived_by
+`
+
+type UpdateAgentOwnerParams struct {
+	ID      pgtype.UUID `json:"id"`
+	OwnerID pgtype.UUID `json:"owner_id"`
+}
+
+func (q *Queries) UpdateAgentOwner(ctx context.Context, arg UpdateAgentOwnerParams) (Agent, error) {
+	row := q.db.QueryRow(ctx, updateAgentOwner, arg.ID, arg.OwnerID)
 	var i Agent
 	err := row.Scan(
 		&i.ID,

@@ -17,6 +17,7 @@ import (
 	"unsafe"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/events"
@@ -1410,6 +1411,41 @@ func TestResolveActor(t *testing.T) {
 }
 
 func TestDaemonRegisterMissingWorkspaceReturns404(t *testing.T) {
+	ctx := context.Background()
+
+	var removedWorkspaceID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO workspace (name, slug, description, issue_prefix)
+		VALUES ('Removed Workspace', 'removed-workspace-register-test', 'temp', 'RMR')
+		RETURNING id
+	`).Scan(&removedWorkspaceID); err != nil {
+		t.Fatalf("insert workspace: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO member (workspace_id, user_id, role)
+		VALUES ($1, $2, 'owner')
+	`, removedWorkspaceID, testUserID); err != nil {
+		t.Fatalf("insert member: %v", err)
+	}
+
+	rawToken, err := auth.GenerateDaemonToken()
+	if err != nil {
+		t.Fatalf("GenerateDaemonToken: %v", err)
+	}
+	if _, err := testHandler.Queries.CreateDaemonToken(ctx, db.CreateDaemonTokenParams{
+		TokenHash:   auth.HashToken(rawToken),
+		WorkspaceID: parseUUID(removedWorkspaceID),
+		DaemonID:    "local-daemon",
+		UserID:      parseUUID(testUserID),
+		ExpiresAt:   pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+	}); err != nil {
+		t.Fatalf("CreateDaemonToken: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `DELETE FROM workspace WHERE id = $1`, removedWorkspaceID); err != nil {
+		t.Fatalf("delete workspace: %v", err)
+	}
+
+	handler := middleware.DaemonAuth(testHandler.Queries)(http.HandlerFunc(testHandler.DaemonRegister))
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/daemon/register", bytes.NewBufferString(`{
 		"workspace_id":"00000000-0000-0000-0000-000000000001",
@@ -1418,9 +1454,9 @@ func TestDaemonRegisterMissingWorkspaceReturns404(t *testing.T) {
 		"runtimes":[{"name":"Local Codex","type":"codex","version":"1.0.0","status":"online"}]
 	}`))
 	req.Header.Set("Content-Type", "application/json")
-	req = withDaemonIdentity(req, "00000000-0000-0000-0000-000000000001", "local-daemon")
+	req.Header.Set("Authorization", "Bearer "+rawToken)
 
-	testHandler.DaemonRegister(w, req)
+	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("DaemonRegister: expected 404, got %d: %s", w.Code, w.Body.String())
 	}
@@ -1791,4 +1827,291 @@ func TestGetPingTimesOutAfterHeartbeatClaimsIt(t *testing.T) {
 	if got.Error != "daemon did not respond within 60 seconds" {
 		t.Fatalf("ping error = %q, want timeout error", got.Error)
 	}
+}
+
+func TestDaemonRegisterUsesEnrollUserAsOwner(t *testing.T) {
+	ctx := context.Background()
+
+	var enrollUserID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO "user" (name, email)
+		VALUES ('Daemon Enroller', 'daemon-enroller@multica.ai')
+		RETURNING id
+	`).Scan(&enrollUserID); err != nil {
+		t.Fatalf("insert enroll user: %v", err)
+	}
+	defer testPool.Exec(ctx, `DELETE FROM "user" WHERE id = $1`, enrollUserID)
+
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO member (workspace_id, user_id, role)
+		VALUES ($1, $2, 'member')
+	`, testWorkspaceID, enrollUserID); err != nil {
+		t.Fatalf("insert enroll member: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	enrollReq := httptest.NewRequest("POST", "/api/daemon/workspaces/"+testWorkspaceID+"/enroll", bytes.NewBufferString(`{"daemon_id":"owned-daemon"}`))
+	enrollReq.Header.Set("Content-Type", "application/json")
+	enrollReq.Header.Set("X-User-ID", enrollUserID)
+	enrollReq = withURLParam(enrollReq, "workspaceId", testWorkspaceID)
+	testHandler.DaemonEnroll(w, enrollReq)
+	if w.Code != http.StatusOK {
+		t.Fatalf("DaemonEnroll: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var enrollResp struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&enrollResp); err != nil {
+		t.Fatalf("DaemonEnroll: decode response: %v", err)
+	}
+	defer testPool.Exec(ctx, `DELETE FROM daemon_token WHERE daemon_id = $1`, "owned-daemon")
+	defer testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE daemon_id = $1`, "owned-daemon")
+	defer testPool.Exec(ctx, `DELETE FROM agent WHERE workspace_id = $1 AND name = $2`, testWorkspaceID, orchestratorName)
+	if _, err := testPool.Exec(ctx, `DELETE FROM agent WHERE workspace_id = $1 AND name = $2`, testWorkspaceID, orchestratorName); err != nil {
+		t.Fatalf("delete existing orchestrator: %v", err)
+	}
+
+	handler := middleware.DaemonAuth(testHandler.Queries)(http.HandlerFunc(testHandler.DaemonRegister))
+
+	w = httptest.NewRecorder()
+	registerReq := httptest.NewRequest("POST", "/api/daemon/register", bytes.NewBufferString(`{
+		"device_name":"test-machine",
+		"runtimes":[{"name":"Local Claude","type":"claude","version":"1.0.0","status":"online"}]
+	}`))
+	registerReq.Header.Set("Content-Type", "application/json")
+	registerReq.Header.Set("Authorization", "Bearer "+enrollResp.Token)
+	handler.ServeHTTP(w, registerReq)
+	if w.Code != http.StatusOK {
+		t.Fatalf("DaemonRegister: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var runtimeOwnerID string
+	if err := testPool.QueryRow(ctx, `
+		SELECT owner_id::text
+		FROM agent_runtime
+		WHERE daemon_id = $1
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, "owned-daemon").Scan(&runtimeOwnerID); err != nil {
+		t.Fatalf("load runtime owner: %v", err)
+	}
+	if runtimeOwnerID != enrollUserID {
+		t.Fatalf("runtime owner = %q, want enroll user %q", runtimeOwnerID, enrollUserID)
+	}
+
+	var orchestratorOwnerID string
+	if err := testPool.QueryRow(ctx, `
+		SELECT owner_id::text
+		FROM agent
+		WHERE workspace_id = $1 AND name = $2 AND archived_at IS NULL
+	`, testWorkspaceID, orchestratorName).Scan(&orchestratorOwnerID); err != nil {
+		t.Fatalf("load orchestrator owner: %v", err)
+	}
+	if orchestratorOwnerID != enrollUserID {
+		t.Fatalf("orchestrator owner = %q, want enroll user %q", orchestratorOwnerID, enrollUserID)
+	}
+}
+
+func TestDaemonScopedRuntimeAndTaskEndpointsRejectForeignResources(t *testing.T) {
+	ctx := context.Background()
+	fx := createDaemonScopeFixture(t, ctx)
+
+	t.Run("runtime endpoint rejects foreign daemon runtime", func(t *testing.T) {
+		handler := middleware.DaemonAuth(testHandler.Queries)(http.HandlerFunc(testHandler.DaemonHeartbeat))
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/api/daemon/heartbeat", bytes.NewBufferString(`{"runtime_id":"`+fx.foreignRuntimeID+`"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+fx.primaryToken)
+
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("DaemonHeartbeat: expected 403 for foreign runtime, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("runtime endpoint rejects cross workspace runtime", func(t *testing.T) {
+		handler := middleware.DaemonAuth(testHandler.Queries)(http.HandlerFunc(testHandler.ReportRuntimeUsage))
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/api/daemon/runtimes/"+fx.crossWorkspaceRuntimeID+"/usage", bytes.NewBufferString(`{"entries":[]}`))
+		req = withURLParam(req, "runtimeId", fx.crossWorkspaceRuntimeID)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+fx.primaryToken)
+
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("ReportRuntimeUsage: expected 403 for cross-workspace runtime, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("task endpoint rejects foreign daemon task", func(t *testing.T) {
+		handler := middleware.DaemonAuth(testHandler.Queries)(http.HandlerFunc(testHandler.GetTaskStatus))
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/daemon/tasks/"+fx.foreignTaskID+"/status", nil)
+		req = withURLParam(req, "taskId", fx.foreignTaskID)
+		req.Header.Set("Authorization", "Bearer "+fx.primaryToken)
+
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("GetTaskStatus: expected 403 for foreign task, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("task endpoint rejects cross workspace task", func(t *testing.T) {
+		handler := middleware.DaemonAuth(testHandler.Queries)(http.HandlerFunc(testHandler.ListTaskMessages))
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/daemon/tasks/"+fx.crossWorkspaceTaskID+"/messages", nil)
+		req = withURLParam(req, "taskId", fx.crossWorkspaceTaskID)
+		req.Header.Set("Authorization", "Bearer "+fx.primaryToken)
+
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("ListTaskMessages: expected 403 for cross-workspace task, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+}
+
+type daemonScopeFixture struct {
+	primaryToken            string
+	foreignRuntimeID        string
+	crossWorkspaceRuntimeID string
+	foreignTaskID           string
+	crossWorkspaceTaskID    string
+}
+
+func createDaemonScopeFixture(t *testing.T, ctx context.Context) daemonScopeFixture {
+	t.Helper()
+
+	var primaryRuntimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, owner_id, last_seen_at)
+		VALUES ($1, 'scope-primary-daemon', 'Scope Primary Runtime', 'local', 'claude', 'online', 'primary device', '{}'::jsonb, $2, now())
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&primaryRuntimeID); err != nil {
+		t.Fatalf("insert primary runtime: %v", err)
+	}
+
+	var foreignRuntimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, owner_id, last_seen_at)
+		VALUES ($1, 'scope-foreign-daemon', 'Scope Foreign Runtime', 'local', 'codex', 'online', 'foreign device', '{}'::jsonb, $2, now())
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&foreignRuntimeID); err != nil {
+		t.Fatalf("insert foreign runtime: %v", err)
+	}
+
+	var agentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (workspace_id, name, description, runtime_mode, runtime_config, runtime_id, visibility, max_concurrent_tasks, owner_id)
+		VALUES ($1, 'Scope Test Agent', '', 'local', '{}'::jsonb, $2, 'workspace', 1, $3)
+		RETURNING id
+	`, testWorkspaceID, primaryRuntimeID, testUserID).Scan(&agentID); err != nil {
+		t.Fatalf("insert agent: %v", err)
+	}
+
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number, position)
+		VALUES ($1, 'Scope test issue', 'todo', 'medium', 'member', $2, 12001, 0)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("insert issue: %v", err)
+	}
+
+	var foreignTaskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority)
+		VALUES ($1, $2, $3, 'queued', 0)
+		RETURNING id
+	`, agentID, foreignRuntimeID, issueID).Scan(&foreignTaskID); err != nil {
+		t.Fatalf("insert foreign task: %v", err)
+	}
+
+	var workspace2ID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO workspace (name, slug, description, issue_prefix)
+		VALUES ('Handler Scope Workspace 2', 'handler-scope-ws-2', 'Secondary workspace for daemon scope tests', 'HS2')
+		RETURNING id
+	`).Scan(&workspace2ID); err != nil {
+		t.Fatalf("insert secondary workspace: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO member (workspace_id, user_id, role)
+		VALUES ($1, $2, 'owner')
+	`, workspace2ID, testUserID); err != nil {
+		t.Fatalf("insert secondary member: %v", err)
+	}
+
+	var runtime2ID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, owner_id, last_seen_at)
+		VALUES ($1, 'scope-cross-workspace-daemon', 'Scope Cross Runtime', 'local', 'claude', 'online', 'cross workspace device', '{}'::jsonb, $2, now())
+		RETURNING id
+	`, workspace2ID, testUserID).Scan(&runtime2ID); err != nil {
+		t.Fatalf("insert cross-workspace runtime: %v", err)
+	}
+
+	var agent2ID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (workspace_id, name, description, runtime_mode, runtime_config, runtime_id, visibility, max_concurrent_tasks, owner_id)
+		VALUES ($1, 'Scope Cross Agent', '', 'local', '{}'::jsonb, $2, 'workspace', 1, $3)
+		RETURNING id
+	`, workspace2ID, runtime2ID, testUserID).Scan(&agent2ID); err != nil {
+		t.Fatalf("insert cross-workspace agent: %v", err)
+	}
+
+	var issue2ID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number, position)
+		VALUES ($1, 'Scope cross issue', 'todo', 'medium', 'member', $2, 12002, 0)
+		RETURNING id
+	`, workspace2ID, testUserID).Scan(&issue2ID); err != nil {
+		t.Fatalf("insert cross-workspace issue: %v", err)
+	}
+
+	var crossWorkspaceTaskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority)
+		VALUES ($1, $2, $3, 'queued', 0)
+		RETURNING id
+	`, agent2ID, runtime2ID, issue2ID).Scan(&crossWorkspaceTaskID); err != nil {
+		t.Fatalf("insert cross-workspace task: %v", err)
+	}
+
+	primaryToken := createDaemonTokenForTest(t, ctx, testWorkspaceID, "scope-primary-daemon")
+
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM daemon_token WHERE daemon_id IN ('scope-primary-daemon', 'scope-foreign-daemon', 'scope-cross-workspace-daemon')`)
+		testPool.Exec(ctx, `DELETE FROM workspace WHERE slug = 'handler-scope-ws-2'`)
+		testPool.Exec(ctx, `DELETE FROM issue WHERE id IN ($1, $2)`, issueID, issue2ID)
+		testPool.Exec(ctx, `DELETE FROM agent WHERE id IN ($1, $2)`, agentID, agent2ID)
+		testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE id IN ($1, $2, $3)`, primaryRuntimeID, foreignRuntimeID, runtime2ID)
+	})
+
+	return daemonScopeFixture{
+		primaryToken:            primaryToken,
+		foreignRuntimeID:        foreignRuntimeID,
+		crossWorkspaceRuntimeID: runtime2ID,
+		foreignTaskID:           foreignTaskID,
+		crossWorkspaceTaskID:    crossWorkspaceTaskID,
+	}
+}
+
+func createDaemonTokenForTest(t *testing.T, ctx context.Context, workspaceID string, daemonID string) string {
+	t.Helper()
+
+	rawToken, err := auth.GenerateDaemonToken()
+	if err != nil {
+		t.Fatalf("GenerateDaemonToken: %v", err)
+	}
+	if _, err := testHandler.Queries.CreateDaemonToken(ctx, db.CreateDaemonTokenParams{
+		TokenHash:   auth.HashToken(rawToken),
+		WorkspaceID: parseUUID(workspaceID),
+		DaemonID:    daemonID,
+		UserID:      parseUUID(testUserID),
+		ExpiresAt:   pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+	}); err != nil {
+		t.Fatalf("CreateDaemonToken(%s): %v", daemonID, err)
+	}
+	return rawToken
 }
