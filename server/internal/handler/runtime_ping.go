@@ -1,19 +1,15 @@
 package handler
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/middleware"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
-
-// ---------------------------------------------------------------------------
-// In-memory ping store
-// ---------------------------------------------------------------------------
 
 // PingStatus represents the lifecycle of a runtime ping test.
 type PingStatus string
@@ -28,121 +24,31 @@ const (
 
 // PingRequest represents a pending or completed ping test.
 type PingRequest struct {
-	ID        string     `json:"id"`
-	RuntimeID string     `json:"runtime_id"`
-	Status    PingStatus `json:"status"`
-	Output    string     `json:"output,omitempty"`
-	Error     string     `json:"error,omitempty"`
-	DurationMs int64    `json:"duration_ms,omitempty"`
-	CreatedAt time.Time  `json:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
+	ID         string     `json:"id"`
+	RuntimeID  string     `json:"runtime_id"`
+	Status     PingStatus `json:"status"`
+	Output     string     `json:"output,omitempty"`
+	Error      string     `json:"error,omitempty"`
+	DurationMs int64      `json:"duration_ms,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
 }
 
-// PingStore is a thread-safe in-memory store for ping requests.
-// Pings expire after 2 minutes.
-type PingStore struct {
-	mu    sync.Mutex
-	pings map[string]*PingRequest // keyed by ping ID
+func runtimePingResponse(req db.RuntimePingRequest) PingRequest {
+	resp := PingRequest{
+		ID:        uuidToString(req.ID),
+		RuntimeID: uuidToString(req.RuntimeID),
+		Status:    PingStatus(req.Status),
+		Output:    req.Output,
+		Error:     req.Error,
+		CreatedAt: req.CreatedAt.Time,
+		UpdatedAt: req.UpdatedAt.Time,
+	}
+	if req.DurationMs.Valid {
+		resp.DurationMs = req.DurationMs.Int64
+	}
+	return resp
 }
-
-func NewPingStore() *PingStore {
-	return &PingStore{
-		pings: make(map[string]*PingRequest),
-	}
-}
-
-func (s *PingStore) Create(runtimeID string) *PingRequest {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Clean up old pings for this runtime
-	for id, p := range s.pings {
-		if time.Since(p.CreatedAt) > 2*time.Minute {
-			delete(s.pings, id)
-		}
-	}
-
-	ping := &PingRequest{
-		ID:        randomID(),
-		RuntimeID: runtimeID,
-		Status:    PingPending,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-	s.pings[ping.ID] = ping
-	return ping
-}
-
-func (s *PingStore) Get(id string) *PingRequest {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	p, ok := s.pings[id]
-	if !ok {
-		return nil
-	}
-	// Check for timeout
-	if p.Status == PingPending && time.Since(p.CreatedAt) > 60*time.Second {
-		p.Status = PingTimeout
-		p.Error = "daemon did not respond within 60 seconds"
-		p.UpdatedAt = time.Now()
-	}
-	return p
-}
-
-// PopPending returns and removes the oldest pending ping for a runtime.
-func (s *PingStore) PopPending(runtimeID string) *PingRequest {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var oldest *PingRequest
-	for _, p := range s.pings {
-		if p.RuntimeID == runtimeID && p.Status == PingPending {
-			if oldest == nil || p.CreatedAt.Before(oldest.CreatedAt) {
-				oldest = p
-			}
-		}
-	}
-	if oldest != nil {
-		oldest.Status = PingRunning
-		oldest.UpdatedAt = time.Now()
-	}
-	return oldest
-}
-
-func (s *PingStore) Complete(id string, output string, durationMs int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if p, ok := s.pings[id]; ok {
-		p.Status = PingCompleted
-		p.Output = output
-		p.DurationMs = durationMs
-		p.UpdatedAt = time.Now()
-	}
-}
-
-func (s *PingStore) Fail(id string, errMsg string, durationMs int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if p, ok := s.pings[id]; ok {
-		p.Status = PingFailed
-		p.Error = errMsg
-		p.DurationMs = durationMs
-		p.UpdatedAt = time.Now()
-	}
-}
-
-func randomID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
-// ---------------------------------------------------------------------------
-// Handlers
-// ---------------------------------------------------------------------------
 
 // InitiatePing creates a new ping request (protected route, called by frontend).
 func (h *Handler) InitiatePing(w http.ResponseWriter, r *http.Request) {
@@ -157,30 +63,71 @@ func (h *Handler) InitiatePing(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireWorkspaceMember(w, r, uuidToString(rt.WorkspaceID), "runtime not found"); !ok {
 		return
 	}
+	if !rt.DaemonID.Valid || rt.DaemonID.String == "" {
+		writeError(w, http.StatusConflict, "runtime is not bound to a daemon")
+		return
+	}
 
-	ping := h.PingStore.Create(runtimeID)
-	writeJSON(w, http.StatusOK, ping)
+	ping, err := h.Queries.CreateRuntimePingRequest(r.Context(), db.CreateRuntimePingRequestParams{
+		WorkspaceID: rt.WorkspaceID,
+		RuntimeID:   rt.ID,
+		DaemonID:    rt.DaemonID.String,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create ping request")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, runtimePingResponse(ping))
 }
 
 // GetPing returns the status of a ping request (protected route, called by frontend).
 func (h *Handler) GetPing(w http.ResponseWriter, r *http.Request) {
 	pingID := chi.URLParam(r, "pingId")
-
-	ping := h.PingStore.Get(pingID)
-	if ping == nil {
-		writeError(w, http.StatusNotFound, "ping not found")
+	if _, err := h.Queries.TimeoutStaleRuntimePingRequests(r.Context(), 60); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load ping")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, ping)
+	ping, err := h.Queries.GetRuntimePingRequest(r.Context(), parseUUID(pingID))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "ping not found")
+		return
+	}
+	if uuidToString(ping.RuntimeID) != chi.URLParam(r, "runtimeId") {
+		writeError(w, http.StatusNotFound, "ping not found")
+		return
+	}
+	if _, ok := h.requireWorkspaceMember(w, r, uuidToString(ping.WorkspaceID), "ping not found"); !ok {
+		return
+	}
+
+	writeJSON(w, http.StatusOK, runtimePingResponse(ping))
 }
 
 // ReportPingResult receives the ping result from the daemon.
 func (h *Handler) ReportPingResult(w http.ResponseWriter, r *http.Request) {
 	pingID := chi.URLParam(r, "pingId")
+	runtimeID := chi.URLParam(r, "runtimeId")
+	daemonID := middleware.DaemonIDFromContext(r.Context())
+	workspaceID := middleware.DaemonWorkspaceIDFromContext(r.Context())
+	if daemonID == "" || workspaceID == "" {
+		writeError(w, http.StatusUnauthorized, "daemon not authenticated")
+		return
+	}
+
+	ping, err := h.Queries.GetRuntimePingRequestForDaemon(r.Context(), db.GetRuntimePingRequestForDaemonParams{
+		ID:          parseUUID(pingID),
+		DaemonID:    daemonID,
+		WorkspaceID: parseUUID(workspaceID),
+	})
+	if err != nil || uuidToString(ping.RuntimeID) != runtimeID {
+		writeError(w, http.StatusNotFound, "ping not found")
+		return
+	}
 
 	var req struct {
-		Status     string `json:"status"` // "completed" or "failed"
+		Status     string `json:"status"`
 		Output     string `json:"output"`
 		Error      string `json:"error"`
 		DurationMs int64  `json:"duration_ms"`
@@ -190,10 +137,44 @@ func (h *Handler) ReportPingResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Status == "completed" {
-		h.PingStore.Complete(pingID, req.Output, req.DurationMs)
-	} else {
-		h.PingStore.Fail(pingID, req.Error, req.DurationMs)
+	paramsBase := struct {
+		ID          pgtype.UUID
+		DaemonID    string
+		WorkspaceID pgtype.UUID
+	}{
+		ID:          parseUUID(pingID),
+		DaemonID:    daemonID,
+		WorkspaceID: parseUUID(workspaceID),
+	}
+
+	switch req.Status {
+	case "completed":
+		_, err := h.Queries.CompleteRuntimePingRequestForDaemon(r.Context(), db.CompleteRuntimePingRequestForDaemonParams{
+			ID:          paramsBase.ID,
+			DaemonID:    paramsBase.DaemonID,
+			WorkspaceID: paramsBase.WorkspaceID,
+			Output:      req.Output,
+			DurationMs:  pgtype.Int8{Int64: req.DurationMs, Valid: true},
+		})
+		if err != nil {
+			writeError(w, http.StatusNotFound, "ping not found")
+			return
+		}
+	case "failed":
+		_, err := h.Queries.FailRuntimePingRequestForDaemon(r.Context(), db.FailRuntimePingRequestForDaemonParams{
+			ID:          paramsBase.ID,
+			DaemonID:    paramsBase.DaemonID,
+			WorkspaceID: paramsBase.WorkspaceID,
+			Error:       req.Error,
+			DurationMs:  pgtype.Int8{Int64: req.DurationMs, Valid: true},
+		})
+		if err != nil {
+			writeError(w, http.StatusNotFound, "ping not found")
+			return
+		}
+	default:
+		writeError(w, http.StatusBadRequest, "invalid status: "+req.Status)
+		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

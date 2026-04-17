@@ -233,6 +233,36 @@ type PersonalAccessToken struct {
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 
+type RuntimePingRequest struct {
+	ID          pgtype.UUID        `json:"id"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	RuntimeID   pgtype.UUID        `json:"runtime_id"`
+	DaemonID    string             `json:"daemon_id"`
+	Status      string             `json:"status"`
+	Output      string             `json:"output"`
+	Error       string             `json:"error"`
+	DurationMs  pgtype.Int8        `json:"duration_ms"`
+	ClaimedAt   pgtype.Timestamptz `json:"claimed_at"`
+	CompletedAt pgtype.Timestamptz `json:"completed_at"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RuntimeUpdateRequest struct {
+	ID            pgtype.UUID        `json:"id"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	RuntimeID     pgtype.UUID        `json:"runtime_id"`
+	DaemonID      string             `json:"daemon_id"`
+	TargetVersion string             `json:"target_version"`
+	Status        string             `json:"status"`
+	Output        string             `json:"output"`
+	Error         string             `json:"error"`
+	ClaimedAt     pgtype.Timestamptz `json:"claimed_at"`
+	CompletedAt   pgtype.Timestamptz `json:"completed_at"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+}
+
 type RuntimeUsage struct {
 	ID               pgtype.UUID        `json:"id"`
 	RuntimeID        pgtype.UUID        `json:"runtime_id"`

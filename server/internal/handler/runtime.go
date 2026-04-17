@@ -87,6 +87,9 @@ func (h *Handler) ReportRuntimeUsage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "runtimeId is required")
 		return
 	}
+	if _, ok := h.requireDaemonOwnedRuntime(w, r, runtimeID); !ok {
+		return
+	}
 
 	var req struct {
 		Entries []RuntimeUsageEntry `json:"entries"`

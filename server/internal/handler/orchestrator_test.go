@@ -280,31 +280,19 @@ func TestDaemonRegister_CreatesOrchestratorOnPreferredClaudeRuntime(t *testing.T
 	`).Scan(&workspaceID); err != nil {
 		t.Fatalf("insert workspace: %v", err)
 	}
-	if _, err := testPool.Exec(ctx, `
-		INSERT INTO member (workspace_id, user_id, role)
-		VALUES ($1, $2, 'owner')
-	`, workspaceID, testUserID); err != nil {
-		t.Fatalf("insert membership: %v", err)
-	}
-
 	t.Cleanup(func() {
 		testPool.Exec(ctx, `DELETE FROM workspace WHERE id = $1`, workspaceID)
 	})
 
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/api/daemon/register", strings.NewReader(fmt.Sprintf(`{
-		"workspace_id":%q,
-		"daemon_id":"daemon-preferred-runtime",
-		"device_name":"test-machine",
-		"runtimes":[
-			{"name":"Local Codex","type":"codex","version":"1.0.0","status":"online"},
-			{"name":"Local Claude","type":"claude","version":"1.0.0","status":"online"}
-		]
-	}`, workspaceID)))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-User-ID", testUserID)
-
-	testHandler.DaemonRegister(w, req)
+	w := performDaemonRequest(testHandler.DaemonRegister, newDaemonAuthenticatedRequest(t, "POST", "/api/daemon/register", workspaceID, "daemon-preferred-runtime", map[string]any{
+		"workspace_id": workspaceID,
+		"daemon_id":    "daemon-preferred-runtime",
+		"device_name":  "test-machine",
+		"runtimes": []map[string]any{
+			{"name": "Local Codex", "type": "codex", "version": "1.0.0", "status": "online"},
+			{"name": "Local Claude", "type": "claude", "version": "1.0.0", "status": "online"},
+		},
+	}))
 	if w.Code != http.StatusOK {
 		t.Fatalf("DaemonRegister: expected 200, got %d: %s", w.Code, w.Body.String())
 	}

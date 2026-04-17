@@ -442,6 +442,34 @@ func TestInvalidJWT(t *testing.T) {
 	}
 }
 
+func TestDaemonRouteRejectsUserJWTViaNewRouterWiring(t *testing.T) {
+	req, err := http.NewRequest("POST", testServer.URL+"/api/daemon/heartbeat", bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 401 from daemon auth middleware, got %d: %s", resp.StatusCode, body)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read response body: %v", err)
+	}
+	if strings.TrimSpace(string(body)) != `{"error":"daemon token required"}` {
+		t.Fatalf("expected daemon token rejection body, got: %s", body)
+	}
+}
+
 // ---- Issues CRUD through full router ----
 
 func TestIssuesCRUDThroughRouter(t *testing.T) {

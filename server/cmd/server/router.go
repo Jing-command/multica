@@ -86,7 +86,7 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus) chi.Route
 
 	// Daemon API routes (all require a valid token)
 	r.Route("/api/daemon", func(r chi.Router) {
-		r.Use(middleware.Auth(queries))
+		r.Use(middleware.DaemonAuth(queries))
 
 		r.Post("/register", h.DaemonRegister)
 		r.Post("/deregister", h.DaemonDeregister)
