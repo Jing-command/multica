@@ -1410,7 +1410,7 @@ func TestResolveActor(t *testing.T) {
 	}
 }
 
-func TestDaemonRegisterMissingWorkspaceReturns404(t *testing.T) {
+func TestDaemonRegisterWithRemovedWorkspaceTokenReturnsUnauthorized(t *testing.T) {
 	ctx := context.Background()
 
 	var removedWorkspaceID string
@@ -1457,11 +1457,11 @@ func TestDaemonRegisterMissingWorkspaceReturns404(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+rawToken)
 
 	handler.ServeHTTP(w, req)
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("DaemonRegister: expected 404, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("DaemonRegister: expected 401, got %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "workspace not found") {
-		t.Fatalf("DaemonRegister: expected workspace not found error, got %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), "invalid daemon token") {
+		t.Fatalf("DaemonRegister: expected invalid daemon token error, got %s", w.Body.String())
 	}
 }
 

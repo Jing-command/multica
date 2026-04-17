@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/multica-ai/multica/server/internal/middleware"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -1286,12 +1287,19 @@ func TestClaimTaskByRuntime_IncludesPermissionSnapshotJSON(t *testing.T) {
 	}
 
 	runtimeID := fixture.workerRuntimeID
+	if _, err := testPool.Exec(ctx, `UPDATE agent_runtime SET daemon_id = $2 WHERE id = $1`, runtimeID, "orchestration-worker-daemon"); err != nil {
+		t.Fatalf("attach daemon_id to worker runtime: %v", err)
+	}
 
+	rawToken := createDaemonTokenForTest(t, ctx, testWorkspaceID, "orchestration-worker-daemon")
+	defer testPool.Exec(ctx, `DELETE FROM daemon_token WHERE daemon_id = $1`, "orchestration-worker-daemon")
+
+	handler := middleware.DaemonAuth(testHandler.Queries)(http.HandlerFunc(testHandler.ClaimTaskByRuntime))
 	w := httptest.NewRecorder()
 	req := newRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", map[string]any{})
 	req = withURLParam(req, "runtimeId", runtimeID)
-	req = withDaemonIdentity(req, testWorkspaceID, "")
-	testHandler.ClaimTaskByRuntime(w, req)
+	req.Header.Set("Authorization", "Bearer "+rawToken)
+	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}

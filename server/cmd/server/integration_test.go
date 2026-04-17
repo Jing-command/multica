@@ -150,10 +150,19 @@ func setupIntegrationTestFixture(ctx context.Context, pool *pgxpool.Pool) (strin
 }
 
 func cleanupIntegrationTestFixture(ctx context.Context, pool *pgxpool.Pool) error {
+	if _, err := pool.Exec(ctx, `DELETE FROM auth_abuse_event WHERE identifier IN ($1, $2)`, integrationTestEmail, "integration-sendcode@multica.ai"); err != nil {
+		return err
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM auth_abuse_event WHERE identifier = $1`, "new-integration-verify@multica.ai"); err != nil {
+		return err
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM verification_code WHERE email IN ($1, $2, $3)`, integrationTestEmail, "integration-sendcode@multica.ai", "new-integration-verify@multica.ai"); err != nil {
+		return err
+	}
 	if _, err := pool.Exec(ctx, `DELETE FROM workspace WHERE slug = $1`, integrationTestWorkspaceSlug); err != nil {
 		return err
 	}
-	if _, err := pool.Exec(ctx, `DELETE FROM "user" WHERE email = $1`, integrationTestEmail); err != nil {
+	if _, err := pool.Exec(ctx, `DELETE FROM "user" WHERE email IN ($1, $2, $3)`, integrationTestEmail, "integration-sendcode@multica.ai", "new-integration-verify@multica.ai"); err != nil {
 		return err
 	}
 	return nil
@@ -325,9 +334,13 @@ func TestHealth(t *testing.T) {
 
 func TestSendCodeAndVerify(t *testing.T) {
 	const email = "integration-sendcode@multica.ai"
+	const ip = "127.0.0.1"
 	ctx := context.Background()
 
+	testPool.Exec(ctx, `DELETE FROM auth_abuse_event WHERE identifier = $1 OR ip = $2`, email, ip)
+
 	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM auth_abuse_event WHERE identifier = $1 OR ip = $2`, email, ip)
 		testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email)
 		var userID string
 		err := testPool.QueryRow(ctx, `SELECT id FROM "user" WHERE email = $1`, email).Scan(&userID)
@@ -408,9 +421,13 @@ func TestSendCodeAndVerify(t *testing.T) {
 
 func TestVerifyCodeCreatesWorkspaceForNewUser(t *testing.T) {
 	const email = "new-integration-verify@multica.ai"
+	const ip = "127.0.0.1"
 	ctx := context.Background()
 
+	testPool.Exec(ctx, `DELETE FROM auth_abuse_event WHERE identifier = $1 OR ip = $2`, email, ip)
+
 	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM auth_abuse_event WHERE identifier = $1 OR ip = $2`, email, ip)
 		testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email)
 		var userID string
 		err := testPool.QueryRow(ctx, `SELECT id FROM "user" WHERE email = $1`, email).Scan(&userID)
@@ -593,9 +610,9 @@ func TestDaemonHeartbeatRejectsCrossWorkspaceRuntime(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNotFound {
+	if resp.StatusCode != http.StatusForbidden {
 		respBody, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 404, got %d: %s", resp.StatusCode, respBody)
+		t.Fatalf("expected 403, got %d: %s", resp.StatusCode, respBody)
 	}
 }
 
@@ -617,9 +634,9 @@ func TestDaemonClaimRejectsCrossWorkspaceRuntime(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNotFound {
+	if resp.StatusCode != http.StatusForbidden {
 		respBody, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 404, got %d: %s", resp.StatusCode, respBody)
+		t.Fatalf("expected 403, got %d: %s", resp.StatusCode, respBody)
 	}
 }
 
@@ -641,9 +658,9 @@ func TestDaemonTaskStatusRejectsCrossRuntimeTask(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNotFound {
+	if resp.StatusCode != http.StatusForbidden {
 		respBody, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected 404, got %d: %s", resp.StatusCode, respBody)
+		t.Fatalf("expected 403, got %d: %s", resp.StatusCode, respBody)
 	}
 }
 

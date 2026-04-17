@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_child_review_round_one_submitted_per_child;
