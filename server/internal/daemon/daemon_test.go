@@ -1002,11 +1002,11 @@ func TestReloadWorkspacesRefreshesAuthAndUserTokenFromConfig(t *testing.T) {
 	}
 }
 
-func TestReportUsageRecordsSkipsAmbiguousProviderRouting(t *testing.T) {
+func TestReportUsageRecordsRoutesSameProviderByWorkspace(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	if err := cli.SaveCLIConfig(cli.CLIConfig{
 		UserToken: "mul_user_token",
-		WatchedWorkspaces: []cli.WatchedWorkspace{{ID: "ws-1", Name: "Workspace 1"}},
+		WatchedWorkspaces: []cli.WatchedWorkspace{{ID: "ws-1", Name: "Workspace 1"}, {ID: "ws-2", Name: "Workspace 2"}},
 		DaemonAuth: map[string]cli.DaemonAuthConfig{
 			"ws-1": {DaemonID: "daemon-1", Token: "mdt_ws1", ExpiresAt: time.Now().Add(14 * 24 * time.Hour).UTC().Format(time.RFC3339)},
 			"ws-2": {DaemonID: "daemon-1", Token: "mdt_ws2", ExpiresAt: time.Now().Add(14 * 24 * time.Hour).UTC().Format(time.RFC3339)},
@@ -1015,10 +1015,22 @@ func TestReportUsageRecordsSkipsAmbiguousProviderRouting(t *testing.T) {
 		t.Fatalf("SaveCLIConfig() error = %v", err)
 	}
 
-	var usageCalls atomic.Int32
+	var ws1Calls atomic.Int32
+	var ws2Calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/daemon/runtimes/rt-1/usage" || r.URL.Path == "/api/daemon/runtimes/rt-2/usage" {
-			usageCalls.Add(1)
+		switch r.URL.Path {
+		case "/api/daemon/runtimes/rt-1/usage":
+			ws1Calls.Add(1)
+			if auth := r.Header.Get("Authorization"); auth != "Bearer mdt_ws1" {
+				t.Fatalf("rt-1 auth = %q, want Bearer mdt_ws1", auth)
+			}
+		case "/api/daemon/runtimes/rt-2/usage":
+			ws2Calls.Add(1)
+			if auth := r.Header.Get("Authorization"); auth != "Bearer mdt_ws2" {
+				t.Fatalf("rt-2 auth = %q, want Bearer mdt_ws2", auth)
+			}
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
@@ -1036,10 +1048,13 @@ func TestReportUsageRecordsSkipsAmbiguousProviderRouting(t *testing.T) {
 		t.Fatalf("resolveAuth() error = %v", err)
 	}
 
-	d.reportUsageRecords(context.Background(), []usage.Record{{Provider: "claude", Model: "sonnet"}})
+	d.reportUsageRecords(context.Background(), []usage.Record{
+		{WorkspaceID: "ws-1", Provider: "claude", Model: "sonnet"},
+		{WorkspaceID: "ws-2", Provider: "claude", Model: "sonnet"},
+	})
 
-	if usageCalls.Load() != 0 {
-		t.Fatalf("usage calls = %d, want 0", usageCalls.Load())
+	if ws1Calls.Load() != 1 || ws2Calls.Load() != 1 {
+		t.Fatalf("usage calls ws-1=%d ws-2=%d, want 1 each", ws1Calls.Load(), ws2Calls.Load())
 	}
 }
 

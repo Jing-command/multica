@@ -66,6 +66,7 @@ type codexPayload struct {
 	Type  string          `json:"type"`
 	Info  *codexTokenInfo `json:"info"`
 	Model string          `json:"model"` // present in turn_context events
+	Cwd   string          `json:"cwd"`
 }
 
 type codexTokenInfo struct {
@@ -100,6 +101,7 @@ func (s *Scanner) parseCodexFile(path string) *Record {
 
 	var lastUsage *codexTokenUsage
 	var lastModel string
+	var lastCwd string
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
@@ -120,8 +122,13 @@ func (s *Scanner) parseCodexFile(path string) *Record {
 		}
 
 		// Track model from turn_context events
-		if evt.Type == "turn_context" && evt.Payload.Model != "" {
-			lastModel = evt.Payload.Model
+		if evt.Type == "turn_context" {
+			if evt.Payload.Model != "" {
+				lastModel = evt.Payload.Model
+			}
+			if evt.Payload.Cwd != "" {
+				lastCwd = evt.Payload.Cwd
+			}
 			continue
 		}
 
@@ -154,8 +161,17 @@ func (s *Scanner) parseCodexFile(path string) *Record {
 		cachedTokens = lastUsage.CacheReadInputTokens
 	}
 
+	if lastCwd == "" {
+		return nil
+	}
+	workspaceID := workspaceIDFromPath(lastCwd)
+	if workspaceID == "" {
+		return nil
+	}
+
 	return &Record{
 		Date:             date,
+		WorkspaceID:      workspaceID,
 		Provider:         "codex",
 		Model:            model,
 		InputTokens:      lastUsage.InputTokens,
