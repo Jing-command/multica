@@ -1829,6 +1829,72 @@ func TestGetPingTimesOutAfterHeartbeatClaimsIt(t *testing.T) {
 	}
 }
 
+func TestInitiatePingPersistsDaemonOwnershipContext(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/ping", nil), "runtimeId", runtimeID)
+	testHandler.InitiatePing(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiatePing: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created PingRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created ping: %v", err)
+	}
+
+	var workspaceID, daemonID string
+	if err := testPool.QueryRow(ctx, `
+		SELECT workspace_id::text, daemon_id
+		FROM runtime_ping
+		WHERE id = $1
+	`, created.ID).Scan(&workspaceID, &daemonID); err != nil {
+		t.Fatalf("load runtime_ping ownership context: %v", err)
+	}
+	if workspaceID != testWorkspaceID {
+		t.Fatalf("runtime_ping.workspace_id = %q, want %q", workspaceID, testWorkspaceID)
+	}
+	if daemonID != handlerTestDaemonID {
+		t.Fatalf("runtime_ping.daemon_id = %q, want %q", daemonID, handlerTestDaemonID)
+	}
+}
+
+func TestInitiateUpdatePersistsDaemonOwnershipContext(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/update", map[string]any{
+		"target_version": "v2.0.0",
+	}), "runtimeId", runtimeID)
+	testHandler.InitiateUpdate(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiateUpdate: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created UpdateRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created update: %v", err)
+	}
+
+	var workspaceID, daemonID string
+	if err := testPool.QueryRow(ctx, `
+		SELECT workspace_id::text, daemon_id
+		FROM runtime_update
+		WHERE id = $1
+	`, created.ID).Scan(&workspaceID, &daemonID); err != nil {
+		t.Fatalf("load runtime_update ownership context: %v", err)
+	}
+	if workspaceID != testWorkspaceID {
+		t.Fatalf("runtime_update.workspace_id = %q, want %q", workspaceID, testWorkspaceID)
+	}
+	if daemonID != handlerTestDaemonID {
+		t.Fatalf("runtime_update.daemon_id = %q, want %q", daemonID, handlerTestDaemonID)
+	}
+}
+
 func TestDaemonRegisterUsesEnrollUserAsOwner(t *testing.T) {
 	ctx := context.Background()
 
