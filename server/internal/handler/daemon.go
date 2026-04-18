@@ -276,12 +276,12 @@ func (h *Handler) DaemonHeartbeat(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{"status": "ok"}
 
 	// Check for pending ping requests for this runtime.
-	if pending, err := h.popPendingPingRequest(r.Context(), req.RuntimeID); err == nil && pending != nil {
+	if pending, err := h.popPendingPingRequest(r.Context(), req.RuntimeID, uuidToString(rt.WorkspaceID), rt.DaemonID.String); err == nil && pending != nil {
 		resp["pending_ping"] = map[string]string{"id": pending.ID}
 	}
 
 	// Check for pending update requests for this runtime.
-	if pending, err := h.popPendingUpdateRequest(r.Context(), req.RuntimeID); err == nil && pending != nil {
+	if pending, err := h.popPendingUpdateRequest(r.Context(), req.RuntimeID, uuidToString(rt.WorkspaceID), rt.DaemonID.String); err == nil && pending != nil {
 		resp["pending_update"] = map[string]string{
 			"id":             pending.ID,
 			"target_version": pending.TargetVersion,

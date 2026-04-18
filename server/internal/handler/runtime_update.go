@@ -73,8 +73,12 @@ func (h *Handler) getUpdateRequest(ctx context.Context, updateID string) (*Updat
 	return &result, nil
 }
 
-func (h *Handler) popPendingUpdateRequest(ctx context.Context, runtimeID string) (*UpdateRequest, error) {
-	items, err := h.Queries.PopPendingRuntimeUpdate(ctx, parseUUID(runtimeID))
+func (h *Handler) popPendingUpdateRequest(ctx context.Context, runtimeID, workspaceID, daemonID string) (*UpdateRequest, error) {
+	items, err := h.Queries.PopPendingRuntimeUpdateForDaemon(ctx, db.PopPendingRuntimeUpdateForDaemonParams{
+		RuntimeID:   parseUUID(runtimeID),
+		WorkspaceID: parseUUID(workspaceID),
+		DaemonID:    daemonID,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -85,18 +89,38 @@ func (h *Handler) popPendingUpdateRequest(ctx context.Context, runtimeID string)
 	return &result, nil
 }
 
-func (h *Handler) completeUpdateRequest(ctx context.Context, updateID, output string) error {
-	_, err := h.Queries.SetRuntimeUpdateCompleted(ctx, db.SetRuntimeUpdateCompletedParams{
-		ID:     parseUUID(updateID),
-		Output: output,
+func (h *Handler) getUpdateRequestForDaemon(ctx context.Context, updateID, runtimeID, workspaceID, daemonID string) (*UpdateRequest, error) {
+	update, err := h.Queries.GetRuntimeUpdateForDaemon(ctx, db.GetRuntimeUpdateForDaemonParams{
+		ID:          parseUUID(updateID),
+		RuntimeID:   parseUUID(runtimeID),
+		WorkspaceID: parseUUID(workspaceID),
+		DaemonID:    daemonID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	result := runtimeUpdateToRequest(update)
+	return &result, nil
+}
+
+func (h *Handler) completeUpdateRequestForDaemon(ctx context.Context, updateID, runtimeID, workspaceID, daemonID, output string) error {
+	_, err := h.Queries.SetRuntimeUpdateCompletedForDaemon(ctx, db.SetRuntimeUpdateCompletedForDaemonParams{
+		ID:          parseUUID(updateID),
+		RuntimeID:   parseUUID(runtimeID),
+		WorkspaceID: parseUUID(workspaceID),
+		DaemonID:    daemonID,
+		Output:      output,
 	})
 	return err
 }
 
-func (h *Handler) failUpdateRequest(ctx context.Context, updateID, errMsg string) error {
-	_, err := h.Queries.SetRuntimeUpdateFailed(ctx, db.SetRuntimeUpdateFailedParams{
-		ID:    parseUUID(updateID),
-		Error: errMsg,
+func (h *Handler) failUpdateRequestForDaemon(ctx context.Context, updateID, runtimeID, workspaceID, daemonID, errMsg string) error {
+	_, err := h.Queries.SetRuntimeUpdateFailedForDaemon(ctx, db.SetRuntimeUpdateFailedForDaemonParams{
+		ID:          parseUUID(updateID),
+		RuntimeID:   parseUUID(runtimeID),
+		WorkspaceID: parseUUID(workspaceID),
+		DaemonID:    daemonID,
+		Error:       errMsg,
 	})
 	return err
 }
@@ -174,17 +198,19 @@ func (h *Handler) ReportUpdateResult(w http.ResponseWriter, r *http.Request) {
 	}
 
 	updateID := chi.URLParam(r, "updateId")
+	workspaceID, daemonID, ok := daemonScopeFromRequest(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "invalid daemon token")
+		return
+	}
 
-	update, loadErr := h.getUpdateRequest(r.Context(), updateID)
+	_, loadErr := h.getUpdateRequestForDaemon(r.Context(), updateID, runtimeID, workspaceID, daemonID)
 	if loadErr != nil {
 		if isNotFound(loadErr) {
 			writeError(w, http.StatusNotFound, "update not found")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to load update")
-		return
-	}
-	if _, ok := h.requireDaemonRuntimeScope(w, r, update.RuntimeID); !ok {
 		return
 	}
 
@@ -201,9 +227,9 @@ func (h *Handler) ReportUpdateResult(w http.ResponseWriter, r *http.Request) {
 	var err error
 	switch req.Status {
 	case "completed":
-		err = h.completeUpdateRequest(r.Context(), updateID, req.Output)
+		err = h.completeUpdateRequestForDaemon(r.Context(), updateID, runtimeID, workspaceID, daemonID, req.Output)
 	case "failed":
-		err = h.failUpdateRequest(r.Context(), updateID, req.Error)
+		err = h.failUpdateRequestForDaemon(r.Context(), updateID, runtimeID, workspaceID, daemonID, req.Error)
 	case "running":
 		err = nil
 	default:

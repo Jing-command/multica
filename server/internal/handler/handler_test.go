@@ -1957,6 +1957,145 @@ func TestInitiateUpdateRejectsRuntimeWithoutDaemonBinding(t *testing.T) {
 	}
 }
 
+func TestDaemonHeartbeatDoesNotClaimPingOwnedByAnotherDaemon(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+	if _, err := testPool.Exec(ctx, `DELETE FROM runtime_ping WHERE runtime_id = $1`, runtimeID); err != nil {
+		t.Fatalf("cleanup runtime_ping: %v", err)
+	}
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/ping", nil), "runtimeId", runtimeID)
+	testHandler.InitiatePing(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiatePing: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	if _, err := testPool.Exec(ctx, `UPDATE runtime_ping SET daemon_id = $2 WHERE runtime_id = $1`, runtimeID, "other-daemon"); err != nil {
+		t.Fatalf("rebind ping request to other daemon: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/daemon/heartbeat", map[string]any{"runtime_id": runtimeID})
+	req = withDaemonIdentity(req, testWorkspaceID, handlerTestDaemonID)
+	testHandler.DaemonHeartbeat(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("DaemonHeartbeat: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "pending_ping") {
+		t.Fatalf("expected no pending_ping for foreign daemon-owned request, got %s", w.Body.String())
+	}
+}
+
+func TestReportPingResultRejectsRequestOwnedByAnotherDaemon(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+	if _, err := testPool.Exec(ctx, `DELETE FROM runtime_ping WHERE runtime_id = $1`, runtimeID); err != nil {
+		t.Fatalf("cleanup runtime_ping: %v", err)
+	}
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/ping", nil), "runtimeId", runtimeID)
+	testHandler.InitiatePing(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiatePing: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created PingRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created ping: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `UPDATE runtime_ping SET daemon_id = $2 WHERE id = $1`, created.ID, "other-daemon"); err != nil {
+		t.Fatalf("rebind ping request to other daemon: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/ping/"+created.ID, map[string]any{
+		"status":      "completed",
+		"output":      "pong",
+		"duration_ms": 12,
+	})
+	req = withURLParam(req, "runtimeId", runtimeID)
+	req = withURLParam(req, "pingId", created.ID)
+	req = withDaemonIdentity(req, testWorkspaceID, handlerTestDaemonID)
+	testHandler.ReportPingResult(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("ReportPingResult: expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDaemonHeartbeatDoesNotClaimUpdateOwnedByAnotherDaemon(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+	if _, err := testPool.Exec(ctx, `DELETE FROM runtime_update WHERE runtime_id = $1`, runtimeID); err != nil {
+		t.Fatalf("cleanup runtime_update: %v", err)
+	}
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/update", map[string]any{
+		"target_version": "v1.2.3",
+	}), "runtimeId", runtimeID)
+	testHandler.InitiateUpdate(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiateUpdate: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	if _, err := testPool.Exec(ctx, `UPDATE runtime_update SET daemon_id = $2 WHERE runtime_id = $1`, runtimeID, "other-daemon"); err != nil {
+		t.Fatalf("rebind update request to other daemon: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/daemon/heartbeat", map[string]any{"runtime_id": runtimeID})
+	req = withDaemonIdentity(req, testWorkspaceID, handlerTestDaemonID)
+	testHandler.DaemonHeartbeat(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("DaemonHeartbeat: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "pending_update") {
+		t.Fatalf("expected no pending_update for foreign daemon-owned request, got %s", w.Body.String())
+	}
+}
+
+func TestReportUpdateResultRejectsRequestOwnedByAnotherDaemon(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+	if _, err := testPool.Exec(ctx, `DELETE FROM runtime_update WHERE runtime_id = $1`, runtimeID); err != nil {
+		t.Fatalf("cleanup runtime_update: %v", err)
+	}
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/update", map[string]any{
+		"target_version": "v1.2.3",
+	}), "runtimeId", runtimeID)
+	testHandler.InitiateUpdate(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiateUpdate: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created UpdateRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created update: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `UPDATE runtime_update SET daemon_id = $2 WHERE id = $1`, created.ID, "other-daemon"); err != nil {
+		t.Fatalf("rebind update request to other daemon: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/update/"+created.ID, map[string]any{
+		"status": "completed",
+		"output": "updated",
+	})
+	req = withURLParam(req, "runtimeId", runtimeID)
+	req = withURLParam(req, "updateId", created.ID)
+	req = withDaemonIdentity(req, testWorkspaceID, handlerTestDaemonID)
+	testHandler.ReportUpdateResult(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("ReportUpdateResult: expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestDaemonRegisterUsesEnrollUserAsOwner(t *testing.T) {
 	ctx := context.Background()
 

@@ -81,8 +81,12 @@ func (h *Handler) getPingRequest(ctx context.Context, pingID string) (*PingReque
 	return &result, nil
 }
 
-func (h *Handler) popPendingPingRequest(ctx context.Context, runtimeID string) (*PingRequest, error) {
-	items, err := h.Queries.PopPendingRuntimePing(ctx, parseUUID(runtimeID))
+func (h *Handler) popPendingPingRequest(ctx context.Context, runtimeID, workspaceID, daemonID string) (*PingRequest, error) {
+	items, err := h.Queries.PopPendingRuntimePingForDaemon(ctx, db.PopPendingRuntimePingForDaemonParams{
+		RuntimeID:   parseUUID(runtimeID),
+		WorkspaceID: parseUUID(workspaceID),
+		DaemonID:    daemonID,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -93,20 +97,40 @@ func (h *Handler) popPendingPingRequest(ctx context.Context, runtimeID string) (
 	return &result, nil
 }
 
-func (h *Handler) completePingRequest(ctx context.Context, pingID, output string, durationMs int64) error {
-	_, err := h.Queries.SetRuntimePingCompleted(ctx, db.SetRuntimePingCompletedParams{
-		ID:         parseUUID(pingID),
-		Output:     output,
-		DurationMs: pgtype.Int8{Int64: durationMs, Valid: true},
+func (h *Handler) getPingRequestForDaemon(ctx context.Context, pingID, runtimeID, workspaceID, daemonID string) (*PingRequest, error) {
+	ping, err := h.Queries.GetRuntimePingForDaemon(ctx, db.GetRuntimePingForDaemonParams{
+		ID:          parseUUID(pingID),
+		RuntimeID:   parseUUID(runtimeID),
+		WorkspaceID: parseUUID(workspaceID),
+		DaemonID:    daemonID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	result := runtimePingToRequest(ping)
+	return &result, nil
+}
+
+func (h *Handler) completePingRequestForDaemon(ctx context.Context, pingID, runtimeID, workspaceID, daemonID, output string, durationMs int64) error {
+	_, err := h.Queries.SetRuntimePingCompletedForDaemon(ctx, db.SetRuntimePingCompletedForDaemonParams{
+		ID:          parseUUID(pingID),
+		RuntimeID:   parseUUID(runtimeID),
+		WorkspaceID: parseUUID(workspaceID),
+		DaemonID:    daemonID,
+		Output:      output,
+		DurationMs:  pgtype.Int8{Int64: durationMs, Valid: true},
 	})
 	return err
 }
 
-func (h *Handler) failPingRequest(ctx context.Context, pingID, errMsg string, durationMs int64) error {
-	_, err := h.Queries.SetRuntimePingFailed(ctx, db.SetRuntimePingFailedParams{
-		ID:         parseUUID(pingID),
-		Error:      errMsg,
-		DurationMs: pgtype.Int8{Int64: durationMs, Valid: true},
+func (h *Handler) failPingRequestForDaemon(ctx context.Context, pingID, runtimeID, workspaceID, daemonID, errMsg string, durationMs int64) error {
+	_, err := h.Queries.SetRuntimePingFailedForDaemon(ctx, db.SetRuntimePingFailedForDaemonParams{
+		ID:          parseUUID(pingID),
+		RuntimeID:   parseUUID(runtimeID),
+		WorkspaceID: parseUUID(workspaceID),
+		DaemonID:    daemonID,
+		Error:       errMsg,
+		DurationMs:  pgtype.Int8{Int64: durationMs, Valid: true},
 	})
 	return err
 }
@@ -167,17 +191,19 @@ func (h *Handler) ReportPingResult(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pingID := chi.URLParam(r, "pingId")
+	workspaceID, daemonID, ok := daemonScopeFromRequest(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "invalid daemon token")
+		return
+	}
 
-	ping, loadErr := h.getPingRequest(r.Context(), pingID)
+	_, loadErr := h.getPingRequestForDaemon(r.Context(), pingID, runtimeID, workspaceID, daemonID)
 	if loadErr != nil {
 		if isNotFound(loadErr) {
 			writeError(w, http.StatusNotFound, "ping not found")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to load ping")
-		return
-	}
-	if _, ok := h.requireDaemonRuntimeScope(w, r, ping.RuntimeID); !ok {
 		return
 	}
 
@@ -194,9 +220,9 @@ func (h *Handler) ReportPingResult(w http.ResponseWriter, r *http.Request) {
 
 	var err error
 	if req.Status == "completed" {
-		err = h.completePingRequest(r.Context(), pingID, req.Output, req.DurationMs)
+		err = h.completePingRequestForDaemon(r.Context(), pingID, runtimeID, workspaceID, daemonID, req.Output, req.DurationMs)
 	} else {
-		err = h.failPingRequest(r.Context(), pingID, req.Error, req.DurationMs)
+		err = h.failPingRequestForDaemon(r.Context(), pingID, runtimeID, workspaceID, daemonID, req.Error, req.DurationMs)
 	}
 	if err != nil {
 		if isNotFound(err) {
