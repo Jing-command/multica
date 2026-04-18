@@ -124,6 +124,10 @@ func (h *Handler) InitiatePing(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireWorkspaceMember(w, r, uuidToString(rt.WorkspaceID), "runtime not found"); !ok {
 		return
 	}
+	if !rt.DaemonID.Valid {
+		writeError(w, http.StatusConflict, "runtime is not currently attached to a daemon")
+		return
+	}
 
 	ping, err := h.Queries.CreateRuntimePing(r.Context(), db.CreateRuntimePingParams{
 		RuntimeID:   parseUUID(runtimeID),

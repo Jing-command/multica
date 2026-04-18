@@ -1895,6 +1895,68 @@ func TestInitiateUpdatePersistsDaemonOwnershipContext(t *testing.T) {
 	}
 }
 
+func TestInitiatePingRejectsRuntimeWithoutDaemonBinding(t *testing.T) {
+	ctx := context.Background()
+	var runtimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, owner_id, last_seen_at)
+		VALUES ($1, NULL, 'Unattached Ping Runtime', 'local', 'claude', 'online', 'unattached device', '{}'::jsonb, $2, now())
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&runtimeID); err != nil {
+		t.Fatalf("insert unattached ping runtime: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE id = $1`, runtimeID)
+	})
+
+	w := httptest.NewRecorder()
+	req := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/ping", nil), "runtimeId", runtimeID)
+	testHandler.InitiatePing(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("InitiatePing: expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode InitiatePing error: %v", err)
+	}
+	if resp["error"] != "runtime is not currently attached to a daemon" {
+		t.Fatalf("InitiatePing error = %q, want runtime detached message", resp["error"])
+	}
+}
+
+func TestInitiateUpdateRejectsRuntimeWithoutDaemonBinding(t *testing.T) {
+	ctx := context.Background()
+	var runtimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, owner_id, last_seen_at)
+		VALUES ($1, NULL, 'Unattached Update Runtime', 'local', 'claude', 'online', 'unattached device', '{}'::jsonb, $2, now())
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&runtimeID); err != nil {
+		t.Fatalf("insert unattached update runtime: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE id = $1`, runtimeID)
+	})
+
+	w := httptest.NewRecorder()
+	req := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/update", map[string]any{
+		"target_version": "v1.2.3",
+	}), "runtimeId", runtimeID)
+	testHandler.InitiateUpdate(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("InitiateUpdate: expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode InitiateUpdate error: %v", err)
+	}
+	if resp["error"] != "runtime is not currently attached to a daemon" {
+		t.Fatalf("InitiateUpdate error = %q, want runtime detached message", resp["error"])
+	}
+}
+
 func TestDaemonRegisterUsesEnrollUserAsOwner(t *testing.T) {
 	ctx := context.Background()
 

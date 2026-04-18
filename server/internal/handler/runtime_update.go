@@ -114,6 +114,10 @@ func (h *Handler) InitiateUpdate(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireWorkspaceMember(w, r, uuidToString(rt.WorkspaceID), "runtime not found"); !ok {
 		return
 	}
+	if !rt.DaemonID.Valid {
+		writeError(w, http.StatusConflict, "runtime is not currently attached to a daemon")
+		return
+	}
 
 	var req struct {
 		TargetVersion string `json:"target_version"`

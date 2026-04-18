@@ -2,6 +2,13 @@ ALTER TABLE runtime_ping
     ADD COLUMN workspace_id UUID,
     ADD COLUMN daemon_id TEXT;
 
+DELETE FROM runtime_ping AS rp
+WHERE EXISTS (
+    SELECT 1
+    FROM agent_runtime AS ar
+    WHERE ar.id = rp.runtime_id AND ar.daemon_id IS NULL
+);
+
 UPDATE runtime_ping AS rp
 SET workspace_id = ar.workspace_id,
     daemon_id = ar.daemon_id
@@ -30,6 +37,13 @@ CREATE INDEX idx_runtime_ping_runtime_workspace_daemon_created
 ALTER TABLE runtime_update
     ADD COLUMN workspace_id UUID,
     ADD COLUMN daemon_id TEXT;
+
+DELETE FROM runtime_update AS ru
+WHERE EXISTS (
+    SELECT 1
+    FROM agent_runtime AS ar
+    WHERE ar.id = ru.runtime_id AND ar.daemon_id IS NULL
+);
 
 UPDATE runtime_update AS ru
 SET workspace_id = ar.workspace_id,
