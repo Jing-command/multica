@@ -65,7 +65,12 @@ func (h *Handler) getPingRequest(ctx context.Context, pingID string) (*PingReque
 		return nil, err
 	}
 	if (ping.Status == string(PingPending) || ping.Status == string(PingRunning)) && ping.CreatedAt.Valid && time.Since(ping.CreatedAt.Time) > 60*time.Second {
-		timedOut, err := h.Queries.SetRuntimePingTimeout(ctx, ping.ID)
+		timedOut, err := h.Queries.SetRuntimePingTimeoutForDaemon(ctx, db.SetRuntimePingTimeoutForDaemonParams{
+			ID:          ping.ID,
+			RuntimeID:   ping.RuntimeID,
+			WorkspaceID: ping.WorkspaceID,
+			DaemonID:    ping.DaemonID,
+		})
 		if err == nil {
 			ping = timedOut
 		} else if !isNotFound(err) {

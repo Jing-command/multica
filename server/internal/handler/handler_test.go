@@ -1785,6 +1785,80 @@ func TestGetUpdateReturnsPersistedTerminalStateWhenTimeoutUpdateLosesRace(t *tes
 	}
 }
 
+func TestGetUpdateDoesNotTimeoutAfterOwnershipChangesBeforeTimeoutUpdate(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/update", map[string]any{
+		"target_version": "v1.2.3",
+	}), "runtimeId", runtimeID)
+	testHandler.InitiateUpdate(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiateUpdate: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created UpdateRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created update: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE runtime_update
+		SET created_at = $2, updated_at = $2
+		WHERE id = $1
+	`, created.ID, time.Now().Add(-3*time.Minute)); err != nil {
+		t.Fatalf("age update request: %v", err)
+	}
+
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT id FROM runtime_update WHERE id = $1 FOR UPDATE`, created.ID); err != nil {
+		t.Fatalf("lock update row: %v", err)
+	}
+
+	resultCh := make(chan *UpdateRequest, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, err := testHandler.getUpdateRequest(ctx, created.ID)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resultCh <- result
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE runtime_update
+		SET daemon_id = 'other-daemon', updated_at = now()
+		WHERE id = $1
+	`, created.ID); err != nil {
+		t.Fatalf("rebind update ownership in tx: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit tx: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("getUpdateRequest returned error: %v", err)
+	case got := <-resultCh:
+		if got.Status != UpdatePending {
+			t.Fatalf("update status = %q, want %q", got.Status, UpdatePending)
+		}
+		if got.Error != "" {
+			t.Fatalf("update error = %q, want empty", got.Error)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for getUpdateRequest")
+	}
+}
+
 func TestGetPingTimesOutAfterHeartbeatClaimsIt(t *testing.T) {
 	ctx := context.Background()
 	runtimeID := mustGetHandlerTestRuntimeID(t)
@@ -1826,6 +1900,78 @@ func TestGetPingTimesOutAfterHeartbeatClaimsIt(t *testing.T) {
 	}
 	if got.Error != "daemon did not respond within 60 seconds" {
 		t.Fatalf("ping error = %q, want timeout error", got.Error)
+	}
+}
+
+func TestGetPingDoesNotTimeoutAfterOwnershipChangesBeforeTimeoutUpdate(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/ping", nil), "runtimeId", runtimeID)
+	testHandler.InitiatePing(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiatePing: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created PingRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created ping: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE runtime_ping
+		SET created_at = $2, updated_at = $2
+		WHERE id = $1
+	`, created.ID, time.Now().Add(-2*time.Minute)); err != nil {
+		t.Fatalf("age ping request: %v", err)
+	}
+
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT id FROM runtime_ping WHERE id = $1 FOR UPDATE`, created.ID); err != nil {
+		t.Fatalf("lock ping row: %v", err)
+	}
+
+	resultCh := make(chan *PingRequest, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, err := testHandler.getPingRequest(ctx, created.ID)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resultCh <- result
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE runtime_ping
+		SET daemon_id = 'other-daemon', updated_at = now()
+		WHERE id = $1
+	`, created.ID); err != nil {
+		t.Fatalf("rebind ping ownership in tx: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit tx: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("getPingRequest returned error: %v", err)
+	case got := <-resultCh:
+		if got.Status != PingPending {
+			t.Fatalf("ping status = %q, want %q", got.Status, PingPending)
+		}
+		if got.Error != "" {
+			t.Fatalf("ping error = %q, want empty", got.Error)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for getPingRequest")
 	}
 }
 

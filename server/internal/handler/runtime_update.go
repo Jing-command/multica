@@ -57,7 +57,12 @@ func (h *Handler) getUpdateRequest(ctx context.Context, updateID string) (*Updat
 		return nil, err
 	}
 	if (update.Status == string(UpdatePending) || update.Status == string(UpdateRunning)) && update.CreatedAt.Valid && time.Since(update.CreatedAt.Time) > 120*time.Second {
-		timedOut, err := h.Queries.SetRuntimeUpdateTimeout(ctx, update.ID)
+		timedOut, err := h.Queries.SetRuntimeUpdateTimeoutForDaemon(ctx, db.SetRuntimeUpdateTimeoutForDaemonParams{
+			ID:          update.ID,
+			RuntimeID:   update.RuntimeID,
+			WorkspaceID: update.WorkspaceID,
+			DaemonID:    update.DaemonID,
+		})
 		if err == nil {
 			update = timedOut
 		} else if !isNotFound(err) {
