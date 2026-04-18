@@ -8,13 +8,24 @@ SET workspace_id = ar.workspace_id,
 FROM agent_runtime AS ar
 WHERE ar.id = rp.runtime_id;
 
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM runtime_ping
+        WHERE workspace_id IS NULL OR daemon_id IS NULL
+    ) THEN
+        RAISE EXCEPTION 'runtime_ping backfill failed';
+    END IF;
+END $$;
+
 ALTER TABLE runtime_ping
     ALTER COLUMN workspace_id SET NOT NULL,
     ALTER COLUMN daemon_id SET NOT NULL,
     ADD CONSTRAINT runtime_ping_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES workspace(id) ON DELETE CASCADE;
 
-CREATE INDEX idx_runtime_ping_workspace_daemon_runtime_status_created_at
-    ON runtime_ping(workspace_id, daemon_id, runtime_id, status, created_at);
+CREATE INDEX idx_runtime_ping_runtime_workspace_daemon_created
+    ON runtime_ping(runtime_id, workspace_id, daemon_id, created_at);
 
 ALTER TABLE runtime_update
     ADD COLUMN workspace_id UUID,
@@ -26,10 +37,21 @@ SET workspace_id = ar.workspace_id,
 FROM agent_runtime AS ar
 WHERE ar.id = ru.runtime_id;
 
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM runtime_update
+        WHERE workspace_id IS NULL OR daemon_id IS NULL
+    ) THEN
+        RAISE EXCEPTION 'runtime_update backfill failed';
+    END IF;
+END $$;
+
 ALTER TABLE runtime_update
     ALTER COLUMN workspace_id SET NOT NULL,
     ALTER COLUMN daemon_id SET NOT NULL,
     ADD CONSTRAINT runtime_update_workspace_id_fkey FOREIGN KEY (workspace_id) REFERENCES workspace(id) ON DELETE CASCADE;
 
-CREATE INDEX idx_runtime_update_workspace_daemon_runtime_status_created_at
-    ON runtime_update(workspace_id, daemon_id, runtime_id, status, created_at);
+CREATE INDEX idx_runtime_update_runtime_workspace_daemon_created
+    ON runtime_update(runtime_id, workspace_id, daemon_id, created_at);

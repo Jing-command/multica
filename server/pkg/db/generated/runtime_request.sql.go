@@ -13,14 +13,18 @@ import (
 
 const createRuntimePing = `-- name: CreateRuntimePing :one
 INSERT INTO runtime_ping (runtime_id, workspace_id, daemon_id, status)
-SELECT agent_runtime.id, agent_runtime.workspace_id, agent_runtime.daemon_id, 'pending'
-FROM agent_runtime
-WHERE agent_runtime.id = $1
+VALUES ($1, $2, $3, 'pending')
 RETURNING id, runtime_id, status, output, error, duration_ms, created_at, updated_at, workspace_id, daemon_id
 `
 
-func (q *Queries) CreateRuntimePing(ctx context.Context, runtimeID pgtype.UUID) (RuntimePing, error) {
-	row := q.db.QueryRow(ctx, createRuntimePing, runtimeID)
+type CreateRuntimePingParams struct {
+	RuntimeID   pgtype.UUID `json:"runtime_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	DaemonID    string      `json:"daemon_id"`
+}
+
+func (q *Queries) CreateRuntimePing(ctx context.Context, arg CreateRuntimePingParams) (RuntimePing, error) {
+	row := q.db.QueryRow(ctx, createRuntimePing, arg.RuntimeID, arg.WorkspaceID, arg.DaemonID)
 	var i RuntimePing
 	err := row.Scan(
 		&i.ID,
@@ -39,19 +43,24 @@ func (q *Queries) CreateRuntimePing(ctx context.Context, runtimeID pgtype.UUID) 
 
 const createRuntimeUpdate = `-- name: CreateRuntimeUpdate :one
 INSERT INTO runtime_update (runtime_id, workspace_id, daemon_id, status, target_version)
-SELECT agent_runtime.id, agent_runtime.workspace_id, agent_runtime.daemon_id, 'pending', $1
-FROM agent_runtime
-WHERE agent_runtime.id = $2
+VALUES ($1, $2, $3, 'pending', $4)
 RETURNING id, runtime_id, status, target_version, output, error, created_at, updated_at, workspace_id, daemon_id
 `
 
 type CreateRuntimeUpdateParams struct {
-	TargetVersion string      `json:"target_version"`
 	RuntimeID     pgtype.UUID `json:"runtime_id"`
+	WorkspaceID   pgtype.UUID `json:"workspace_id"`
+	DaemonID      string      `json:"daemon_id"`
+	TargetVersion string      `json:"target_version"`
 }
 
 func (q *Queries) CreateRuntimeUpdate(ctx context.Context, arg CreateRuntimeUpdateParams) (RuntimeUpdate, error) {
-	row := q.db.QueryRow(ctx, createRuntimeUpdate, arg.TargetVersion, arg.RuntimeID)
+	row := q.db.QueryRow(ctx, createRuntimeUpdate,
+		arg.RuntimeID,
+		arg.WorkspaceID,
+		arg.DaemonID,
+		arg.TargetVersion,
+	)
 	var i RuntimeUpdate
 	err := row.Scan(
 		&i.ID,
@@ -93,17 +102,23 @@ func (q *Queries) GetRuntimePing(ctx context.Context, id pgtype.UUID) (RuntimePi
 
 const getRuntimePingForDaemon = `-- name: GetRuntimePingForDaemon :one
 SELECT id, runtime_id, status, output, error, duration_ms, created_at, updated_at, workspace_id, daemon_id FROM runtime_ping
-WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3 AND daemon_id = $4
 `
 
 type GetRuntimePingForDaemonParams struct {
 	ID          pgtype.UUID `json:"id"`
+	RuntimeID   pgtype.UUID `json:"runtime_id"`
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
 	DaemonID    string      `json:"daemon_id"`
 }
 
 func (q *Queries) GetRuntimePingForDaemon(ctx context.Context, arg GetRuntimePingForDaemonParams) (RuntimePing, error) {
-	row := q.db.QueryRow(ctx, getRuntimePingForDaemon, arg.ID, arg.WorkspaceID, arg.DaemonID)
+	row := q.db.QueryRow(ctx, getRuntimePingForDaemon,
+		arg.ID,
+		arg.RuntimeID,
+		arg.WorkspaceID,
+		arg.DaemonID,
+	)
 	var i RuntimePing
 	err := row.Scan(
 		&i.ID,
@@ -145,17 +160,23 @@ func (q *Queries) GetRuntimeUpdate(ctx context.Context, id pgtype.UUID) (Runtime
 
 const getRuntimeUpdateForDaemon = `-- name: GetRuntimeUpdateForDaemon :one
 SELECT id, runtime_id, status, target_version, output, error, created_at, updated_at, workspace_id, daemon_id FROM runtime_update
-WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3 AND daemon_id = $4
 `
 
 type GetRuntimeUpdateForDaemonParams struct {
 	ID          pgtype.UUID `json:"id"`
+	RuntimeID   pgtype.UUID `json:"runtime_id"`
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
 	DaemonID    string      `json:"daemon_id"`
 }
 
 func (q *Queries) GetRuntimeUpdateForDaemon(ctx context.Context, arg GetRuntimeUpdateForDaemonParams) (RuntimeUpdate, error) {
-	row := q.db.QueryRow(ctx, getRuntimeUpdateForDaemon, arg.ID, arg.WorkspaceID, arg.DaemonID)
+	row := q.db.QueryRow(ctx, getRuntimeUpdateForDaemon,
+		arg.ID,
+		arg.RuntimeID,
+		arg.WorkspaceID,
+		arg.DaemonID,
+	)
 	var i RuntimeUpdate
 	err := row.Scan(
 		&i.ID,
@@ -222,9 +243,9 @@ const popPendingRuntimePingForDaemon = `-- name: PopPendingRuntimePingForDaemon 
 WITH next_ping AS (
     SELECT id
     FROM runtime_ping
-    WHERE runtime_ping.workspace_id = $1
-      AND runtime_ping.daemon_id = $2
-      AND runtime_ping.runtime_id = $3
+    WHERE runtime_ping.runtime_id = $1
+      AND runtime_ping.workspace_id = $2
+      AND runtime_ping.daemon_id = $3
       AND runtime_ping.status = 'pending'
     ORDER BY created_at ASC
     LIMIT 1
@@ -237,13 +258,13 @@ RETURNING id, runtime_id, status, output, error, duration_ms, created_at, update
 `
 
 type PopPendingRuntimePingForDaemonParams struct {
+	RuntimeID   pgtype.UUID `json:"runtime_id"`
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
 	DaemonID    string      `json:"daemon_id"`
-	RuntimeID   pgtype.UUID `json:"runtime_id"`
 }
 
 func (q *Queries) PopPendingRuntimePingForDaemon(ctx context.Context, arg PopPendingRuntimePingForDaemonParams) ([]RuntimePing, error) {
-	rows, err := q.db.Query(ctx, popPendingRuntimePingForDaemon, arg.WorkspaceID, arg.DaemonID, arg.RuntimeID)
+	rows, err := q.db.Query(ctx, popPendingRuntimePingForDaemon, arg.RuntimeID, arg.WorkspaceID, arg.DaemonID)
 	if err != nil {
 		return nil, err
 	}
@@ -323,9 +344,9 @@ const popPendingRuntimeUpdateForDaemon = `-- name: PopPendingRuntimeUpdateForDae
 WITH next_update AS (
     SELECT id
     FROM runtime_update
-    WHERE runtime_update.workspace_id = $1
-      AND runtime_update.daemon_id = $2
-      AND runtime_update.runtime_id = $3
+    WHERE runtime_update.runtime_id = $1
+      AND runtime_update.workspace_id = $2
+      AND runtime_update.daemon_id = $3
       AND runtime_update.status = 'pending'
     ORDER BY created_at ASC
     LIMIT 1
@@ -338,13 +359,13 @@ RETURNING id, runtime_id, status, target_version, output, error, created_at, upd
 `
 
 type PopPendingRuntimeUpdateForDaemonParams struct {
+	RuntimeID   pgtype.UUID `json:"runtime_id"`
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
 	DaemonID    string      `json:"daemon_id"`
-	RuntimeID   pgtype.UUID `json:"runtime_id"`
 }
 
 func (q *Queries) PopPendingRuntimeUpdateForDaemon(ctx context.Context, arg PopPendingRuntimeUpdateForDaemonParams) ([]RuntimeUpdate, error) {
-	rows, err := q.db.Query(ctx, popPendingRuntimeUpdateForDaemon, arg.WorkspaceID, arg.DaemonID, arg.RuntimeID)
+	rows, err := q.db.Query(ctx, popPendingRuntimeUpdateForDaemon, arg.RuntimeID, arg.WorkspaceID, arg.DaemonID)
 	if err != nil {
 		return nil, err
 	}
@@ -407,13 +428,14 @@ func (q *Queries) SetRuntimePingCompleted(ctx context.Context, arg SetRuntimePin
 
 const setRuntimePingCompletedForDaemon = `-- name: SetRuntimePingCompletedForDaemon :one
 UPDATE runtime_ping
-SET status = 'completed', output = $4, duration_ms = $5, updated_at = now()
-WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3
+SET status = 'completed', output = $5, duration_ms = $6, updated_at = now()
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3 AND daemon_id = $4
 RETURNING id, runtime_id, status, output, error, duration_ms, created_at, updated_at, workspace_id, daemon_id
 `
 
 type SetRuntimePingCompletedForDaemonParams struct {
 	ID          pgtype.UUID `json:"id"`
+	RuntimeID   pgtype.UUID `json:"runtime_id"`
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
 	DaemonID    string      `json:"daemon_id"`
 	Output      string      `json:"output"`
@@ -423,6 +445,7 @@ type SetRuntimePingCompletedForDaemonParams struct {
 func (q *Queries) SetRuntimePingCompletedForDaemon(ctx context.Context, arg SetRuntimePingCompletedForDaemonParams) (RuntimePing, error) {
 	row := q.db.QueryRow(ctx, setRuntimePingCompletedForDaemon,
 		arg.ID,
+		arg.RuntimeID,
 		arg.WorkspaceID,
 		arg.DaemonID,
 		arg.Output,
@@ -477,13 +500,14 @@ func (q *Queries) SetRuntimePingFailed(ctx context.Context, arg SetRuntimePingFa
 
 const setRuntimePingFailedForDaemon = `-- name: SetRuntimePingFailedForDaemon :one
 UPDATE runtime_ping
-SET status = 'failed', error = $4, duration_ms = $5, updated_at = now()
-WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3
+SET status = 'failed', error = $5, duration_ms = $6, updated_at = now()
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3 AND daemon_id = $4
 RETURNING id, runtime_id, status, output, error, duration_ms, created_at, updated_at, workspace_id, daemon_id
 `
 
 type SetRuntimePingFailedForDaemonParams struct {
 	ID          pgtype.UUID `json:"id"`
+	RuntimeID   pgtype.UUID `json:"runtime_id"`
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
 	DaemonID    string      `json:"daemon_id"`
 	Error       string      `json:"error"`
@@ -493,6 +517,7 @@ type SetRuntimePingFailedForDaemonParams struct {
 func (q *Queries) SetRuntimePingFailedForDaemon(ctx context.Context, arg SetRuntimePingFailedForDaemonParams) (RuntimePing, error) {
 	row := q.db.QueryRow(ctx, setRuntimePingFailedForDaemon,
 		arg.ID,
+		arg.RuntimeID,
 		arg.WorkspaceID,
 		arg.DaemonID,
 		arg.Error,
@@ -542,18 +567,24 @@ func (q *Queries) SetRuntimePingTimeout(ctx context.Context, id pgtype.UUID) (Ru
 const setRuntimePingTimeoutForDaemon = `-- name: SetRuntimePingTimeoutForDaemon :one
 UPDATE runtime_ping
 SET status = 'timeout', error = 'daemon did not respond within 60 seconds', updated_at = now()
-WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3 AND status IN ('pending', 'running')
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3 AND daemon_id = $4 AND status IN ('pending', 'running')
 RETURNING id, runtime_id, status, output, error, duration_ms, created_at, updated_at, workspace_id, daemon_id
 `
 
 type SetRuntimePingTimeoutForDaemonParams struct {
 	ID          pgtype.UUID `json:"id"`
+	RuntimeID   pgtype.UUID `json:"runtime_id"`
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
 	DaemonID    string      `json:"daemon_id"`
 }
 
 func (q *Queries) SetRuntimePingTimeoutForDaemon(ctx context.Context, arg SetRuntimePingTimeoutForDaemonParams) (RuntimePing, error) {
-	row := q.db.QueryRow(ctx, setRuntimePingTimeoutForDaemon, arg.ID, arg.WorkspaceID, arg.DaemonID)
+	row := q.db.QueryRow(ctx, setRuntimePingTimeoutForDaemon,
+		arg.ID,
+		arg.RuntimeID,
+		arg.WorkspaceID,
+		arg.DaemonID,
+	)
 	var i RuntimePing
 	err := row.Scan(
 		&i.ID,
@@ -602,13 +633,14 @@ func (q *Queries) SetRuntimeUpdateCompleted(ctx context.Context, arg SetRuntimeU
 
 const setRuntimeUpdateCompletedForDaemon = `-- name: SetRuntimeUpdateCompletedForDaemon :one
 UPDATE runtime_update
-SET status = 'completed', output = $4, updated_at = now()
-WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3
+SET status = 'completed', output = $5, updated_at = now()
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3 AND daemon_id = $4
 RETURNING id, runtime_id, status, target_version, output, error, created_at, updated_at, workspace_id, daemon_id
 `
 
 type SetRuntimeUpdateCompletedForDaemonParams struct {
 	ID          pgtype.UUID `json:"id"`
+	RuntimeID   pgtype.UUID `json:"runtime_id"`
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
 	DaemonID    string      `json:"daemon_id"`
 	Output      string      `json:"output"`
@@ -617,6 +649,7 @@ type SetRuntimeUpdateCompletedForDaemonParams struct {
 func (q *Queries) SetRuntimeUpdateCompletedForDaemon(ctx context.Context, arg SetRuntimeUpdateCompletedForDaemonParams) (RuntimeUpdate, error) {
 	row := q.db.QueryRow(ctx, setRuntimeUpdateCompletedForDaemon,
 		arg.ID,
+		arg.RuntimeID,
 		arg.WorkspaceID,
 		arg.DaemonID,
 		arg.Output,
@@ -669,13 +702,14 @@ func (q *Queries) SetRuntimeUpdateFailed(ctx context.Context, arg SetRuntimeUpda
 
 const setRuntimeUpdateFailedForDaemon = `-- name: SetRuntimeUpdateFailedForDaemon :one
 UPDATE runtime_update
-SET status = 'failed', error = $4, updated_at = now()
-WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3
+SET status = 'failed', error = $5, updated_at = now()
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3 AND daemon_id = $4
 RETURNING id, runtime_id, status, target_version, output, error, created_at, updated_at, workspace_id, daemon_id
 `
 
 type SetRuntimeUpdateFailedForDaemonParams struct {
 	ID          pgtype.UUID `json:"id"`
+	RuntimeID   pgtype.UUID `json:"runtime_id"`
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
 	DaemonID    string      `json:"daemon_id"`
 	Error       string      `json:"error"`
@@ -684,6 +718,7 @@ type SetRuntimeUpdateFailedForDaemonParams struct {
 func (q *Queries) SetRuntimeUpdateFailedForDaemon(ctx context.Context, arg SetRuntimeUpdateFailedForDaemonParams) (RuntimeUpdate, error) {
 	row := q.db.QueryRow(ctx, setRuntimeUpdateFailedForDaemon,
 		arg.ID,
+		arg.RuntimeID,
 		arg.WorkspaceID,
 		arg.DaemonID,
 		arg.Error,
@@ -732,18 +767,24 @@ func (q *Queries) SetRuntimeUpdateTimeout(ctx context.Context, id pgtype.UUID) (
 const setRuntimeUpdateTimeoutForDaemon = `-- name: SetRuntimeUpdateTimeoutForDaemon :one
 UPDATE runtime_update
 SET status = 'timeout', error = 'update did not complete within 120 seconds', updated_at = now()
-WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3 AND status IN ('pending', 'running')
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3 AND daemon_id = $4 AND status IN ('pending', 'running')
 RETURNING id, runtime_id, status, target_version, output, error, created_at, updated_at, workspace_id, daemon_id
 `
 
 type SetRuntimeUpdateTimeoutForDaemonParams struct {
 	ID          pgtype.UUID `json:"id"`
+	RuntimeID   pgtype.UUID `json:"runtime_id"`
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
 	DaemonID    string      `json:"daemon_id"`
 }
 
 func (q *Queries) SetRuntimeUpdateTimeoutForDaemon(ctx context.Context, arg SetRuntimeUpdateTimeoutForDaemonParams) (RuntimeUpdate, error) {
-	row := q.db.QueryRow(ctx, setRuntimeUpdateTimeoutForDaemon, arg.ID, arg.WorkspaceID, arg.DaemonID)
+	row := q.db.QueryRow(ctx, setRuntimeUpdateTimeoutForDaemon,
+		arg.ID,
+		arg.RuntimeID,
+		arg.WorkspaceID,
+		arg.DaemonID,
+	)
 	var i RuntimeUpdate
 	err := row.Scan(
 		&i.ID,

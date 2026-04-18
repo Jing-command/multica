@@ -129,6 +129,8 @@ func (h *Handler) InitiateUpdate(w http.ResponseWriter, r *http.Request) {
 
 	update, err := h.Queries.CreateRuntimeUpdate(r.Context(), db.CreateRuntimeUpdateParams{
 		RuntimeID:     parseUUID(runtimeID),
+		WorkspaceID:   rt.WorkspaceID,
+		DaemonID:      rt.DaemonID.String,
 		TargetVersion: req.TargetVersion,
 	})
 	if err != nil {

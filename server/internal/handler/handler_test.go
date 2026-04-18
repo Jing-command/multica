@@ -1867,7 +1867,7 @@ func TestInitiateUpdatePersistsDaemonOwnershipContext(t *testing.T) {
 
 	createW := httptest.NewRecorder()
 	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/update", map[string]any{
-		"target_version": "v2.0.0",
+		"target_version": "v1.2.3",
 	}), "runtimeId", runtimeID)
 	testHandler.InitiateUpdate(createW, createReq)
 	if createW.Code != http.StatusOK {

@@ -1,8 +1,6 @@
 -- name: CreateRuntimePing :one
 INSERT INTO runtime_ping (runtime_id, workspace_id, daemon_id, status)
-SELECT agent_runtime.id, agent_runtime.workspace_id, agent_runtime.daemon_id, 'pending'
-FROM agent_runtime
-WHERE agent_runtime.id = sqlc.arg(runtime_id)
+VALUES ($1, $2, $3, 'pending')
 RETURNING *;
 
 -- name: GetRuntimePing :one
@@ -11,7 +9,7 @@ WHERE id = $1;
 
 -- name: GetRuntimePingForDaemon :one
 SELECT * FROM runtime_ping
-WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3;
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3 AND daemon_id = $4;
 
 -- name: PopPendingRuntimePing :many
 WITH next_ping AS (
@@ -31,9 +29,9 @@ RETURNING *;
 WITH next_ping AS (
     SELECT id
     FROM runtime_ping
-    WHERE runtime_ping.workspace_id = $1
-      AND runtime_ping.daemon_id = $2
-      AND runtime_ping.runtime_id = $3
+    WHERE runtime_ping.runtime_id = $1
+      AND runtime_ping.workspace_id = $2
+      AND runtime_ping.daemon_id = $3
       AND runtime_ping.status = 'pending'
     ORDER BY created_at ASC
     LIMIT 1
@@ -52,8 +50,8 @@ RETURNING *;
 
 -- name: SetRuntimePingCompletedForDaemon :one
 UPDATE runtime_ping
-SET status = 'completed', output = $4, duration_ms = $5, updated_at = now()
-WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3
+SET status = 'completed', output = $5, duration_ms = $6, updated_at = now()
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3 AND daemon_id = $4
 RETURNING *;
 
 -- name: SetRuntimePingFailed :one
@@ -64,8 +62,8 @@ RETURNING *;
 
 -- name: SetRuntimePingFailedForDaemon :one
 UPDATE runtime_ping
-SET status = 'failed', error = $4, duration_ms = $5, updated_at = now()
-WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3
+SET status = 'failed', error = $5, duration_ms = $6, updated_at = now()
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3 AND daemon_id = $4
 RETURNING *;
 
 -- name: SetRuntimePingTimeout :one
@@ -77,14 +75,12 @@ RETURNING *;
 -- name: SetRuntimePingTimeoutForDaemon :one
 UPDATE runtime_ping
 SET status = 'timeout', error = 'daemon did not respond within 60 seconds', updated_at = now()
-WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3 AND status IN ('pending', 'running')
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3 AND daemon_id = $4 AND status IN ('pending', 'running')
 RETURNING *;
 
 -- name: CreateRuntimeUpdate :one
 INSERT INTO runtime_update (runtime_id, workspace_id, daemon_id, status, target_version)
-SELECT agent_runtime.id, agent_runtime.workspace_id, agent_runtime.daemon_id, 'pending', sqlc.arg(target_version)
-FROM agent_runtime
-WHERE agent_runtime.id = sqlc.arg(runtime_id)
+VALUES ($1, $2, $3, 'pending', $4)
 RETURNING *;
 
 -- name: GetRuntimeUpdate :one
@@ -93,7 +89,7 @@ WHERE id = $1;
 
 -- name: GetRuntimeUpdateForDaemon :one
 SELECT * FROM runtime_update
-WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3;
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3 AND daemon_id = $4;
 
 -- name: PopPendingRuntimeUpdate :many
 WITH next_update AS (
@@ -113,9 +109,9 @@ RETURNING *;
 WITH next_update AS (
     SELECT id
     FROM runtime_update
-    WHERE runtime_update.workspace_id = $1
-      AND runtime_update.daemon_id = $2
-      AND runtime_update.runtime_id = $3
+    WHERE runtime_update.runtime_id = $1
+      AND runtime_update.workspace_id = $2
+      AND runtime_update.daemon_id = $3
       AND runtime_update.status = 'pending'
     ORDER BY created_at ASC
     LIMIT 1
@@ -134,8 +130,8 @@ RETURNING *;
 
 -- name: SetRuntimeUpdateCompletedForDaemon :one
 UPDATE runtime_update
-SET status = 'completed', output = $4, updated_at = now()
-WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3
+SET status = 'completed', output = $5, updated_at = now()
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3 AND daemon_id = $4
 RETURNING *;
 
 -- name: SetRuntimeUpdateFailed :one
@@ -146,8 +142,8 @@ RETURNING *;
 
 -- name: SetRuntimeUpdateFailedForDaemon :one
 UPDATE runtime_update
-SET status = 'failed', error = $4, updated_at = now()
-WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3
+SET status = 'failed', error = $5, updated_at = now()
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3 AND daemon_id = $4
 RETURNING *;
 
 -- name: SetRuntimeUpdateTimeout :one
@@ -159,5 +155,5 @@ RETURNING *;
 -- name: SetRuntimeUpdateTimeoutForDaemon :one
 UPDATE runtime_update
 SET status = 'timeout', error = 'update did not complete within 120 seconds', updated_at = now()
-WHERE id = $1 AND workspace_id = $2 AND daemon_id = $3 AND status IN ('pending', 'running')
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3 AND daemon_id = $4 AND status IN ('pending', 'running')
 RETURNING *;

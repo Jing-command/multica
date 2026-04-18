@@ -125,7 +125,11 @@ func (h *Handler) InitiatePing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ping, err := h.Queries.CreateRuntimePing(r.Context(), parseUUID(runtimeID))
+	ping, err := h.Queries.CreateRuntimePing(r.Context(), db.CreateRuntimePingParams{
+		RuntimeID:   parseUUID(runtimeID),
+		WorkspaceID: rt.WorkspaceID,
+		DaemonID:    rt.DaemonID.String,
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create ping")
 		return
