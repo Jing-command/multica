@@ -2096,6 +2096,75 @@ func TestReportUpdateResultRejectsRequestOwnedByAnotherDaemon(t *testing.T) {
 	}
 }
 
+func TestRuntimeRebindingDoesNotTransferExistingPingRequestOwnership(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+	if _, err := testPool.Exec(ctx, `DELETE FROM runtime_ping WHERE runtime_id = $1`, runtimeID); err != nil {
+		t.Fatalf("cleanup runtime_ping: %v", err)
+	}
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/ping", nil), "runtimeId", runtimeID)
+	testHandler.InitiatePing(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiatePing: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created PingRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created ping: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `UPDATE agent_runtime SET daemon_id = $2 WHERE id = $1`, runtimeID, "rebound-daemon"); err != nil {
+		t.Fatalf("rebind runtime daemon: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/daemon/heartbeat", map[string]any{"runtime_id": runtimeID})
+	req = withDaemonIdentity(req, testWorkspaceID, "rebound-daemon")
+	testHandler.DaemonHeartbeat(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("DaemonHeartbeat: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), created.ID) {
+		t.Fatalf("expected rebound daemon not to see existing ping request, got %s", w.Body.String())
+	}
+}
+
+func TestRuntimeRebindingAssignsNewUpdateRequestsToNewDaemon(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+	if _, err := testPool.Exec(ctx, `DELETE FROM runtime_update WHERE runtime_id = $1`, runtimeID); err != nil {
+		t.Fatalf("cleanup runtime_update: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `UPDATE agent_runtime SET daemon_id = $2 WHERE id = $1`, runtimeID, "rebound-daemon"); err != nil {
+		t.Fatalf("rebind runtime daemon: %v", err)
+	}
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/update", map[string]any{
+		"target_version": "v9.9.9",
+	}), "runtimeId", runtimeID)
+	testHandler.InitiateUpdate(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiateUpdate: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created UpdateRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created update: %v", err)
+	}
+
+	var daemonID string
+	if err := testPool.QueryRow(ctx, `SELECT daemon_id FROM runtime_update WHERE id = $1`, created.ID).Scan(&daemonID); err != nil {
+		t.Fatalf("load update daemon ownership: %v", err)
+	}
+	if daemonID != "rebound-daemon" {
+		t.Fatalf("runtime_update.daemon_id = %q, want rebound-daemon", daemonID)
+	}
+}
+
 func TestDaemonRegisterUsesEnrollUserAsOwner(t *testing.T) {
 	ctx := context.Background()
 
