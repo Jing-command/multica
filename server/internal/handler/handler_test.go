@@ -1714,6 +1714,14 @@ func TestGetPingReturnsPersistedTerminalStateWhenTimeoutUpdateLosesRace(t *testi
 func TestGetUpdateReturnsPersistedTerminalStateWhenTimeoutUpdateLosesRace(t *testing.T) {
 	ctx := context.Background()
 	runtimeID := mustGetHandlerTestRuntimeID(t)
+	if _, err := testPool.Exec(ctx, `DELETE FROM runtime_update WHERE runtime_id = $1`, runtimeID); err != nil {
+		t.Fatalf("cleanup runtime_update: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(ctx, `DELETE FROM runtime_update WHERE runtime_id = $1`, runtimeID); err != nil {
+			t.Fatalf("cleanup runtime_update: %v", err)
+		}
+	})
 
 	createW := httptest.NewRecorder()
 	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/update", map[string]any{
@@ -1788,6 +1796,14 @@ func TestGetUpdateReturnsPersistedTerminalStateWhenTimeoutUpdateLosesRace(t *tes
 func TestGetUpdateDoesNotTimeoutAfterOwnershipChangesBeforeTimeoutUpdate(t *testing.T) {
 	ctx := context.Background()
 	runtimeID := mustGetHandlerTestRuntimeID(t)
+	if _, err := testPool.Exec(ctx, `DELETE FROM runtime_update WHERE runtime_id = $1`, runtimeID); err != nil {
+		t.Fatalf("cleanup runtime_update: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(ctx, `DELETE FROM runtime_update WHERE runtime_id = $1`, runtimeID); err != nil {
+			t.Fatalf("cleanup runtime_update: %v", err)
+		}
+	})
 
 	createW := httptest.NewRecorder()
 	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/update", map[string]any{
