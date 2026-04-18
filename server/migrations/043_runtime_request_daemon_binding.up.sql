@@ -2,12 +2,17 @@ ALTER TABLE runtime_ping
     ADD COLUMN workspace_id UUID,
     ADD COLUMN daemon_id TEXT;
 
-DELETE FROM runtime_ping AS rp
-WHERE EXISTS (
-    SELECT 1
-    FROM agent_runtime AS ar
-    WHERE ar.id = rp.runtime_id AND ar.daemon_id IS NULL
-);
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM runtime_ping AS rp
+        JOIN agent_runtime AS ar ON ar.id = rp.runtime_id
+        WHERE ar.daemon_id IS NULL
+    ) THEN
+        RAISE EXCEPTION 'runtime_ping contains rows for runtimes without daemon bindings';
+    END IF;
+END $$;
 
 UPDATE runtime_ping AS rp
 SET workspace_id = ar.workspace_id,
@@ -38,12 +43,17 @@ ALTER TABLE runtime_update
     ADD COLUMN workspace_id UUID,
     ADD COLUMN daemon_id TEXT;
 
-DELETE FROM runtime_update AS ru
-WHERE EXISTS (
-    SELECT 1
-    FROM agent_runtime AS ar
-    WHERE ar.id = ru.runtime_id AND ar.daemon_id IS NULL
-);
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM runtime_update AS ru
+        JOIN agent_runtime AS ar ON ar.id = ru.runtime_id
+        WHERE ar.daemon_id IS NULL
+    ) THEN
+        RAISE EXCEPTION 'runtime_update contains rows for runtimes without daemon bindings';
+    END IF;
+END $$;
 
 UPDATE runtime_update AS ru
 SET workspace_id = ar.workspace_id,
