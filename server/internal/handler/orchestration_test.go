@@ -18,14 +18,14 @@ import (
 var orchestrationHandlerSeq atomic.Int64
 
 type orchestrationHandlerFixture struct {
-	parentIssueID        string
-	childIssueID         string
-	orchestratorAgentID  string
-	workerAgentID        string
-	outsiderAgentID      string
-	orchestratorTaskID   string
-	workerChildTaskID    string
-	workerRuntimeID      string
+	parentIssueID       string
+	childIssueID        string
+	orchestratorAgentID string
+	workerAgentID       string
+	outsiderAgentID     string
+	orchestratorTaskID  string
+	workerChildTaskID   string
+	workerRuntimeID     string
 }
 
 func seedOrchestrationHandlerFixture(t *testing.T, ctx context.Context) orchestrationHandlerFixture {
@@ -132,6 +132,54 @@ func seedOrchestrationHandlerFixture(t *testing.T, ctx context.Context) orchestr
 		orchestratorTaskID:  orchestratorTaskID,
 		workerChildTaskID:   workerChildTaskID,
 		workerRuntimeID:     workerRuntimeID,
+	}
+}
+
+func TestRequireWorkflowAgentAcceptsVerifiedTaskBoundAgentContext(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationHandlerFixture(t, ctx)
+
+	issue, err := testHandler.Queries.GetIssue(ctx, parseUUID(fixture.childIssueID))
+	if err != nil {
+		t.Fatalf("load child issue: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/ignored", nil)
+	req.Header.Set("X-Agent-ID", fixture.workerAgentID)
+	req.Header.Set("X-Task-ID", fixture.workerChildTaskID)
+
+	agentID, ok := testHandler.requireWorkflowAgent(w, req, issue)
+	if !ok {
+		t.Fatalf("requireWorkflowAgent rejected verified task-bound agent: status=%d body=%s", w.Code, w.Body.String())
+	}
+	if agentID != fixture.workerAgentID {
+		t.Fatalf("agentID = %q, want %q", agentID, fixture.workerAgentID)
+	}
+}
+
+func TestRequireWorkflowAgentRejectsHeaderOnlyAgentContextWithoutVerifiedTask(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationHandlerFixture(t, ctx)
+
+	issue, err := testHandler.Queries.GetIssue(ctx, parseUUID(fixture.childIssueID))
+	if err != nil {
+		t.Fatalf("load child issue: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/ignored", nil)
+	req.Header.Set("X-Agent-ID", fixture.workerAgentID)
+
+	agentID, ok := testHandler.requireWorkflowAgent(w, req, issue)
+	if ok {
+		t.Fatalf("requireWorkflowAgent unexpectedly accepted header-only agent context, agentID=%q", agentID)
+	}
+	if agentID != "" {
+		t.Fatalf("agentID = %q, want empty", agentID)
+	}
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d: %s", w.Code, http.StatusForbidden, w.Body.String())
 	}
 }
 
@@ -1306,9 +1354,9 @@ func TestClaimTaskByRuntime_IncludesPermissionSnapshotJSON(t *testing.T) {
 
 	var resp struct {
 		Task *struct {
-			ID                     string                 `json:"id"`
-			PermissionSnapshot     map[string]any         `json:"permission_snapshot"`
-			PermissionSnapshotJSON json.RawMessage        `json:"permission_snapshot_json"`
+			ID                     string          `json:"id"`
+			PermissionSnapshot     map[string]any  `json:"permission_snapshot"`
+			PermissionSnapshotJSON json.RawMessage `json:"permission_snapshot_json"`
 		} `json:"task"`
 	}
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {

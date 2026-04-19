@@ -119,6 +119,24 @@ func resolveMemberActor(userID string) (actorType, actorID string) {
 	return "member", userID
 }
 
+func (h *Handler) resolveVerifiedAgentActorFromTask(ctx context.Context, taskID, agentID, workspaceID string) (actorType, actorID string, ok bool) {
+	if taskID == "" || agentID == "" || workspaceID == "" {
+		return "", "", false
+	}
+
+	task, err := h.Queries.GetAgentTask(ctx, parseUUID(taskID))
+	if err != nil || uuidToString(task.AgentID) != agentID {
+		return "", "", false
+	}
+
+	agent, err := h.Queries.GetAgent(ctx, parseUUID(agentID))
+	if err != nil || uuidToString(agent.WorkspaceID) != workspaceID {
+		return "", "", false
+	}
+
+	return "agent", agentID, true
+}
+
 func daemonScopeFromRequest(r *http.Request) (string, string, bool) {
 	workspaceID := strings.TrimSpace(middleware.DaemonWorkspaceIDFromContext(r.Context()))
 	daemonID := strings.TrimSpace(middleware.DaemonIDFromContext(r.Context()))
@@ -174,34 +192,10 @@ func (h *Handler) requireDaemonTaskScope(w http.ResponseWriter, r *http.Request,
 	return nil, false
 }
 
-// resolveActor determines whether the request is from an agent or a human member.
-// If X-Agent-ID and X-Task-ID headers are both set, validates that the task
-// belongs to the claimed agent (defense-in-depth against manual header spoofing).
-// If only X-Agent-ID is set, validates that the agent belongs to the workspace.
-// Returns ("agent", agentID) on success, ("member", userID) otherwise.
-func (h *Handler) resolveActor(r *http.Request, userID, workspaceID string) (actorType, actorID string) {
-	agentID := r.Header.Get("X-Agent-ID")
-	if agentID == "" {
-		return "member", userID
-	}
-
-	// Validate the agent exists in the target workspace.
-	agent, err := h.Queries.GetAgent(r.Context(), parseUUID(agentID))
-	if err != nil || uuidToString(agent.WorkspaceID) != workspaceID {
-		slog.Debug("resolveActor: X-Agent-ID rejected, agent not found or workspace mismatch", "agent_id", agentID, "workspace_id", workspaceID)
-		return "member", userID
-	}
-
-	// When X-Task-ID is provided, cross-check that the task belongs to this agent.
-	if taskID := r.Header.Get("X-Task-ID"); taskID != "" {
-		task, err := h.Queries.GetAgentTask(r.Context(), parseUUID(taskID))
-		if err != nil || uuidToString(task.AgentID) != agentID {
-			slog.Debug("resolveActor: X-Task-ID rejected, task not found or agent mismatch", "agent_id", agentID, "task_id", taskID)
-			return "member", userID
-		}
-	}
-
-	return "agent", agentID
+// resolveActor now resolves only the authenticated member identity.
+// Verified agent actor resolution must go through explicit task-bound helpers.
+func (h *Handler) resolveActor(_ *http.Request, userID, _ string) (actorType, actorID string) {
+	return resolveMemberActor(userID)
 }
 
 func requireUserID(w http.ResponseWriter, r *http.Request) (string, bool) {
