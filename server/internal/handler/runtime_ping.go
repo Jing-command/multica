@@ -102,6 +102,19 @@ func (h *Handler) popPendingPingRequest(ctx context.Context, runtimeID, workspac
 	return &result, nil
 }
 
+func (h *Handler) getPingRequestForWorkspace(ctx context.Context, pingID, runtimeID, workspaceID string) (*PingRequest, error) {
+	ping, err := h.Queries.GetRuntimePingForWorkspace(ctx, db.GetRuntimePingForWorkspaceParams{
+		ID:          parseUUID(pingID),
+		RuntimeID:   parseUUID(runtimeID),
+		WorkspaceID: parseUUID(workspaceID),
+	})
+	if err != nil {
+		return nil, err
+	}
+	result := runtimePingToRequest(ping)
+	return &result, nil
+}
+
 func (h *Handler) getPingRequestForDaemon(ctx context.Context, pingID, runtimeID, workspaceID, daemonID string) (*PingRequest, error) {
 	ping, err := h.Queries.GetRuntimePingForDaemon(ctx, db.GetRuntimePingForDaemonParams{
 		ID:          parseUUID(pingID),
@@ -173,9 +186,19 @@ func (h *Handler) InitiatePing(w http.ResponseWriter, r *http.Request) {
 
 // GetPing returns the status of a ping request (protected route, called by frontend).
 func (h *Handler) GetPing(w http.ResponseWriter, r *http.Request) {
+	runtimeID := chi.URLParam(r, "runtimeId")
 	pingID := chi.URLParam(r, "pingId")
 
-	ping, err := h.getPingRequest(r.Context(), pingID)
+	rt, err := h.Queries.GetAgentRuntime(r.Context(), parseUUID(runtimeID))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "runtime not found")
+		return
+	}
+	if _, ok := h.requireWorkspaceMember(w, r, uuidToString(rt.WorkspaceID), "runtime not found"); !ok {
+		return
+	}
+
+	ping, err := h.getPingRequestForWorkspace(r.Context(), pingID, runtimeID, uuidToString(rt.WorkspaceID))
 	if err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, "ping not found")

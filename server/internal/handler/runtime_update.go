@@ -94,6 +94,19 @@ func (h *Handler) popPendingUpdateRequest(ctx context.Context, runtimeID, worksp
 	return &result, nil
 }
 
+func (h *Handler) getUpdateRequestForWorkspace(ctx context.Context, updateID, runtimeID, workspaceID string) (*UpdateRequest, error) {
+	update, err := h.Queries.GetRuntimeUpdateForWorkspace(ctx, db.GetRuntimeUpdateForWorkspaceParams{
+		ID:          parseUUID(updateID),
+		RuntimeID:   parseUUID(runtimeID),
+		WorkspaceID: parseUUID(workspaceID),
+	})
+	if err != nil {
+		return nil, err
+	}
+	result := runtimeUpdateToRequest(update)
+	return &result, nil
+}
+
 func (h *Handler) getUpdateRequestForDaemon(ctx context.Context, updateID, runtimeID, workspaceID, daemonID string) (*UpdateRequest, error) {
 	update, err := h.Queries.GetRuntimeUpdateForDaemon(ctx, db.GetRuntimeUpdateForDaemonParams{
 		ID:          parseUUID(updateID),
@@ -180,9 +193,19 @@ func (h *Handler) InitiateUpdate(w http.ResponseWriter, r *http.Request) {
 
 // GetUpdate returns the status of an update request (protected route, called by frontend).
 func (h *Handler) GetUpdate(w http.ResponseWriter, r *http.Request) {
+	runtimeID := chi.URLParam(r, "runtimeId")
 	updateID := chi.URLParam(r, "updateId")
 
-	update, err := h.getUpdateRequest(r.Context(), updateID)
+	rt, err := h.Queries.GetAgentRuntime(r.Context(), parseUUID(runtimeID))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "runtime not found")
+		return
+	}
+	if _, ok := h.requireWorkspaceMember(w, r, uuidToString(rt.WorkspaceID), "runtime not found"); !ok {
+		return
+	}
+
+	update, err := h.getUpdateRequestForWorkspace(r.Context(), updateID, runtimeID, uuidToString(rt.WorkspaceID))
 	if err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, "update not found")

@@ -135,6 +135,35 @@ func (q *Queries) GetRuntimePingForDaemon(ctx context.Context, arg GetRuntimePin
 	return i, err
 }
 
+const getRuntimePingForWorkspace = `-- name: GetRuntimePingForWorkspace :one
+SELECT id, runtime_id, status, output, error, duration_ms, created_at, updated_at, workspace_id, daemon_id FROM runtime_ping
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3
+`
+
+type GetRuntimePingForWorkspaceParams struct {
+	ID          pgtype.UUID `json:"id"`
+	RuntimeID   pgtype.UUID `json:"runtime_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+func (q *Queries) GetRuntimePingForWorkspace(ctx context.Context, arg GetRuntimePingForWorkspaceParams) (RuntimePing, error) {
+	row := q.db.QueryRow(ctx, getRuntimePingForWorkspace, arg.ID, arg.RuntimeID, arg.WorkspaceID)
+	var i RuntimePing
+	err := row.Scan(
+		&i.ID,
+		&i.RuntimeID,
+		&i.Status,
+		&i.Output,
+		&i.Error,
+		&i.DurationMs,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.WorkspaceID,
+		&i.DaemonID,
+	)
+	return i, err
+}
+
 const getRuntimeUpdate = `-- name: GetRuntimeUpdate :one
 SELECT id, runtime_id, status, target_version, output, error, created_at, updated_at, workspace_id, daemon_id FROM runtime_update
 WHERE id = $1
@@ -177,6 +206,35 @@ func (q *Queries) GetRuntimeUpdateForDaemon(ctx context.Context, arg GetRuntimeU
 		arg.WorkspaceID,
 		arg.DaemonID,
 	)
+	var i RuntimeUpdate
+	err := row.Scan(
+		&i.ID,
+		&i.RuntimeID,
+		&i.Status,
+		&i.TargetVersion,
+		&i.Output,
+		&i.Error,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.WorkspaceID,
+		&i.DaemonID,
+	)
+	return i, err
+}
+
+const getRuntimeUpdateForWorkspace = `-- name: GetRuntimeUpdateForWorkspace :one
+SELECT id, runtime_id, status, target_version, output, error, created_at, updated_at, workspace_id, daemon_id FROM runtime_update
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3
+`
+
+type GetRuntimeUpdateForWorkspaceParams struct {
+	ID          pgtype.UUID `json:"id"`
+	RuntimeID   pgtype.UUID `json:"runtime_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+func (q *Queries) GetRuntimeUpdateForWorkspace(ctx context.Context, arg GetRuntimeUpdateForWorkspaceParams) (RuntimeUpdate, error) {
+	row := q.db.QueryRow(ctx, getRuntimeUpdateForWorkspace, arg.ID, arg.RuntimeID, arg.WorkspaceID)
 	var i RuntimeUpdate
 	err := row.Scan(
 		&i.ID,

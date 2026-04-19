@@ -7,6 +7,10 @@ RETURNING *;
 SELECT * FROM runtime_ping
 WHERE id = $1;
 
+-- name: GetRuntimePingForWorkspace :one
+SELECT * FROM runtime_ping
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3;
+
 -- name: GetRuntimePingForDaemon :one
 SELECT * FROM runtime_ping
 WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3 AND daemon_id = $4;
@@ -86,6 +90,10 @@ RETURNING *;
 -- name: GetRuntimeUpdate :one
 SELECT * FROM runtime_update
 WHERE id = $1;
+
+-- name: GetRuntimeUpdateForWorkspace :one
+SELECT * FROM runtime_update
+WHERE id = $1 AND runtime_id = $2 AND workspace_id = $3;
 
 -- name: GetRuntimeUpdateForDaemon :one
 SELECT * FROM runtime_update

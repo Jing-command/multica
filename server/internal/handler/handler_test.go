@@ -54,6 +54,24 @@ func mustGetHandlerTestRuntimeID(t *testing.T) string {
 	return runtimeID
 }
 
+func createRuntimeForWorkspaceAndDaemon(t *testing.T, workspaceID, name, daemonID string) string {
+	t.Helper()
+
+	provider := fmt.Sprintf("handler_test_runtime_%d", time.Now().UnixNano())
+
+	var runtimeID string
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO agent_runtime (
+			workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at
+		)
+		VALUES ($1, $2, $3, 'cloud', $4, 'online', $5, '{}'::jsonb, now())
+		RETURNING id
+	`, workspaceID, daemonID, name, provider, name).Scan(&runtimeID); err != nil {
+		t.Fatalf("create runtime %q: %v", name, err)
+	}
+	return runtimeID
+}
+
 const (
 	handlerTestEmail         = "handler-test@multica.ai"
 	handlerTestName          = "Handler Test User"
@@ -1465,6 +1483,154 @@ func TestDaemonRegisterWithRemovedWorkspaceTokenReturnsUnauthorized(t *testing.T
 	}
 }
 
+func TestGetPingReturnsRequestForMatchingRuntimeAndWorkspace(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+	if _, err := testPool.Exec(ctx, `DELETE FROM runtime_ping WHERE runtime_id = $1`, runtimeID); err != nil {
+		t.Fatalf("cleanup runtime_ping: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(ctx, `DELETE FROM runtime_ping WHERE runtime_id = $1`, runtimeID); err != nil {
+			t.Fatalf("cleanup runtime_ping: %v", err)
+		}
+	})
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/ping", nil), "runtimeId", runtimeID)
+	testHandler.InitiatePing(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiatePing: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created PingRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created ping: %v", err)
+	}
+
+	getW := httptest.NewRecorder()
+	getReq := newRequest("GET", "/api/runtimes/"+runtimeID+"/ping/"+created.ID, nil)
+	getReq = withURLParam(getReq, "runtimeId", runtimeID)
+	getReq = withURLParam(getReq, "pingId", created.ID)
+	testHandler.GetPing(getW, getReq)
+	if getW.Code != http.StatusOK {
+		t.Fatalf("GetPing: expected 200, got %d: %s", getW.Code, getW.Body.String())
+	}
+}
+
+func TestGetPingReturnsNotFoundForRequestFromDifferentRuntime(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+	otherRuntimeID := createRuntimeForWorkspaceAndDaemon(t, testWorkspaceID, "Other GetPing Runtime", handlerTestDaemonID)
+	if _, err := testPool.Exec(ctx, `DELETE FROM runtime_ping WHERE runtime_id = $1 OR runtime_id = $2`, runtimeID, otherRuntimeID); err != nil {
+		t.Fatalf("cleanup runtime_ping: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(ctx, `DELETE FROM runtime_ping WHERE runtime_id = $1 OR runtime_id = $2`, runtimeID, otherRuntimeID); err != nil {
+			t.Fatalf("cleanup runtime_ping: %v", err)
+		}
+		if _, err := testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE id = $1`, otherRuntimeID); err != nil {
+			t.Fatalf("cleanup other runtime: %v", err)
+		}
+	})
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+otherRuntimeID+"/ping", nil), "runtimeId", otherRuntimeID)
+	testHandler.InitiatePing(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiatePing: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created PingRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created ping: %v", err)
+	}
+
+	getW := httptest.NewRecorder()
+	getReq := newRequest("GET", "/api/runtimes/"+runtimeID+"/ping/"+created.ID, nil)
+	getReq = withURLParam(getReq, "runtimeId", runtimeID)
+	getReq = withURLParam(getReq, "pingId", created.ID)
+	testHandler.GetPing(getW, getReq)
+	if getW.Code != http.StatusNotFound {
+		t.Fatalf("GetPing: expected 404, got %d: %s", getW.Code, getW.Body.String())
+	}
+}
+
+func TestGetUpdateReturnsRequestForMatchingRuntimeAndWorkspace(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+	if _, err := testPool.Exec(ctx, `DELETE FROM runtime_update WHERE runtime_id = $1`, runtimeID); err != nil {
+		t.Fatalf("cleanup runtime_update: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(ctx, `DELETE FROM runtime_update WHERE runtime_id = $1`, runtimeID); err != nil {
+			t.Fatalf("cleanup runtime_update: %v", err)
+		}
+	})
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/update", map[string]any{
+		"target_version": "v1.2.3",
+	}), "runtimeId", runtimeID)
+	testHandler.InitiateUpdate(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiateUpdate: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created UpdateRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created update: %v", err)
+	}
+
+	getW := httptest.NewRecorder()
+	getReq := newRequest("GET", "/api/runtimes/"+runtimeID+"/update/"+created.ID, nil)
+	getReq = withURLParam(getReq, "runtimeId", runtimeID)
+	getReq = withURLParam(getReq, "updateId", created.ID)
+	testHandler.GetUpdate(getW, getReq)
+	if getW.Code != http.StatusOK {
+		t.Fatalf("GetUpdate: expected 200, got %d: %s", getW.Code, getW.Body.String())
+	}
+}
+
+func TestGetUpdateReturnsNotFoundForRequestFromDifferentRuntime(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+	otherRuntimeID := createRuntimeForWorkspaceAndDaemon(t, testWorkspaceID, "Other GetUpdate Runtime", handlerTestDaemonID)
+	if _, err := testPool.Exec(ctx, `DELETE FROM runtime_update WHERE runtime_id = $1 OR runtime_id = $2`, runtimeID, otherRuntimeID); err != nil {
+		t.Fatalf("cleanup runtime_update: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(ctx, `DELETE FROM runtime_update WHERE runtime_id = $1 OR runtime_id = $2`, runtimeID, otherRuntimeID); err != nil {
+			t.Fatalf("cleanup runtime_update: %v", err)
+		}
+		if _, err := testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE id = $1`, otherRuntimeID); err != nil {
+			t.Fatalf("cleanup other runtime: %v", err)
+		}
+	})
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+otherRuntimeID+"/update", map[string]any{
+		"target_version": "v1.2.3",
+	}), "runtimeId", otherRuntimeID)
+	testHandler.InitiateUpdate(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiateUpdate: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created UpdateRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created update: %v", err)
+	}
+
+	getW := httptest.NewRecorder()
+	getReq := newRequest("GET", "/api/runtimes/"+runtimeID+"/update/"+created.ID, nil)
+	getReq = withURLParam(getReq, "runtimeId", runtimeID)
+	getReq = withURLParam(getReq, "updateId", created.ID)
+	testHandler.GetUpdate(getW, getReq)
+	if getW.Code != http.StatusNotFound {
+		t.Fatalf("GetUpdate: expected 404, got %d: %s", getW.Code, getW.Body.String())
+	}
+}
+
 func TestPingPersistsAcrossHandlerRestart(t *testing.T) {
 	runtimeID := mustGetHandlerTestRuntimeID(t)
 
@@ -1528,7 +1694,9 @@ func TestPingPersistsAcrossHandlerRestart(t *testing.T) {
 
 	restartedAgain := newRestartedTestHandler()
 	getW := httptest.NewRecorder()
-	getReq := withURLParam(newRequest("GET", "/api/pings/"+created.ID, nil), "pingId", created.ID)
+	getReq := newRequest("GET", "/api/runtimes/"+runtimeID+"/ping/"+created.ID, nil)
+	getReq = withURLParam(getReq, "runtimeId", runtimeID)
+	getReq = withURLParam(getReq, "pingId", created.ID)
 	restartedAgain.GetPing(getW, getReq)
 	if getW.Code != http.StatusOK {
 		t.Fatalf("GetPing after restart: expected 200, got %d: %s", getW.Code, getW.Body.String())
@@ -1615,7 +1783,9 @@ func TestUpdatePersistsAcrossHandlerRestart(t *testing.T) {
 
 	restartedAgain := newRestartedTestHandler()
 	getW := httptest.NewRecorder()
-	getReq := withURLParam(newRequest("GET", "/api/updates/"+created.ID, nil), "updateId", created.ID)
+	getReq := newRequest("GET", "/api/runtimes/"+runtimeID+"/update/"+created.ID, nil)
+	getReq = withURLParam(getReq, "runtimeId", runtimeID)
+	getReq = withURLParam(getReq, "updateId", created.ID)
 	restartedAgain.GetUpdate(getW, getReq)
 	if getW.Code != http.StatusOK {
 		t.Fatalf("GetUpdate after restart: expected 200, got %d: %s", getW.Code, getW.Body.String())
