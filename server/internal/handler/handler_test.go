@@ -2891,3 +2891,193 @@ func createDaemonTokenForTest(t *testing.T, ctx context.Context, workspaceID str
 	}
 	return rawToken
 }
+
+func TestCancelTaskReturnsNotFoundForTaskFromDifferentIssue(t *testing.T) {
+	ctx := context.Background()
+
+	issueA := createIssueForTaskTest(t, ctx, "Issue A")
+	issueB := createIssueForTaskTest(t, ctx, "Issue B")
+	taskID := createQueuedTaskForIssueTest(t, ctx, issueB)
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues/"+issueA+"/tasks/"+taskID+"/cancel", nil)
+	req = withURLParam(req, "id", issueA)
+	req = withURLParam(req, "taskId", taskID)
+	testHandler.CancelTask(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("CancelTask: expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestListTasksByIssueRequiresIssueWorkspaceAccess(t *testing.T) {
+	ctx := context.Background()
+	otherWorkspaceID := createWorkspaceForTaskAuthTest(t, ctx)
+	issueID := createIssueInWorkspaceForTaskTest(t, ctx, otherWorkspaceID, "Foreign issue")
+	createQueuedTaskForIssueInWorkspaceTest(t, ctx, otherWorkspaceID, issueID)
+
+	w := httptest.NewRecorder()
+	req := newRequest("GET", "/api/issues/"+issueID+"/tasks", nil)
+	req = withURLParam(req, "id", issueID)
+	testHandler.ListTasksByIssue(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("ListTasksByIssue: expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestGetActiveTaskForIssueRequiresIssueWorkspaceAccess(t *testing.T) {
+	ctx := context.Background()
+	otherWorkspaceID := createWorkspaceForTaskAuthTest(t, ctx)
+	issueID := createIssueInWorkspaceForTaskTest(t, ctx, otherWorkspaceID, "Foreign active issue")
+	createTaskForIssueInWorkspaceTest(t, ctx, otherWorkspaceID, issueID, "running")
+
+	w := httptest.NewRecorder()
+	req := newRequest("GET", "/api/issues/"+issueID+"/active-task", nil)
+	req = withURLParam(req, "id", issueID)
+	testHandler.GetActiveTaskForIssue(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("GetActiveTaskForIssue: expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestGetActiveTaskForIssueOnlyReturnsTasksForRequestedIssue(t *testing.T) {
+	ctx := context.Background()
+	visibleIssueID := createIssueForTaskTest(t, ctx, "Visible issue")
+	createTaskForIssueInWorkspaceTest(t, ctx, testWorkspaceID, visibleIssueID, "running")
+
+	otherWorkspaceID := createWorkspaceForTaskAuthTest(t, ctx)
+	foreignIssueID := createIssueInWorkspaceForTaskTest(t, ctx, otherWorkspaceID, "Foreign requested issue")
+	createTaskForIssueInWorkspaceTest(t, ctx, otherWorkspaceID, foreignIssueID, "dispatched")
+
+	w := httptest.NewRecorder()
+	req := newRequest("GET", "/api/issues/"+foreignIssueID+"/active-task", nil)
+	req = withURLParam(req, "id", foreignIssueID)
+	testHandler.GetActiveTaskForIssue(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("GetActiveTaskForIssue: expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func createIssueForTaskTest(t *testing.T, ctx context.Context, title string) string {
+	t.Helper()
+	return createIssueInWorkspaceForTaskTest(t, ctx, testWorkspaceID, title)
+}
+
+func createWorkspaceForTaskAuthTest(t *testing.T, ctx context.Context) string {
+	t.Helper()
+
+	suffix := time.Now().UnixNano()
+	slug := fmt.Sprintf("handler-task-auth-%d", suffix)
+	issuePrefix := fmt.Sprintf("TA%d", suffix%100000)
+
+	var workspaceID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO workspace (name, slug, description, issue_prefix)
+		VALUES ($1, $2, 'Temporary workspace for task auth tests', $3)
+		RETURNING id
+	`, "Handler Task Auth Workspace", slug, issuePrefix).Scan(&workspaceID); err != nil {
+		t.Fatalf("create task auth workspace: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(ctx, `DELETE FROM workspace WHERE id = $1`, workspaceID); err != nil {
+			t.Fatalf("cleanup task auth workspace: %v", err)
+		}
+	})
+
+	return workspaceID
+}
+
+func createIssueInWorkspaceForTaskTest(t *testing.T, ctx context.Context, workspaceID, title string) string {
+	t.Helper()
+
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		WITH next_number AS (
+			SELECT COALESCE(MAX(number), 0) + 1 AS number
+			FROM issue
+			WHERE workspace_id = $1
+		)
+		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number, position)
+		SELECT $1, $2, 'todo', 'medium', 'member', $3, number, 0
+		FROM next_number
+		RETURNING id
+	`, workspaceID, title, testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("create issue in workspace %s: %v", workspaceID, err)
+	}
+
+	if workspaceID == testWorkspaceID {
+		t.Cleanup(func() {
+			if _, err := testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID); err != nil {
+				t.Fatalf("cleanup issue: %v", err)
+			}
+		})
+	}
+
+	return issueID
+}
+
+func createQueuedTaskForIssueTest(t *testing.T, ctx context.Context, issueID string) string {
+	t.Helper()
+	return createTaskForIssueInWorkspaceTest(t, ctx, testWorkspaceID, issueID, "queued")
+}
+
+func createQueuedTaskForIssueInWorkspaceTest(t *testing.T, ctx context.Context, workspaceID, issueID string) string {
+	t.Helper()
+	return createTaskForIssueInWorkspaceTest(t, ctx, workspaceID, issueID, "queued")
+}
+
+func createTaskForIssueInWorkspaceTest(t *testing.T, ctx context.Context, workspaceID, issueID, status string) string {
+	t.Helper()
+
+	suffix := time.Now().UnixNano()
+	provider := fmt.Sprintf("task_auth_provider_%d", suffix)
+	daemonID := fmt.Sprintf("task-auth-daemon-%d", suffix)
+	runtimeName := fmt.Sprintf("Task Auth Runtime %d", suffix)
+	agentName := fmt.Sprintf("Task Auth Agent %d", suffix)
+
+	var runtimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (
+			workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, owner_id, last_seen_at
+		)
+		VALUES ($1, $2, $3, 'local', $4, 'online', $5, '{}'::jsonb, $6, now())
+		RETURNING id
+	`, workspaceID, daemonID, runtimeName, provider, runtimeName, testUserID).Scan(&runtimeID); err != nil {
+		t.Fatalf("create task auth runtime: %v", err)
+	}
+
+	var agentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (
+			workspace_id, name, description, runtime_mode, runtime_config,
+			runtime_id, visibility, max_concurrent_tasks, owner_id
+		)
+		VALUES ($1, $2, '', 'local', '{}'::jsonb, $3, 'workspace', 1, $4)
+		RETURNING id
+	`, workspaceID, agentName, runtimeID, testUserID).Scan(&agentID); err != nil {
+		t.Fatalf("create task auth agent: %v", err)
+	}
+
+	var taskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority)
+		VALUES ($1, $2, $3, $4, 0)
+		RETURNING id
+	`, agentID, runtimeID, issueID, status).Scan(&taskID); err != nil {
+		t.Fatalf("create task auth task: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, taskID); err != nil {
+			t.Fatalf("cleanup task auth task: %v", err)
+		}
+		if _, err := testPool.Exec(ctx, `DELETE FROM agent WHERE id = $1`, agentID); err != nil {
+			t.Fatalf("cleanup task auth agent: %v", err)
+		}
+		if _, err := testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE id = $1`, runtimeID); err != nil {
+			t.Fatalf("cleanup task auth runtime: %v", err)
+		}
+	})
+
+	return taskID
+}

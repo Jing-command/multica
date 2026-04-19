@@ -688,10 +688,25 @@ func (h *Handler) ListTaskMessages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func (h *Handler) getIssueForWorkspace(w http.ResponseWriter, r *http.Request, issueID string) (*db.Issue, bool) {
+	issue, err := h.Queries.GetIssue(r.Context(), parseUUID(issueID))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "issue not found")
+		return nil, false
+	}
+	if _, ok := h.requireWorkspaceMember(w, r, uuidToString(issue.WorkspaceID), "issue not found"); !ok {
+		return nil, false
+	}
+	return &issue, true
+}
+
 // GetActiveTaskForIssue returns all currently active tasks for an issue.
 // Returns { tasks: [...] } array (may be empty).
 func (h *Handler) GetActiveTaskForIssue(w http.ResponseWriter, r *http.Request) {
 	issueID := chi.URLParam(r, "id")
+	if _, ok := h.getIssueForWorkspace(w, r, issueID); !ok {
+		return
+	}
 
 	tasks, err := h.Queries.ListActiveTasksByIssue(r.Context(), parseUUID(issueID))
 	if err != nil {
@@ -708,22 +723,44 @@ func (h *Handler) GetActiveTaskForIssue(w http.ResponseWriter, r *http.Request) 
 
 // CancelTask cancels a running or queued task by ID.
 func (h *Handler) CancelTask(w http.ResponseWriter, r *http.Request) {
-	taskID := chi.URLParam(r, "taskId")
+	issueID := chi.URLParam(r, "id")
+	issue, ok := h.getIssueForWorkspace(w, r, issueID)
+	if !ok {
+		return
+	}
 
-	task, err := h.TaskService.CancelTask(r.Context(), parseUUID(taskID))
+	taskID := chi.URLParam(r, "taskId")
+	task, err := h.Queries.GetTaskByIssueForWorkspace(r.Context(), db.GetTaskByIssueForWorkspaceParams{
+		ID:          parseUUID(taskID),
+		IssueID:     parseUUID(issueID),
+		WorkspaceID: issue.WorkspaceID,
+	})
+	if err != nil {
+		if isNotFound(err) {
+			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to validate task")
+		return
+	}
+
+	cancelled, err := h.TaskService.CancelTask(r.Context(), task.ID)
 	if err != nil {
 		slog.Warn("cancel task failed", "task_id", taskID, "error", err)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	slog.Info("task cancelled by user", "task_id", taskID, "issue_id", uuidToString(task.IssueID))
-	writeJSON(w, http.StatusOK, taskToResponse(*task))
+	slog.Info("task cancelled by user", "task_id", taskID, "issue_id", uuidToString(cancelled.IssueID))
+	writeJSON(w, http.StatusOK, taskToResponse(*cancelled))
 }
 
 // ListTasksByIssue returns all tasks (any status) for an issue — used for execution history.
 func (h *Handler) ListTasksByIssue(w http.ResponseWriter, r *http.Request) {
 	issueID := chi.URLParam(r, "id")
+	if _, ok := h.getIssueForWorkspace(w, r, issueID); !ok {
+		return
+	}
 
 	tasks, err := h.Queries.ListTasksByIssue(r.Context(), parseUUID(issueID))
 	if err != nil {

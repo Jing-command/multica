@@ -154,6 +154,14 @@ SET status = 'cancelled', completed_at = now()
 WHERE id = $1 AND status IN ('queued', 'dispatched', 'running')
 RETURNING *;
 
+-- name: GetTaskByIssueForWorkspace :one
+SELECT atq.*
+FROM agent_task_queue atq
+JOIN issue i ON i.id = atq.issue_id
+WHERE atq.id = $1
+  AND atq.issue_id = $2
+  AND i.workspace_id = $3;
+
 -- name: CountRunningTasks :one
 SELECT count(*) FROM agent_task_queue
 WHERE agent_id = $1 AND status IN ('dispatched', 'running');
