@@ -89,7 +89,7 @@ func (h *Handler) SubscribeToIssue(w http.ResponseWriter, r *http.Request) {
 
 	workspaceID := uuidToString(issue.WorkspaceID)
 	callerID := requestUserID(r)
-	subActorType, subActorID := h.resolveActor(r, callerID, workspaceID)
+	subActorType, subActorID := resolveMemberActor(callerID)
 	h.publish(protocol.EventSubscriberAdded, workspaceID, subActorType, subActorID, map[string]any{
 		"issue_id":  issueID,
 		"user_type": targetUserType,
@@ -137,7 +137,7 @@ func (h *Handler) UnsubscribeFromIssue(w http.ResponseWriter, r *http.Request) {
 
 	workspaceID := uuidToString(issue.WorkspaceID)
 	callerID := requestUserID(r)
-	unsubActorType, unsubActorID := h.resolveActor(r, callerID, workspaceID)
+	unsubActorType, unsubActorID := resolveMemberActor(callerID)
 	h.publish(protocol.EventSubscriberRemoved, workspaceID, unsubActorType, unsubActorID, map[string]any{
 		"issue_id":  issueID,
 		"user_type": targetUserType,

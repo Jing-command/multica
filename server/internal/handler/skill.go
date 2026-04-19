@@ -20,15 +20,15 @@ import (
 // --- Response structs ---
 
 type SkillResponse struct {
-	ID          string `json:"id"`
-	WorkspaceID string `json:"workspace_id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Content     string `json:"content"`
-	Config      any    `json:"config"`
+	ID          string  `json:"id"`
+	WorkspaceID string  `json:"workspace_id"`
+	Name        string  `json:"name"`
+	Description string  `json:"description"`
+	Content     string  `json:"content"`
+	Config      any     `json:"config"`
 	CreatedBy   *string `json:"created_by"`
-	CreatedAt   string `json:"created_at"`
-	UpdatedAt   string `json:"updated_at"`
+	CreatedAt   string  `json:"created_at"`
+	UpdatedAt   string  `json:"updated_at"`
 }
 
 type SkillFileResponse struct {
@@ -263,7 +263,7 @@ func (h *Handler) CreateSkill(w http.ResponseWriter, r *http.Request) {
 		SkillResponse: skillToResponse(skill),
 		Files:         fileResps,
 	}
-	actorType, actorID := h.resolveActor(r, creatorID, workspaceID)
+	actorType, actorID := resolveMemberActor(creatorID)
 	h.publish(protocol.EventSkillCreated, workspaceID, actorType, actorID, map[string]any{"skill": resp})
 	writeJSON(w, http.StatusCreated, resp)
 }
@@ -365,7 +365,7 @@ func (h *Handler) UpdateSkill(w http.ResponseWriter, r *http.Request) {
 		Files:         fileResps,
 	}
 	wsID := resolveWorkspaceID(r)
-	actorType, actorID := h.resolveActor(r, requestUserID(r), wsID)
+	actorType, actorID := resolveMemberActor(requestUserID(r))
 	h.publish(protocol.EventSkillUpdated, wsID, actorType, actorID, map[string]any{"skill": resp})
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -384,7 +384,7 @@ func (h *Handler) DeleteSkill(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to delete skill")
 		return
 	}
-	actorType, actorID := h.resolveActor(r, requestUserID(r), uuidToString(skill.WorkspaceID))
+	actorType, actorID := resolveMemberActor(requestUserID(r))
 	h.publish(protocol.EventSkillDeleted, uuidToString(skill.WorkspaceID), actorType, actorID, map[string]any{"skill_id": id})
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -852,7 +852,7 @@ func (h *Handler) ImportSkill(w http.ResponseWriter, r *http.Request) {
 		SkillResponse: skillToResponse(skill),
 		Files:         fileResps,
 	}
-	actorType, actorID := h.resolveActor(r, creatorID, workspaceID)
+	actorType, actorID := resolveMemberActor(creatorID)
 	h.publish(protocol.EventSkillCreated, workspaceID, actorType, actorID, map[string]any{"skill": resp})
 	writeJSON(w, http.StatusCreated, resp)
 }
@@ -1009,7 +1009,7 @@ func (h *Handler) SetAgentSkills(w http.ResponseWriter, r *http.Request) {
 	for i, s := range skills {
 		resp[i] = skillToResponse(s)
 	}
-	actorType, actorID := h.resolveActor(r, requestUserID(r), uuidToString(agent.WorkspaceID))
+	actorType, actorID := resolveMemberActor(requestUserID(r))
 	h.publish(protocol.EventAgentStatus, uuidToString(agent.WorkspaceID), actorType, actorID, map[string]any{"agent_id": uuidToString(agent.ID), "skills": resp})
 	writeJSON(w, http.StatusOK, resp)
 }

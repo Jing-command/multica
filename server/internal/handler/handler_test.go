@@ -268,6 +268,35 @@ func withURLParam(req *http.Request, key, value string) *http.Request {
 	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
 }
 
+func createSpoofTestAgent(t *testing.T, ctx context.Context, runtimeName, daemonID, agentName string) (string, string) {
+	t.Helper()
+
+	var runtimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (
+			workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, owner_id, last_seen_at
+		)
+		VALUES ($1, $2, $3, 'local', 'claude', 'online', 'spoofed device', '{}'::jsonb, $4, now())
+		RETURNING id
+	`, testWorkspaceID, daemonID, runtimeName, testUserID).Scan(&runtimeID); err != nil {
+		t.Fatalf("insert spoof runtime: %v", err)
+	}
+
+	var agentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (
+			workspace_id, name, description, runtime_mode, runtime_config,
+			runtime_id, visibility, max_concurrent_tasks, owner_id
+		)
+		VALUES ($1, $2, '', 'local', '{}'::jsonb, $3, 'workspace', 1, $4)
+		RETURNING id
+	`, testWorkspaceID, agentName, runtimeID, testUserID).Scan(&agentID); err != nil {
+		t.Fatalf("insert spoof agent: %v", err)
+	}
+
+	return runtimeID, agentID
+}
+
 func TestIssueCRUD(t *testing.T) {
 	// Create
 	w := httptest.NewRecorder()
@@ -409,6 +438,162 @@ func TestCommentCRUD(t *testing.T) {
 	req = newRequest("DELETE", "/api/issues/"+issueID, nil)
 	req = withURLParam(req, "id", issueID)
 	testHandler.DeleteIssue(w, req)
+}
+
+func TestCreateCommentIgnoresSpoofedAgentHeaders(t *testing.T) {
+	ctx := context.Background()
+	runtimeID, agentID := createSpoofTestAgent(t, ctx, "Spoofed Comment Runtime", "spoof-comment-daemon", "Spoofed Comment Agent")
+
+	wIssue := httptest.NewRecorder()
+	reqIssue := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":  "Spoof comment issue",
+		"status": "todo",
+	})
+	testHandler.CreateIssue(wIssue, reqIssue)
+	if wIssue.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue: expected 201, got %d: %s", wIssue.Code, wIssue.Body.String())
+	}
+
+	var issue IssueResponse
+	if err := json.NewDecoder(wIssue.Body).Decode(&issue); err != nil {
+		t.Fatalf("decode issue: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(ctx, `DELETE FROM comment WHERE issue_id = $1`, issue.ID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issue.ID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM agent WHERE id = $1`, agentID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE id = $1`, runtimeID)
+	})
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues/"+issue.ID+"/comments", map[string]any{"content": "spoof me"})
+	req = withURLParam(req, "id", issue.ID)
+	req.Header.Set("X-Agent-ID", agentID)
+	testHandler.CreateComment(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateComment: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var authorType string
+	var authorID string
+	if err := testPool.QueryRow(ctx, `
+		SELECT author_type, author_id::text
+		FROM comment
+		WHERE issue_id = $1
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, issue.ID).Scan(&authorType, &authorID); err != nil {
+		t.Fatalf("load comment: %v", err)
+	}
+	if authorType != "member" {
+		t.Fatalf("author_type = %q, want member", authorType)
+	}
+	if authorID != testUserID {
+		t.Fatalf("author_id = %q, want %q", authorID, testUserID)
+	}
+}
+
+func TestCreateIssueIgnoresSpoofedAgentHeaders(t *testing.T) {
+	ctx := context.Background()
+	runtimeID, agentID := createSpoofTestAgent(t, ctx, "Spoofed Issue Runtime", "spoof-issue-daemon", "Spoofed Issue Agent")
+	defer testPool.Exec(ctx, `DELETE FROM agent WHERE id = $1`, agentID)
+	defer testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE id = $1`, runtimeID)
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":  "Spoofed issue create",
+		"status": "todo",
+	})
+	req.Header.Set("X-Agent-ID", agentID)
+	testHandler.CreateIssue(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var issue IssueResponse
+	if err := json.NewDecoder(w.Body).Decode(&issue); err != nil {
+		t.Fatalf("decode issue: %v", err)
+	}
+	defer testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issue.ID)
+
+	var creatorType string
+	var creatorID string
+	if err := testPool.QueryRow(ctx, `SELECT creator_type, creator_id::text FROM issue WHERE id = $1`, issue.ID).Scan(&creatorType, &creatorID); err != nil {
+		t.Fatalf("load issue creator: %v", err)
+	}
+	if creatorType != "member" {
+		t.Fatalf("creator_type = %q, want member", creatorType)
+	}
+	if creatorID != testUserID {
+		t.Fatalf("creator_id = %q, want %q", creatorID, testUserID)
+	}
+}
+
+func TestSpoofedAgentCommentDoesNotSuppressOnCommentTrigger(t *testing.T) {
+	ctx := context.Background()
+	runtimeID, agentID := createSpoofTestAgent(t, ctx, "Spoofed Trigger Runtime", "spoof-trigger-daemon", "Spoofed Trigger Agent")
+
+	agentType := "agent"
+	wIssue := httptest.NewRecorder()
+	reqIssue := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":         "Spoofed trigger issue",
+		"status":        "todo",
+		"assignee_type": &agentType,
+		"assignee_id":   &agentID,
+	})
+	testHandler.CreateIssue(wIssue, reqIssue)
+	if wIssue.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue: expected 201, got %d: %s", wIssue.Code, wIssue.Body.String())
+	}
+
+	var issue IssueResponse
+	if err := json.NewDecoder(wIssue.Body).Decode(&issue); err != nil {
+		t.Fatalf("decode issue: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2`, issue.ID, agentID); err != nil {
+		t.Fatalf("cleanup initial assignment task: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, issue.ID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM comment WHERE issue_id = $1`, issue.ID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issue.ID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM agent WHERE id = $1`, agentID)
+		_, _ = testPool.Exec(ctx, `DELETE FROM agent_runtime WHERE id = $1`, runtimeID)
+	})
+
+	commentW := httptest.NewRecorder()
+	commentReq := newRequest("POST", "/api/issues/"+issue.ID+"/comments", map[string]any{"content": "member comment with spoofed header"})
+	commentReq = withURLParam(commentReq, "id", issue.ID)
+	commentReq.Header.Set("X-Agent-ID", agentID)
+	testHandler.CreateComment(commentW, commentReq)
+	if commentW.Code != http.StatusCreated {
+		t.Fatalf("CreateComment: expected 201, got %d: %s", commentW.Code, commentW.Body.String())
+	}
+
+	var queuedCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2`, issue.ID, agentID).Scan(&queuedCount); err != nil {
+		t.Fatalf("count queued tasks: %v", err)
+	}
+	if queuedCount != 1 {
+		t.Fatalf("queued task count = %d, want 1", queuedCount)
+	}
+
+	var authorType string
+	if err := testPool.QueryRow(ctx, `
+		SELECT author_type
+		FROM comment
+		WHERE issue_id = $1
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, issue.ID).Scan(&authorType); err != nil {
+		t.Fatalf("load comment author_type: %v", err)
+	}
+	if authorType != "member" {
+		t.Fatalf("author_type = %q, want member", authorType)
+	}
 }
 
 func TestAgentCRUD(t *testing.T) {

@@ -212,8 +212,8 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 		parentComment = &parent
 	}
 
-	// Determine author identity: agent (via X-Agent-ID header) or member.
-	authorType, authorID := h.resolveActor(r, userID, uuidToString(issue.WorkspaceID))
+	// Determine author identity from the authenticated member only.
+	authorType, authorID := resolveMemberActor(userID)
 
 	// Expand bare issue identifiers (e.g. MUL-117) into mention links.
 	req.Content = mention.ExpandIssueIdentifiers(r.Context(), h.Queries, issue.WorkspaceID, req.Content)
@@ -467,7 +467,7 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	actorType, actorID := h.resolveActor(r, userID, workspaceID)
+	actorType, actorID := resolveMemberActor(userID)
 	isAuthor := existing.AuthorType == actorType && uuidToString(existing.AuthorID) == actorID
 	isAdmin := roleAllowed(member.Role, "owner", "admin")
 	if !isAuthor && !isAdmin {
@@ -531,7 +531,7 @@ func (h *Handler) DeleteComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	actorType, actorID := h.resolveActor(r, userID, workspaceID)
+	actorType, actorID := resolveMemberActor(userID)
 	isAuthor := comment.AuthorType == actorType && uuidToString(comment.AuthorID) == actorID
 	isAdmin := roleAllowed(member.Role, "owner", "admin")
 	if !isAuthor && !isAdmin {

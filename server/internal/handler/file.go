@@ -151,7 +151,7 @@ func (h *Handler) UploadFile(w http.ResponseWriter, r *http.Request) {
 
 	// If workspace context is available, create an attachment record.
 	if workspaceID != "" {
-		uploaderType, uploaderID := h.resolveActor(r, userID, workspaceID)
+		uploaderType, uploaderID := resolveMemberActor(userID)
 
 		params := db.CreateAttachmentParams{
 			ID:           pgtype.UUID{Bytes: id, Valid: true},
