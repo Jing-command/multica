@@ -103,6 +103,28 @@ func (h *Handler) getUpdateRequestForWorkspace(ctx context.Context, updateID, ru
 	if err != nil {
 		return nil, err
 	}
+	if (update.Status == string(UpdatePending) || update.Status == string(UpdateRunning)) && update.CreatedAt.Valid && time.Since(update.CreatedAt.Time) > 120*time.Second {
+		timedOut, err := h.Queries.SetRuntimeUpdateTimeoutForDaemon(ctx, db.SetRuntimeUpdateTimeoutForDaemonParams{
+			ID:          update.ID,
+			RuntimeID:   update.RuntimeID,
+			WorkspaceID: update.WorkspaceID,
+			DaemonID:    update.DaemonID,
+		})
+		if err == nil {
+			update = timedOut
+		} else if !isNotFound(err) {
+			return nil, err
+		} else {
+			update, err = h.Queries.GetRuntimeUpdateForWorkspace(ctx, db.GetRuntimeUpdateForWorkspaceParams{
+				ID:          update.ID,
+				RuntimeID:   update.RuntimeID,
+				WorkspaceID: update.WorkspaceID,
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
 	result := runtimeUpdateToRequest(update)
 	return &result, nil
 }

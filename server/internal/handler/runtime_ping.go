@@ -111,6 +111,28 @@ func (h *Handler) getPingRequestForWorkspace(ctx context.Context, pingID, runtim
 	if err != nil {
 		return nil, err
 	}
+	if (ping.Status == string(PingPending) || ping.Status == string(PingRunning)) && ping.CreatedAt.Valid && time.Since(ping.CreatedAt.Time) > 60*time.Second {
+		timedOut, err := h.Queries.SetRuntimePingTimeoutForDaemon(ctx, db.SetRuntimePingTimeoutForDaemonParams{
+			ID:          ping.ID,
+			RuntimeID:   ping.RuntimeID,
+			WorkspaceID: ping.WorkspaceID,
+			DaemonID:    ping.DaemonID,
+		})
+		if err == nil {
+			ping = timedOut
+		} else if !isNotFound(err) {
+			return nil, err
+		} else {
+			ping, err = h.Queries.GetRuntimePingForWorkspace(ctx, db.GetRuntimePingForWorkspaceParams{
+				ID:          ping.ID,
+				RuntimeID:   ping.RuntimeID,
+				WorkspaceID: ping.WorkspaceID,
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
 	result := runtimePingToRequest(ping)
 	return &result, nil
 }

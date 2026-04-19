@@ -1631,6 +1631,114 @@ func TestGetUpdateReturnsNotFoundForRequestFromDifferentRuntime(t *testing.T) {
 	}
 }
 
+func TestGetPingTransitionsStaleRequestToTimeoutForMatchingRuntimeAndWorkspace(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+	if _, err := testPool.Exec(ctx, `DELETE FROM runtime_ping WHERE runtime_id = $1`, runtimeID); err != nil {
+		t.Fatalf("cleanup runtime_ping: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(ctx, `DELETE FROM runtime_ping WHERE runtime_id = $1`, runtimeID); err != nil {
+			t.Fatalf("cleanup runtime_ping: %v", err)
+		}
+	})
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/ping", nil), "runtimeId", runtimeID)
+	testHandler.InitiatePing(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiatePing: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created PingRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created ping: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE runtime_ping
+		SET created_at = $2, updated_at = $2
+		WHERE id = $1
+	`, created.ID, time.Now().Add(-2*time.Minute)); err != nil {
+		t.Fatalf("age ping request: %v", err)
+	}
+
+	getW := httptest.NewRecorder()
+	getReq := newRequest("GET", "/api/runtimes/"+runtimeID+"/ping/"+created.ID, nil)
+	getReq = withURLParam(getReq, "runtimeId", runtimeID)
+	getReq = withURLParam(getReq, "pingId", created.ID)
+	testHandler.GetPing(getW, getReq)
+	if getW.Code != http.StatusOK {
+		t.Fatalf("GetPing: expected 200, got %d: %s", getW.Code, getW.Body.String())
+	}
+
+	var got PingRequest
+	if err := json.NewDecoder(getW.Body).Decode(&got); err != nil {
+		t.Fatalf("decode timed out ping: %v", err)
+	}
+	if got.Status != PingTimeout {
+		t.Fatalf("ping status = %q, want %q", got.Status, PingTimeout)
+	}
+	if got.Error != "daemon did not respond within 60 seconds" {
+		t.Fatalf("ping error = %q, want timeout error", got.Error)
+	}
+}
+
+func TestGetUpdateTransitionsStaleRequestToTimeoutForMatchingRuntimeAndWorkspace(t *testing.T) {
+	ctx := context.Background()
+	runtimeID := mustGetHandlerTestRuntimeID(t)
+	if _, err := testPool.Exec(ctx, `DELETE FROM runtime_update WHERE runtime_id = $1`, runtimeID); err != nil {
+		t.Fatalf("cleanup runtime_update: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(ctx, `DELETE FROM runtime_update WHERE runtime_id = $1`, runtimeID); err != nil {
+			t.Fatalf("cleanup runtime_update: %v", err)
+		}
+	})
+
+	createW := httptest.NewRecorder()
+	createReq := withURLParam(newRequest("POST", "/api/runtimes/"+runtimeID+"/update", map[string]any{
+		"target_version": "v1.2.3",
+	}), "runtimeId", runtimeID)
+	testHandler.InitiateUpdate(createW, createReq)
+	if createW.Code != http.StatusOK {
+		t.Fatalf("InitiateUpdate: expected 200, got %d: %s", createW.Code, createW.Body.String())
+	}
+
+	var created UpdateRequest
+	if err := json.NewDecoder(createW.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created update: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE runtime_update
+		SET created_at = $2, updated_at = $2
+		WHERE id = $1
+	`, created.ID, time.Now().Add(-3*time.Minute)); err != nil {
+		t.Fatalf("age update request: %v", err)
+	}
+
+	getW := httptest.NewRecorder()
+	getReq := newRequest("GET", "/api/runtimes/"+runtimeID+"/update/"+created.ID, nil)
+	getReq = withURLParam(getReq, "runtimeId", runtimeID)
+	getReq = withURLParam(getReq, "updateId", created.ID)
+	testHandler.GetUpdate(getW, getReq)
+	if getW.Code != http.StatusOK {
+		t.Fatalf("GetUpdate: expected 200, got %d: %s", getW.Code, getW.Body.String())
+	}
+
+	var got UpdateRequest
+	if err := json.NewDecoder(getW.Body).Decode(&got); err != nil {
+		t.Fatalf("decode timed out update: %v", err)
+	}
+	if got.Status != UpdateTimeout {
+		t.Fatalf("update status = %q, want %q", got.Status, UpdateTimeout)
+	}
+	if got.Error != "update did not complete within 120 seconds" {
+		t.Fatalf("update error = %q, want timeout error", got.Error)
+	}
+}
+
 func TestPingPersistsAcrossHandlerRestart(t *testing.T) {
 	runtimeID := mustGetHandlerTestRuntimeID(t)
 
