@@ -74,26 +74,26 @@ type RepoData struct {
 }
 
 type AgentTaskResponse struct {
-	ID                     string                  `json:"id"`
-	AgentID                string                  `json:"agent_id"`
-	RuntimeID              string                  `json:"runtime_id"`
-	IssueID                string                  `json:"issue_id"`
-	WorkspaceID            string                  `json:"workspace_id"`
-	Status                 string                  `json:"status"`
-	Priority               int32                   `json:"priority"`
-	DispatchedAt           *string                 `json:"dispatched_at"`
-	StartedAt              *string                 `json:"started_at"`
-	CompletedAt            *string                 `json:"completed_at"`
-	Result                 any                     `json:"result"`
-	Error                  *string                 `json:"error"`
-	Agent                  *TaskAgentData          `json:"agent,omitempty"`
-	Repos                  []RepoData              `json:"repos,omitempty"`
-	CreatedAt              string                  `json:"created_at"`
-	PriorSessionID         string                  `json:"prior_session_id,omitempty"`     // session ID from a previous task on same issue
-	PriorWorkDir           string                  `json:"prior_work_dir,omitempty"`       // work_dir from a previous task on same issue
-	TriggerCommentID       *string                 `json:"trigger_comment_id,omitempty"`   // comment that triggered this task
+	ID                     string                         `json:"id"`
+	AgentID                string                         `json:"agent_id"`
+	RuntimeID              string                         `json:"runtime_id"`
+	IssueID                string                         `json:"issue_id"`
+	WorkspaceID            string                         `json:"workspace_id"`
+	Status                 string                         `json:"status"`
+	Priority               int32                          `json:"priority"`
+	DispatchedAt           *string                        `json:"dispatched_at"`
+	StartedAt              *string                        `json:"started_at"`
+	CompletedAt            *string                        `json:"completed_at"`
+	Result                 any                            `json:"result"`
+	Error                  *string                        `json:"error"`
+	Agent                  *TaskAgentData                 `json:"agent,omitempty"`
+	Repos                  []RepoData                     `json:"repos,omitempty"`
+	CreatedAt              string                         `json:"created_at"`
+	PriorSessionID         string                         `json:"prior_session_id,omitempty"`   // session ID from a previous task on same issue
+	PriorWorkDir           string                         `json:"prior_work_dir,omitempty"`     // work_dir from a previous task on same issue
+	TriggerCommentID       *string                        `json:"trigger_comment_id,omitempty"` // comment that triggered this task
 	PermissionSnapshot     *daemon.PermissionSnapshotData `json:"permission_snapshot,omitempty"`
-	PermissionSnapshotJSON json.RawMessage         `json:"permission_snapshot_json,omitempty"`
+	PermissionSnapshotJSON json.RawMessage                `json:"permission_snapshot_json,omitempty"`
 }
 
 // TaskAgentData holds agent info included in claim responses so the daemon
@@ -293,12 +293,10 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := agentToResponse(agent)
-	actorType, actorID := h.resolveActor(r, ownerID, workspaceID)
+	actorType, actorID := resolveMemberActor(ownerID)
 	h.publish(protocol.EventAgentCreated, workspaceID, actorType, actorID, map[string]any{"agent": resp})
 	writeJSON(w, http.StatusCreated, resp)
 }
-
-
 
 type UpdateAgentRequest struct {
 	Name               *string `json:"name"`
@@ -397,7 +395,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 	resp := agentToResponse(agent)
 	slog.Info("agent updated", append(logger.RequestAttrs(r), "agent_id", id, "workspace_id", uuidToString(agent.WorkspaceID))...)
 	userID := requestUserID(r)
-	actorType, actorID := h.resolveActor(r, userID, uuidToString(agent.WorkspaceID))
+	actorType, actorID := resolveMemberActor(userID)
 	h.publish(protocol.EventAgentStatus, uuidToString(agent.WorkspaceID), actorType, actorID, map[string]any{"agent": resp})
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -435,7 +433,7 @@ func (h *Handler) ArchiveAgent(w http.ResponseWriter, r *http.Request) {
 	wsID := uuidToString(archived.WorkspaceID)
 	slog.Info("agent archived", append(logger.RequestAttrs(r), "agent_id", id, "workspace_id", wsID)...)
 	resp := agentToResponse(archived)
-	actorType, actorID := h.resolveActor(r, userID, wsID)
+	actorType, actorID := resolveMemberActor(userID)
 	h.publish(protocol.EventAgentArchived, wsID, actorType, actorID, map[string]any{"agent": resp})
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -465,7 +463,7 @@ func (h *Handler) RestoreAgent(w http.ResponseWriter, r *http.Request) {
 	slog.Info("agent restored", append(logger.RequestAttrs(r), "agent_id", id, "workspace_id", wsID)...)
 	resp := agentToResponse(restored)
 	userID := requestUserID(r)
-	actorType, actorID := h.resolveActor(r, userID, wsID)
+	actorType, actorID := resolveMemberActor(userID)
 	h.publish(protocol.EventAgentRestored, wsID, actorType, actorID, map[string]any{"agent": resp})
 	writeJSON(w, http.StatusOK, resp)
 }

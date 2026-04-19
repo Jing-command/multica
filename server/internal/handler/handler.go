@@ -115,6 +115,10 @@ func requestUserID(r *http.Request) string {
 	return r.Header.Get("X-User-ID")
 }
 
+func resolveMemberActor(userID string) (actorType, actorID string) {
+	return "member", userID
+}
+
 func daemonScopeFromRequest(r *http.Request) (string, string, bool) {
 	workspaceID := strings.TrimSpace(middleware.DaemonWorkspaceIDFromContext(r.Context()))
 	daemonID := strings.TrimSpace(middleware.DaemonIDFromContext(r.Context()))
