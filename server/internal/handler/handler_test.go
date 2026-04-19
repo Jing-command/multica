@@ -2962,6 +2962,78 @@ func createIssueForTaskTest(t *testing.T, ctx context.Context, title string) str
 	return createIssueInWorkspaceForTaskTest(t, ctx, testWorkspaceID, title)
 }
 
+func TestGetActiveTaskForIssueReturnsNotFoundWhenIssueIsOutsideActiveWorkspaceScope(t *testing.T) {
+	ctx := context.Background()
+	workspaceA := createWorkspaceForTaskAuthTest(t, ctx)
+	workspaceB := createWorkspaceForTaskAuthTest(t, ctx)
+	addMemberToWorkspaceForTaskAuthTest(t, ctx, workspaceA)
+	addMemberToWorkspaceForTaskAuthTest(t, ctx, workspaceB)
+
+	issueID := createIssueInWorkspaceForTaskTest(t, ctx, workspaceB, "Scoped away active issue")
+	createTaskForIssueInWorkspaceTest(t, ctx, workspaceB, issueID, "running")
+
+	w := httptest.NewRecorder()
+	req := newRequest("GET", "/api/issues/"+issueID+"/active-task", nil)
+	req = withURLParam(req, "id", issueID)
+	req.Header.Set("X-Workspace-ID", workspaceA)
+	testHandler.GetActiveTaskForIssue(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("GetActiveTaskForIssue: expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestListTasksByIssueReturnsNotFoundWhenIssueIsOutsideActiveWorkspaceScope(t *testing.T) {
+	ctx := context.Background()
+	workspaceA := createWorkspaceForTaskAuthTest(t, ctx)
+	workspaceB := createWorkspaceForTaskAuthTest(t, ctx)
+	addMemberToWorkspaceForTaskAuthTest(t, ctx, workspaceA)
+	addMemberToWorkspaceForTaskAuthTest(t, ctx, workspaceB)
+
+	issueID := createIssueInWorkspaceForTaskTest(t, ctx, workspaceB, "Scoped away history issue")
+	createQueuedTaskForIssueInWorkspaceTest(t, ctx, workspaceB, issueID)
+
+	w := httptest.NewRecorder()
+	req := newRequest("GET", "/api/issues/"+issueID+"/tasks", nil)
+	req = withURLParam(req, "id", issueID)
+	req.Header.Set("X-Workspace-ID", workspaceA)
+	testHandler.ListTasksByIssue(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("ListTasksByIssue: expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCancelTaskReturnsNotFoundWhenIssueIsOutsideActiveWorkspaceScope(t *testing.T) {
+	ctx := context.Background()
+	workspaceA := createWorkspaceForTaskAuthTest(t, ctx)
+	workspaceB := createWorkspaceForTaskAuthTest(t, ctx)
+	addMemberToWorkspaceForTaskAuthTest(t, ctx, workspaceA)
+	addMemberToWorkspaceForTaskAuthTest(t, ctx, workspaceB)
+
+	issueID := createIssueInWorkspaceForTaskTest(t, ctx, workspaceB, "Scoped away cancel issue")
+	taskID := createQueuedTaskForIssueInWorkspaceTest(t, ctx, workspaceB, issueID)
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues/"+issueID+"/tasks/"+taskID+"/cancel", nil)
+	req = withURLParam(req, "id", issueID)
+	req = withURLParam(req, "taskId", taskID)
+	req.Header.Set("X-Workspace-ID", workspaceA)
+	testHandler.CancelTask(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("CancelTask: expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func addMemberToWorkspaceForTaskAuthTest(t *testing.T, ctx context.Context, workspaceID string) {
+	t.Helper()
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO member (workspace_id, user_id, role)
+		VALUES ($1, $2, 'owner')
+		ON CONFLICT (workspace_id, user_id) DO NOTHING
+	`, workspaceID, testUserID); err != nil {
+		t.Fatalf("add member to workspace %s: %v", workspaceID, err)
+	}
+}
+
 func createWorkspaceForTaskAuthTest(t *testing.T, ctx context.Context) string {
 	t.Helper()
 

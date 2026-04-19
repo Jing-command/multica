@@ -688,23 +688,11 @@ func (h *Handler) ListTaskMessages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (h *Handler) getIssueForWorkspace(w http.ResponseWriter, r *http.Request, issueID string) (*db.Issue, bool) {
-	issue, err := h.Queries.GetIssue(r.Context(), parseUUID(issueID))
-	if err != nil {
-		writeError(w, http.StatusNotFound, "issue not found")
-		return nil, false
-	}
-	if _, ok := h.requireWorkspaceMember(w, r, uuidToString(issue.WorkspaceID), "issue not found"); !ok {
-		return nil, false
-	}
-	return &issue, true
-}
-
 // GetActiveTaskForIssue returns all currently active tasks for an issue.
 // Returns { tasks: [...] } array (may be empty).
 func (h *Handler) GetActiveTaskForIssue(w http.ResponseWriter, r *http.Request) {
 	issueID := chi.URLParam(r, "id")
-	if _, ok := h.getIssueForWorkspace(w, r, issueID); !ok {
+	if _, ok := h.loadIssueForUser(w, r, issueID); !ok {
 		return
 	}
 
@@ -724,7 +712,7 @@ func (h *Handler) GetActiveTaskForIssue(w http.ResponseWriter, r *http.Request) 
 // CancelTask cancels a running or queued task by ID.
 func (h *Handler) CancelTask(w http.ResponseWriter, r *http.Request) {
 	issueID := chi.URLParam(r, "id")
-	issue, ok := h.getIssueForWorkspace(w, r, issueID)
+	issue, ok := h.loadIssueForUser(w, r, issueID)
 	if !ok {
 		return
 	}
@@ -758,7 +746,7 @@ func (h *Handler) CancelTask(w http.ResponseWriter, r *http.Request) {
 // ListTasksByIssue returns all tasks (any status) for an issue — used for execution history.
 func (h *Handler) ListTasksByIssue(w http.ResponseWriter, r *http.Request) {
 	issueID := chi.URLParam(r, "id")
-	if _, ok := h.getIssueForWorkspace(w, r, issueID); !ok {
+	if _, ok := h.loadIssueForUser(w, r, issueID); !ok {
 		return
 	}
 
