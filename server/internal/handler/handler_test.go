@@ -1502,10 +1502,23 @@ func TestVerifyCodeClearsCloudFrontCookiesOnLogout(t *testing.T) {
 	}
 }
 
+func TestResolveActorDoesNotUpgradeToAgentWithoutVerifiedContext(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationHandlerFixture(t, ctx)
+
+	req := newRequest("POST", "/ignored", nil)
+	req.Header.Set("X-Agent-ID", fixture.workerAgentID)
+	req.Header.Set("X-Task-ID", fixture.workerChildTaskID)
+
+	actorType, actorID := testHandler.resolveActor(req, testUserID, testWorkspaceID)
+	if actorType != "member" || actorID != testUserID {
+		t.Fatalf("resolveActor upgraded spoofed headers to %s/%s, want member/%s", actorType, actorID, testUserID)
+	}
+}
+
 func TestResolveActor(t *testing.T) {
 	ctx := context.Background()
 
-	// Look up the agent created by the test fixture.
 	var agentID string
 	err := testPool.QueryRow(ctx,
 		`SELECT id FROM agent WHERE workspace_id = $1 AND name = $2`,
@@ -1515,7 +1528,6 @@ func TestResolveActor(t *testing.T) {
 		t.Fatalf("failed to find test agent: %v", err)
 	}
 
-	// Create a task for the agent so we can test X-Task-ID validation.
 	var issueID string
 	err = testPool.QueryRow(ctx,
 		`INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number, position)
@@ -1526,7 +1538,6 @@ func TestResolveActor(t *testing.T) {
 		t.Fatalf("failed to create test issue: %v", err)
 	}
 
-	// Look up runtime_id for the agent.
 	var runtimeID string
 	err = testPool.QueryRow(ctx, `SELECT runtime_id FROM agent WHERE id = $1`, agentID).Scan(&runtimeID)
 	if err != nil {
@@ -1552,36 +1563,27 @@ func TestResolveActor(t *testing.T) {
 		name          string
 		agentIDHeader string
 		taskIDHeader  string
-		wantActorType string
-		wantIsAgent   bool
 	}{
 		{
-			name:          "no headers returns member",
-			wantActorType: "member",
+			name: "no headers returns member",
 		},
 		{
-			name:          "valid agent ID returns agent",
+			name:          "valid agent ID still returns member",
 			agentIDHeader: agentID,
-			wantActorType: "agent",
-			wantIsAgent:   true,
 		},
 		{
 			name:          "non-existent agent ID returns member",
 			agentIDHeader: "00000000-0000-0000-0000-000000000099",
-			wantActorType: "member",
 		},
 		{
-			name:          "valid agent + valid task returns agent",
+			name:          "valid agent plus valid task still returns member",
 			agentIDHeader: agentID,
 			taskIDHeader:  taskID,
-			wantActorType: "agent",
-			wantIsAgent:   true,
 		},
 		{
-			name:          "valid agent + wrong task returns member",
+			name:          "valid agent plus wrong task returns member",
 			agentIDHeader: agentID,
 			taskIDHeader:  "00000000-0000-0000-0000-000000000099",
-			wantActorType: "member",
 		},
 	}
 
@@ -1597,17 +1599,11 @@ func TestResolveActor(t *testing.T) {
 
 			actorType, actorID := testHandler.resolveActor(req, testUserID, testWorkspaceID)
 
-			if actorType != tt.wantActorType {
-				t.Errorf("actorType = %q, want %q", actorType, tt.wantActorType)
+			if actorType != "member" {
+				t.Errorf("actorType = %q, want %q", actorType, "member")
 			}
-			if tt.wantIsAgent {
-				if actorID != tt.agentIDHeader {
-					t.Errorf("actorID = %q, want agent %q", actorID, tt.agentIDHeader)
-				}
-			} else {
-				if actorID != testUserID {
-					t.Errorf("actorID = %q, want user %q", actorID, testUserID)
-				}
+			if actorID != testUserID {
+				t.Errorf("actorID = %q, want user %q", actorID, testUserID)
 			}
 		})
 	}

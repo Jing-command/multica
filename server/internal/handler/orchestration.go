@@ -29,10 +29,10 @@ type reviewIssueWorkflowCriterionRequest struct {
 }
 
 type reviewIssueWorkflowRequest struct {
-	IdempotencyKey  string                                `json:"idempotency_key"`
-	ReviewRoundID   string                                `json:"review_round_id"`
-	Verdict         string                                `json:"verdict"`
-	Summary         string                                `json:"summary"`
+	IdempotencyKey   string                                `json:"idempotency_key"`
+	ReviewRoundID    string                                `json:"review_round_id"`
+	Verdict          string                                `json:"verdict"`
+	Summary          string                                `json:"summary"`
 	CriterionResults []reviewIssueWorkflowCriterionRequest `json:"criterion_results"`
 }
 
@@ -43,20 +43,19 @@ type replanIssueWorkflowRequest struct {
 }
 
 func (h *Handler) requireWorkflowAgent(w http.ResponseWriter, r *http.Request, issue db.Issue) (string, bool) {
-	userID, ok := requireUserID(w, r)
+	_, ok := requireUserID(w, r)
 	if !ok {
 		return "", false
 	}
-	actorType, actorID := h.resolveActor(r, userID, uuidToString(issue.WorkspaceID))
-	if actorType != "agent" {
+
+	taskID := r.Header.Get("X-Task-ID")
+	agentID := r.Header.Get("X-Agent-ID")
+	actorType, actorID, verified := h.resolveVerifiedAgentActorFromTask(r.Context(), taskID, agentID, uuidToString(issue.WorkspaceID))
+	if !verified || actorType != "agent" {
 		writeError(w, http.StatusForbidden, "workflow command requires assigned agent actor")
 		return "", false
 	}
-	taskID := r.Header.Get("X-Task-ID")
-	if taskID == "" {
-		writeError(w, http.StatusForbidden, "workflow command requires assigned agent task")
-		return "", false
-	}
+
 	task, err := h.Queries.GetAgentTask(r.Context(), parseUUID(taskID))
 	taskMatchesIssue := err == nil && uuidToString(task.IssueID) == uuidToString(issue.ID)
 	if !taskMatchesIssue && err == nil && issue.ParentIssueID.Valid {
