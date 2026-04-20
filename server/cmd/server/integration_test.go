@@ -218,9 +218,9 @@ func createDaemonTokenForTest(t *testing.T, workspaceID, daemonID string) string
 		t.Fatalf("generate daemon token: %v", err)
 	}
 	if _, err := testPool.Exec(context.Background(), `
-		INSERT INTO daemon_token (token_hash, workspace_id, daemon_id, expires_at)
-		VALUES ($1, $2, $3, now() + interval '1 day')
-	`, auth.HashToken(rawToken), workspaceID, daemonID); err != nil {
+		INSERT INTO daemon_token (token_hash, workspace_id, daemon_id, user_id, expires_at)
+		VALUES ($1, $2, $3, $4, now() + interval '1 day')
+	`, auth.HashToken(rawToken), workspaceID, daemonID, testUserID); err != nil {
 		t.Fatalf("insert daemon token: %v", err)
 	}
 	return rawToken
