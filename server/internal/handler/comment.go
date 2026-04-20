@@ -220,7 +220,8 @@ func (h *Handler) resolveVerifiedAgentCommentActor(w http.ResponseWriter, r *htt
 	}
 
 	task, err := h.Queries.GetAgentTask(r.Context(), parseUUID(taskID))
-	if err != nil || uuidToString(task.IssueID) != uuidToString(issue.ID) {
+	taskIsActive := err == nil && (task.Status == "queued" || task.Status == "dispatched" || task.Status == "running")
+	if err != nil || uuidToString(task.IssueID) != uuidToString(issue.ID) || !taskIsActive {
 		writeError(w, http.StatusForbidden, "verified agent context required")
 		return "", "", false
 	}

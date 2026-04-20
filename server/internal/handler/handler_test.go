@@ -649,6 +649,32 @@ func TestCreateAgentCommentEnqueuesMentionedAgentTask(t *testing.T) {
 	}
 }
 
+func TestCreateAgentCommentRejectsCompletedTaskContext(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationHandlerFixture(t, ctx)
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE agent_task_queue
+		SET status = 'completed', completed_at = now()
+		WHERE id = $1
+	`, fixture.workerChildTaskID); err != nil {
+		t.Fatalf("complete worker task: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues/"+fixture.childIssueID+"/agent-comments", map[string]any{
+		"content": "should reject completed task context",
+	})
+	req = withURLParam(req, "id", fixture.childIssueID)
+	req.Header.Set("X-Agent-ID", fixture.workerAgentID)
+	req.Header.Set("X-Task-ID", fixture.workerChildTaskID)
+
+	testHandler.CreateAgentComment(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("CreateAgentComment: expected 403 for completed task, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestCreateAgentCommentRequiresVerifiedTaskContext(t *testing.T) {
 	ctx := context.Background()
 	fixture := seedOrchestrationHandlerFixture(t, ctx)
