@@ -10,9 +10,9 @@ import (
 	"testing"
 )
 
-// authRequestWithAgent makes an authenticated request with X-Agent-ID header,
-// causing the server to resolve the actor as an agent instead of a member.
-func authRequestWithAgent(t *testing.T, method, path string, body any, agentID string) *http.Response {
+// authRequestWithAgentTask makes an authenticated request with X-Agent-ID and
+// X-Task-ID headers, causing the server to resolve a verified agent actor.
+func authRequestWithAgentTask(t *testing.T, method, path string, body any, agentID, taskID string) *http.Response {
 	t.Helper()
 	var bodyReader io.Reader
 	if body != nil {
@@ -27,6 +27,7 @@ func authRequestWithAgent(t *testing.T, method, path string, body any, agentID s
 	req.Header.Set("Authorization", "Bearer "+testToken)
 	req.Header.Set("X-Workspace-ID", testWorkspaceID)
 	req.Header.Set("X-Agent-ID", agentID)
+	req.Header.Set("X-Task-ID", taskID)
 
 	r, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -120,9 +121,40 @@ func postComment(t *testing.T, issueID, content string, parentID *string) string
 	return comment["id"].(string)
 }
 
-// postCommentAsAgent posts a comment with the X-Agent-ID header.
-func postCommentAsAgent(t *testing.T, issueID, content, agentID string, parentID *string) string {
+// createQueuedTaskForIssue inserts a queued task for the given issue/agent pair.
+func createQueuedTaskForIssue(t *testing.T, issueID, agentID string) string {
 	t.Helper()
+
+	var runtimeID string
+	if err := testPool.QueryRow(context.Background(), `SELECT runtime_id FROM agent WHERE id = $1`, agentID).Scan(&runtimeID); err != nil {
+		t.Fatalf("failed to get agent runtime_id: %v", err)
+	}
+
+	var taskID string
+	if err := testPool.QueryRow(context.Background(),
+		`INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority)
+		 VALUES ($1, $2, $3, 'queued', 0)
+		 RETURNING id`,
+		agentID, runtimeID, issueID,
+	).Scan(&taskID); err != nil {
+		t.Fatalf("failed to create queued task: %v", err)
+	}
+
+	return taskID
+}
+
+// postVerifiedAgentComment posts a verified agent-authored comment via the
+// /agent-comments route using a temporary queued task.
+func postVerifiedAgentComment(t *testing.T, issueID, content, agentID string, parentID *string) string {
+	t.Helper()
+
+	taskID := createQueuedTaskForIssue(t, issueID, agentID)
+	defer func() {
+		if _, err := testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID); err != nil {
+			t.Fatalf("failed to delete queued task: %v", err)
+		}
+	}()
+
 	body := map[string]any{
 		"content": content,
 		"type":    "comment",
@@ -130,12 +162,14 @@ func postCommentAsAgent(t *testing.T, issueID, content, agentID string, parentID
 	if parentID != nil {
 		body["parent_id"] = *parentID
 	}
-	resp := authRequestWithAgent(t, "POST", "/api/issues/"+issueID+"/comments", body, agentID)
+
+	resp := authRequestWithAgentTask(t, "POST", "/api/issues/"+issueID+"/agent-comments", body, agentID, taskID)
 	if resp.StatusCode != 201 {
 		b, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		t.Fatalf("postCommentAsAgent: expected 201, got %d: %s", resp.StatusCode, b)
+		t.Fatalf("postVerifiedAgentComment: expected 201, got %d: %s", resp.StatusCode, b)
 	}
+
 	var comment map[string]any
 	readJSON(t, resp, &comment)
 	return comment["id"].(string)
@@ -188,7 +222,7 @@ func TestCommentTriggerOnComment(t *testing.T) {
 	t.Run("reply to agent thread without mentions triggers agent", func(t *testing.T) {
 		clearTasks(t, issueID)
 		// Agent starts a thread.
-		threadID := postCommentAsAgent(t, issueID, "I analyzed the issue.", agentID, nil)
+		threadID := postVerifiedAgentComment(t, issueID, "I analyzed the issue.", agentID, nil)
 		// Member replies in the agent's thread.
 		postComment(t, issueID, "Looks good, please proceed", strPtr(threadID))
 		if n := countPendingTasks(t, issueID); n != 1 {
@@ -267,7 +301,7 @@ func TestCommentTriggerAtAllSuppression(t *testing.T) {
 
 	t.Run("@all in agent thread suppresses on_comment", func(t *testing.T) {
 		clearTasks(t, issueID)
-		threadID := postCommentAsAgent(t, issueID, "Here is my analysis.", agentID, nil)
+		threadID := postVerifiedAgentComment(t, issueID, "Here is my analysis.", agentID, nil)
 		postComment(t, issueID, "[@All](mention://all/all) FYI for the team", strPtr(threadID))
 		if n := countPendingTasks(t, issueID); n != 0 {
 			t.Errorf("expected 0 pending tasks (@all in agent thread), got %d", n)

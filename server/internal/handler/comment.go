@@ -3,9 +3,11 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -174,6 +176,59 @@ type CreateCommentRequest struct {
 	AttachmentIDs []string `json:"attachment_ids"`
 }
 
+func (h *Handler) loadParentCommentForIssue(ctx context.Context, issue db.Issue, parentID *string) (pgtype.UUID, *db.Comment, error) {
+	if parentID == nil {
+		return pgtype.UUID{}, nil, nil
+	}
+
+	parsedParentID := parseUUID(*parentID)
+	parentComment, err := h.Queries.GetComment(ctx, parsedParentID)
+	if err != nil {
+		return pgtype.UUID{}, nil, err
+	}
+	if uuidToString(parentComment.IssueID) != uuidToString(issue.ID) {
+		return pgtype.UUID{}, nil, errors.New("parent comment is outside issue scope")
+	}
+
+	return parsedParentID, &parentComment, nil
+}
+
+func (h *Handler) insertComment(ctx context.Context, issue db.Issue, req CreateCommentRequest, authorType, authorID string, parentID pgtype.UUID) (db.Comment, error) {
+	return h.Queries.CreateComment(ctx, db.CreateCommentParams{
+		IssueID:     issue.ID,
+		WorkspaceID: issue.WorkspaceID,
+		AuthorType:  authorType,
+		AuthorID:    parseUUID(authorID),
+		Content:     mention.ExpandIssueIdentifiers(ctx, h.Queries, issue.WorkspaceID, req.Content),
+		Type:        req.Type,
+		ParentID:    parentID,
+	})
+}
+
+func (h *Handler) resolveVerifiedAgentCommentActor(w http.ResponseWriter, r *http.Request, issue db.Issue) (actorType, actorID string, ok bool) {
+	agentID := strings.TrimSpace(r.Header.Get("X-Agent-ID"))
+	taskID := strings.TrimSpace(r.Header.Get("X-Task-ID"))
+	if agentID == "" || taskID == "" {
+		writeError(w, http.StatusBadRequest, "X-Agent-ID and X-Task-ID are required")
+		return "", "", false
+	}
+
+	actorType, actorID, verified := h.resolveVerifiedAgentActorFromTask(r.Context(), taskID, agentID, uuidToString(issue.WorkspaceID))
+	if !verified || actorType != "agent" {
+		writeError(w, http.StatusForbidden, "verified agent context required")
+		return "", "", false
+	}
+
+	task, err := h.Queries.GetAgentTask(r.Context(), parseUUID(taskID))
+	taskIsActive := err == nil && (task.Status == "queued" || task.Status == "dispatched" || task.Status == "running")
+	if err != nil || uuidToString(task.IssueID) != uuidToString(issue.ID) || !taskIsActive {
+		writeError(w, http.StatusForbidden, "verified agent context required")
+		return "", "", false
+	}
+
+	return actorType, actorID, true
+}
+
 func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 	issueID := chi.URLParam(r, "id")
 	issue, ok := h.loadIssueForUser(w, r, issueID)
@@ -200,47 +255,27 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 		req.Type = "comment"
 	}
 
-	var parentID pgtype.UUID
-	var parentComment *db.Comment
-	if req.ParentID != nil {
-		parentID = parseUUID(*req.ParentID)
-		parent, err := h.Queries.GetComment(r.Context(), parentID)
-		if err != nil || uuidToString(parent.IssueID) != issueID {
-			writeError(w, http.StatusBadRequest, "invalid parent comment")
-			return
-		}
-		parentComment = &parent
+	parentID, parentComment, err := h.loadParentCommentForIssue(r.Context(), issue, req.ParentID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid parent comment")
+		return
 	}
 
-	// Determine author identity from the authenticated member only.
 	authorType, authorID := resolveMemberActor(userID)
-
-	// Expand bare issue identifiers (e.g. MUL-117) into mention links.
-	req.Content = mention.ExpandIssueIdentifiers(r.Context(), h.Queries, issue.WorkspaceID, req.Content)
-
-	comment, err := h.Queries.CreateComment(r.Context(), db.CreateCommentParams{
-		IssueID:     issue.ID,
-		WorkspaceID: issue.WorkspaceID,
-		AuthorType:  authorType,
-		AuthorID:    parseUUID(authorID),
-		Content:     req.Content,
-		Type:        req.Type,
-		ParentID:    parentID,
-	})
+	comment, err := h.insertComment(r.Context(), issue, req, authorType, authorID, parentID)
 	if err != nil {
 		slog.Warn("create comment failed", append(logger.RequestAttrs(r), "error", err, "issue_id", issueID)...)
 		writeError(w, http.StatusInternalServerError, "failed to create comment: "+err.Error())
 		return
 	}
 
-	// Link uploaded attachments to this comment.
 	if len(req.AttachmentIDs) > 0 {
 		h.linkAttachmentsByIDs(r.Context(), comment.ID, issue.ID, req.AttachmentIDs)
 	}
 
-	// Fetch linked attachments so the response includes them.
 	groupedAtt := h.groupAttachments(r, []pgtype.UUID{comment.ID})
 	resp := commentToResponse(comment, nil, groupedAtt[uuidToString(comment.ID)])
+
 	slog.Info("comment created", append(logger.RequestAttrs(r), "comment_id", uuidToString(comment.ID), "issue_id", issueID)...)
 	h.publish(protocol.EventCommentCreated, uuidToString(issue.WorkspaceID), authorType, authorID, map[string]any{
 		"comment":             resp,
@@ -250,18 +285,9 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 		"issue_status":        issue.Status,
 	})
 
-	// If the issue is assigned to an agent with on_comment trigger, enqueue a new task.
-	// Skip when the comment comes from the assigned agent itself to avoid loops.
-	// Also skip when the comment @mentions others but not the assignee agent —
-	// the user is talking to someone else, not requesting work from the assignee.
-	// Also skip when replying in a member-started thread without mentioning the
-	// assignee — the user is continuing a member-to-member conversation.
 	if authorType == "member" && h.shouldEnqueueOnComment(r.Context(), issue) &&
 		!h.commentMentionsOthersButNotAssignee(comment.Content, issue) &&
 		!h.isReplyToMemberThread(parentComment, comment.Content, issue) {
-		// Resolve thread root: if the comment is a reply, agent should reply
-		// to the thread root (matching frontend behavior where all replies
-		// in a thread share the same top-level parent).
 		replyTo := comment.ID
 		if comment.ParentID.Valid {
 			replyTo = comment.ParentID
@@ -271,8 +297,68 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Trigger @mentioned agents: parse agent mentions and enqueue tasks for each.
-	// Pass parentComment so that replies inherit mentions from the thread root.
+	h.enqueueMentionedAgentTasks(r.Context(), issue, comment, parentComment, authorType, authorID)
+
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+func (h *Handler) CreateAgentComment(w http.ResponseWriter, r *http.Request) {
+	issueID := chi.URLParam(r, "id")
+	issue, ok := h.loadIssueForUser(w, r, issueID)
+	if !ok {
+		return
+	}
+
+	if _, ok := requireUserID(w, r); !ok {
+		return
+	}
+
+	var req CreateCommentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.Content == "" {
+		writeError(w, http.StatusBadRequest, "content is required")
+		return
+	}
+	if req.Type == "" {
+		req.Type = "comment"
+	}
+	if len(req.AttachmentIDs) > 0 {
+		writeError(w, http.StatusBadRequest, "attachments are not supported for agent comments")
+		return
+	}
+
+	parentID, parentComment, err := h.loadParentCommentForIssue(r.Context(), issue, req.ParentID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid parent comment")
+		return
+	}
+
+	authorType, authorID, ok := h.resolveVerifiedAgentCommentActor(w, r, issue)
+	if !ok {
+		return
+	}
+
+	comment, err := h.insertComment(r.Context(), issue, req, authorType, authorID, parentID)
+	if err != nil {
+		slog.Warn("create agent comment failed", append(logger.RequestAttrs(r), "error", err, "issue_id", issueID)...)
+		writeError(w, http.StatusInternalServerError, "failed to create comment: "+err.Error())
+		return
+	}
+
+	resp := commentToResponse(comment, nil, nil)
+	slog.Info("agent comment created", append(logger.RequestAttrs(r), "comment_id", uuidToString(comment.ID), "issue_id", issueID, "agent_id", authorID)...)
+	h.publish(protocol.EventCommentCreated, uuidToString(issue.WorkspaceID), authorType, authorID, map[string]any{
+		"comment":             resp,
+		"issue_title":         issue.Title,
+		"issue_assignee_type": textToPtr(issue.AssigneeType),
+		"issue_assignee_id":   uuidToPtr(issue.AssigneeID),
+		"issue_status":        issue.Status,
+	})
+
 	h.enqueueMentionedAgentTasks(r.Context(), issue, comment, parentComment, authorType, authorID)
 
 	writeJSON(w, http.StatusCreated, resp)
