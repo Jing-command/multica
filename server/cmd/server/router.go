@@ -175,6 +175,7 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus) chi.Route
 					r.Put("/", h.UpdateIssue)
 					r.Delete("/", h.DeleteIssue)
 					r.Post("/comments", h.CreateComment)
+					r.Post("/agent-comments", h.CreateAgentComment)
 					r.Get("/comments", h.ListComments)
 					r.Get("/timeline", h.ListTimeline)
 					r.Get("/subscribers", h.ListIssueSubscribers)

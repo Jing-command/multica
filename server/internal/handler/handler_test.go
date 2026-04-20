@@ -596,6 +596,83 @@ func TestSpoofedAgentCommentDoesNotSuppressOnCommentTrigger(t *testing.T) {
 	}
 }
 
+func TestCreateAgentCommentRequiresVerifiedTaskContext(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationHandlerFixture(t, ctx)
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues/"+fixture.childIssueID+"/agent-comments", map[string]any{
+		"content": "agent comment without verified task",
+	})
+	req = withURLParam(req, "id", fixture.childIssueID)
+	req.Header.Set("X-Agent-ID", fixture.workerAgentID)
+
+	testHandler.CreateAgentComment(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("CreateAgentComment: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateAgentCommentCreatesAgentAuthoredComment(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationHandlerFixture(t, ctx)
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues/"+fixture.childIssueID+"/agent-comments", map[string]any{
+		"content": "verified agent comment",
+	})
+	req = withURLParam(req, "id", fixture.childIssueID)
+	req.Header.Set("X-Agent-ID", fixture.workerAgentID)
+	req.Header.Set("X-Task-ID", fixture.workerChildTaskID)
+
+	testHandler.CreateAgentComment(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateAgentComment: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var comment CommentResponse
+	if err := json.NewDecoder(w.Body).Decode(&comment); err != nil {
+		t.Fatalf("decode comment: %v", err)
+	}
+	if comment.AuthorType != "agent" {
+		t.Fatalf("author_type = %q, want agent", comment.AuthorType)
+	}
+	if comment.AuthorID != fixture.workerAgentID {
+		t.Fatalf("author_id = %q, want %q", comment.AuthorID, fixture.workerAgentID)
+	}
+}
+
+func TestCreateAgentCommentDoesNotEnqueueOnComment(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationHandlerFixture(t, ctx)
+
+	var beforeCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1`, fixture.childIssueID).Scan(&beforeCount); err != nil {
+		t.Fatalf("count tasks before comment: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues/"+fixture.childIssueID+"/agent-comments", map[string]any{
+		"content": "verified agent comment should not enqueue",
+	})
+	req = withURLParam(req, "id", fixture.childIssueID)
+	req.Header.Set("X-Agent-ID", fixture.workerAgentID)
+	req.Header.Set("X-Task-ID", fixture.workerChildTaskID)
+
+	testHandler.CreateAgentComment(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateAgentComment: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var afterCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1`, fixture.childIssueID).Scan(&afterCount); err != nil {
+		t.Fatalf("count tasks after comment: %v", err)
+	}
+	if afterCount != beforeCount {
+		t.Fatalf("task count = %d, want %d", afterCount, beforeCount)
+	}
+}
+
 func TestAgentCRUD(t *testing.T) {
 	// List agents
 	w := httptest.NewRecorder()
