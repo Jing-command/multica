@@ -325,8 +325,12 @@ func (h *Handler) CreateAgentComment(w http.ResponseWriter, r *http.Request) {
 	if req.Type == "" {
 		req.Type = "comment"
 	}
+	if len(req.AttachmentIDs) > 0 {
+		writeError(w, http.StatusBadRequest, "attachments are not supported for agent comments")
+		return
+	}
 
-	parentID, _, err := h.loadParentCommentForIssue(r.Context(), issue, req.ParentID)
+	parentID, parentComment, err := h.loadParentCommentForIssue(r.Context(), issue, req.ParentID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid parent comment")
 		return
@@ -353,6 +357,8 @@ func (h *Handler) CreateAgentComment(w http.ResponseWriter, r *http.Request) {
 		"issue_assignee_id":   uuidToPtr(issue.AssigneeID),
 		"issue_status":        issue.Status,
 	})
+
+	h.enqueueMentionedAgentTasks(r.Context(), issue, comment, parentComment, authorType, authorID)
 
 	writeJSON(w, http.StatusCreated, resp)
 }

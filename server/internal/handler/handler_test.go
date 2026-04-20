@@ -596,6 +596,59 @@ func TestSpoofedAgentCommentDoesNotSuppressOnCommentTrigger(t *testing.T) {
 	}
 }
 
+func TestCreateAgentCommentRejectsAttachmentIDs(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationHandlerFixture(t, ctx)
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues/"+fixture.childIssueID+"/agent-comments", map[string]any{
+		"content":        "verified agent comment with attachment ids",
+		"attachment_ids": []string{"attachment-1"},
+	})
+	req = withURLParam(req, "id", fixture.childIssueID)
+	req.Header.Set("X-Agent-ID", fixture.workerAgentID)
+	req.Header.Set("X-Task-ID", fixture.workerChildTaskID)
+
+	testHandler.CreateAgentComment(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("CreateAgentComment: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "attachments are not supported") {
+		t.Fatalf("expected unsupported attachments error, got %s", w.Body.String())
+	}
+}
+
+func TestCreateAgentCommentEnqueuesMentionedAgentTask(t *testing.T) {
+	ctx := context.Background()
+	fixture := seedOrchestrationHandlerFixture(t, ctx)
+
+	var beforeCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2`, fixture.childIssueID, fixture.outsiderAgentID).Scan(&beforeCount); err != nil {
+		t.Fatalf("count mentioned agent tasks before comment: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues/"+fixture.childIssueID+"/agent-comments", map[string]any{
+		"content": fmt.Sprintf("please review [@Mentioned](mention://agent/%s)", fixture.outsiderAgentID),
+	})
+	req = withURLParam(req, "id", fixture.childIssueID)
+	req.Header.Set("X-Agent-ID", fixture.workerAgentID)
+	req.Header.Set("X-Task-ID", fixture.workerChildTaskID)
+
+	testHandler.CreateAgentComment(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateAgentComment: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var afterCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2`, fixture.childIssueID, fixture.outsiderAgentID).Scan(&afterCount); err != nil {
+		t.Fatalf("count mentioned agent tasks after comment: %v", err)
+	}
+	if afterCount != beforeCount+1 {
+		t.Fatalf("mentioned agent task count = %d, want %d", afterCount, beforeCount+1)
+	}
+}
+
 func TestCreateAgentCommentRequiresVerifiedTaskContext(t *testing.T) {
 	ctx := context.Background()
 	fixture := seedOrchestrationHandlerFixture(t, ctx)
